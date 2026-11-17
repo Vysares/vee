@@ -1,0 +1,1 @@
+/home/jackson/software/vee/target/debug/libvee_core_types.rlib: /home/jackson/software/vee/core-api/src/crc.rs /home/jackson/software/vee/core-api/src/lib.rs /home/jackson/software/vee/core-types/src/lib.rs /home/jackson/software/vee/core-types/src/reset_log.rs

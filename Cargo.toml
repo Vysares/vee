@@ -1,0 +1,12 @@
+[workspace]
+resolver = "3"
+members = ["core-api", "core-types", "core", "osal"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+
+# Flight crates opt in with `[lints] workspace = true`.
+# The osal does not opt in, because it is the only crate allowed to use unsafe.
+[workspace.lints.rust]
+unsafe_code = "forbid"

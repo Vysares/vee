@@ -1,0 +1,10 @@
+[package]
+name = "vee-core-types"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+vee-core-api = { path = "../core-api" }
+
+[lints]
+workspace = true
