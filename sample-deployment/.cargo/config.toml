@@ -1,0 +1,14 @@
+# Build-time settings for this deployment. Run cargo from this directory (or pass
+# `--config sample-deployment/.cargo/config.toml`) and these override Vee's defaults.
+#
+# Every setting is optional: leave a line out to use the default. Each default is next to the code
+# that uses the setting (search for `option_env!`). A real environment variable of the same name
+# wins over this file. Everything in a deployment, including the ground tool, must be built with
+# the same values.
+
+[env]
+# How many bytes of text an event carries. Sets the event log record size. Default 50.
+VEE_EV_TEXT_MAX_BYTES = "50"
+
+# How many records the reset log holds before it is rotated at startup. Default 1024.
+VEE_RESET_LOG_MAX_RECORDS = "1024"

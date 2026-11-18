@@ -1,0 +1,17 @@
+[package]
+name = "vee-core-derive"
+edition.workspace = true
+version.workspace = true
+
+# A proc-macro crate runs on the build machine, inside the compiler. It is host side, so it may
+# use std. It never goes into the flight binary.
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = "2"
+
+[lints]
+workspace = true

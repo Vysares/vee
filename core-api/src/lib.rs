@@ -1,6 +1,7 @@
 //! Shared types and traits between the core and modules.
 #![no_std]
 
+pub mod config;
 pub mod crc;
 pub mod event;
 pub mod fixed_str;

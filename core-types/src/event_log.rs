@@ -3,24 +3,24 @@
 //! The log is a file of fixed-size records, one per event. Each record is laid out as:
 //!
 //! ```text
-//! | monotonic_us (8) | source (1) | code (2) | severity (1) | args_len (1) | args (32) | crc (2) |
+//! | monotonic_us (8) | source (1) | code (2) | severity (1) | text (EV_TEXT_MAX_BYTES) | crc (2) |
 //! ```
 //!
-//! `args` is zero padded after its first `args_len` bytes. The CRC covers everything before it.
-//! Multi-byte numbers are big-endian.
+//! `text` is a `FixedStr`: ASCII, zero padded. The CRC covers everything before it. Multi-byte
+//! numbers are big-endian.
 //!
 //! `Event` is defined in core-api, so the codec is a pair of free functions here, not methods.
 
 use vee_core_api::crc;
 use vee_core_api::event;
+use vee_core_api::fixed_str;
 
 const TIME_OFFSET: usize = 0;
 const SOURCE_OFFSET: usize = TIME_OFFSET + size_of::<u64>();
 const CODE_OFFSET: usize = SOURCE_OFFSET + size_of::<u8>();
 const SEVERITY_OFFSET: usize = CODE_OFFSET + size_of::<u16>();
-const ARGS_LEN_OFFSET: usize = SEVERITY_OFFSET + size_of::<u8>();
-const ARGS_OFFSET: usize = ARGS_LEN_OFFSET + size_of::<u8>();
-const CRC_OFFSET: usize = ARGS_OFFSET + event::EV_ARGS_MAX_BYTES;
+const TEXT_OFFSET: usize = SEVERITY_OFFSET + size_of::<u8>();
+const CRC_OFFSET: usize = TEXT_OFFSET + event::EV_TEXT_MAX_BYTES;
 
 /// The size of every record in the log.
 pub const RECORD_LEN: usize = CRC_OFFSET + size_of::<u16>();
@@ -57,10 +57,8 @@ pub enum DecodeError {
     /// The CRC does not match the record's contents.
     BadCrc,
     UnknownSeverity(u8),
-    /// `args_len` is more than `EV_ARGS_MAX_BYTES`.
-    ArgsLenTooLong(u8),
-    /// The padding after the used args is not all zero.
-    NonZeroPadding,
+    /// The text is not valid: a non-ASCII byte, or non-zero padding.
+    BadText(fixed_str::Error),
 }
 
 /// Writes an event as one record, with its CRC.
@@ -71,19 +69,15 @@ pub fn encode(event: &event::Event) -> [u8; RECORD_LEN] {
     record[CODE_OFFSET..SEVERITY_OFFSET].copy_from_slice(&event.code.to_be_bytes());
     record[SEVERITY_OFFSET] = severity_to_code(event.severity);
 
-    let args = event.args();
-    // Fits: an `Event` never has more than `EV_ARGS_MAX_BYTES` args, and that is at most 255.
-    record[ARGS_LEN_OFFSET] = args.len() as u8;
-    // The rest of the args area stays zero, which is the padding.
-    record[ARGS_OFFSET..ARGS_OFFSET + args.len()].copy_from_slice(args);
+    record[TEXT_OFFSET..CRC_OFFSET].copy_from_slice(&event.text.to_bytes());
 
     let crc = crc::crc16_ccitt_false(&record[..CRC_OFFSET]);
     record[CRC_OFFSET..].copy_from_slice(&crc.to_be_bytes());
     record
 }
 
-/// Reads one record. The checks are the ones `Event::new` relies on, so a decoded event is as
-/// good as one built live.
+/// Reads one record. A decoded event is as good as one built live: its text was checked by
+/// `FixedStr::from_bytes`.
 pub fn decode(bytes: &[u8]) -> Result<event::Event, DecodeError> {
     if bytes.len() != RECORD_LEN {
         return Err(DecodeError::BadLength);
@@ -94,21 +88,17 @@ pub fn decode(bytes: &[u8]) -> Result<event::Event, DecodeError> {
     }
 
     let severity = severity_from_code(bytes[SEVERITY_OFFSET])?;
-
-    let args_len = bytes[ARGS_LEN_OFFSET];
-    let (args, padding) = bytes[ARGS_OFFSET..CRC_OFFSET]
-        .split_at_checked(usize::from(args_len))
-        .ok_or(DecodeError::ArgsLenTooLong(args_len))?;
-    if padding.iter().any(|&byte| byte != 0) {
-        return Err(DecodeError::NonZeroPadding);
-    }
-
+    let text = fixed_str::FixedStr::from_bytes(core::array::from_fn(|i| bytes[TEXT_OFFSET + i]))
+        .map_err(DecodeError::BadText)?;
     let monotonic_us = u64::from_be_bytes(core::array::from_fn(|i| bytes[TIME_OFFSET + i]));
     let code = u16::from_be_bytes(core::array::from_fn(|i| bytes[CODE_OFFSET + i]));
-    // The length was checked above, so this cannot fail. If it somehow did, the record is
-    // reported as bad, not trusted.
-    event::Event::new(bytes[SOURCE_OFFSET], code, severity, monotonic_us, args)
-        .map_err(|event::Error::ArgsTooLong| DecodeError::ArgsLenTooLong(args_len))
+    Ok(event::Event {
+        source: bytes[SOURCE_OFFSET],
+        code,
+        severity,
+        monotonic_us,
+        text,
+    })
 }
 
 #[cfg(test)]
@@ -116,13 +106,20 @@ mod tests {
     use super as event_log;
     use vee_core_api::crc;
     use vee_core_api::event;
+    use vee_core_api::fixed_str;
 
-    fn make(severity: event::Severity, args: &[u8]) -> event::Event {
-        event::Event::new(2, 0x0102, severity, 0x0102_0304_0506_0708, args).unwrap()
+    fn make(severity: event::Severity, text: &str) -> event::Event {
+        event::Event {
+            source: 2,
+            code: 0x0102,
+            severity,
+            monotonic_us: 0x0102_0304_0506_0708,
+            text: fixed_str::FixedStr::truncated(text).unwrap(),
+        }
     }
 
-    fn info(args: &[u8]) -> event::Event {
-        make(event::Severity::Info, args)
+    fn info(text: &str) -> event::Event {
+        make(event::Severity::Info, text)
     }
 
     /// Recomputes the CRC of a record whose contents a test has changed, so the test can make a
@@ -134,16 +131,33 @@ mod tests {
     }
 
     #[test]
-    fn record_len_is_forty_seven() {
-        assert_eq!(event_log::RECORD_LEN, 47);
+    fn record_len_is_the_fixed_fields_plus_the_text() {
+        // time 8, source 1, code 2, severity 1, text, crc 2
+        assert_eq!(
+            event_log::RECORD_LEN,
+            8 + 1 + 2 + 1 + event::EV_TEXT_MAX_BYTES + 2
+        );
     }
 
     #[test]
     fn events_round_trip() {
-        let full = [9u8; event::EV_ARGS_MAX_BYTES];
-        for ev in [info(&[]), info(&[1, 2, 3]), info(&full)] {
+        let full = [b'x'; event::EV_TEXT_MAX_BYTES];
+        let full = core::str::from_utf8(&full).unwrap();
+        for ev in [info(""), info("reset 3"), info(full)] {
             assert_eq!(event_log::decode(&event_log::encode(&ev)), Ok(ev));
         }
+    }
+
+    #[test]
+    fn text_that_was_cut_off_round_trips_with_its_mark() {
+        let too_long = [b'x'; event::EV_TEXT_MAX_BYTES + 5];
+        let ev = info(core::str::from_utf8(&too_long).unwrap());
+        let read = event_log::decode(&event_log::encode(&ev)).unwrap();
+        assert_eq!(read, ev);
+        assert_eq!(
+            read.text.as_bytes().last(),
+            Some(&fixed_str::TRUNCATED_MARK)
+        );
     }
 
     #[test]
@@ -153,20 +167,26 @@ mod tests {
             event::Severity::Warn,
             event::Severity::Err,
         ] {
-            let ev = make(severity, &[1]);
+            let ev = make(severity, "a");
             assert_eq!(event_log::decode(&event_log::encode(&ev)), Ok(ev));
         }
     }
 
     #[test]
     fn the_largest_values_round_trip() {
-        let ev = event::Event::new(u8::MAX, u16::MAX, event::Severity::Err, u64::MAX, &[]).unwrap();
+        let ev = event::Event {
+            source: u8::MAX,
+            code: u16::MAX,
+            severity: event::Severity::Err,
+            monotonic_us: u64::MAX,
+            text: fixed_str::FixedStr::EMPTY,
+        };
         assert_eq!(event_log::decode(&event_log::encode(&ev)), Ok(ev));
     }
 
     #[test]
-    fn layout_is_time_source_code_severity_len_args_padding_then_big_endian_crc() {
-        let ev = make(event::Severity::Warn, &[0xAA, 0xBB]);
+    fn layout_is_time_source_code_severity_text_padding_then_big_endian_crc() {
+        let ev = make(event::Severity::Warn, "AB");
         let record = event_log::encode(&ev);
 
         let mut expected = [0u8; event_log::CRC_OFFSET];
@@ -174,8 +194,7 @@ mod tests {
         expected[8] = 2; // source
         expected[9..11].copy_from_slice(&[0x01, 0x02]); // code
         expected[11] = 2; // severity: Warn
-        expected[12] = 2; // args_len
-        expected[13..15].copy_from_slice(&[0xAA, 0xBB]); // args, then zero padding
+        expected[12..14].copy_from_slice(b"AB"); // text, then zero padding
         assert_eq!(record[..event_log::CRC_OFFSET], expected);
 
         let crc = crc::crc16_ccitt_false(&expected);
@@ -184,7 +203,7 @@ mod tests {
 
     #[test]
     fn short_input_is_rejected() {
-        let record = event_log::encode(&info(&[]));
+        let record = event_log::encode(&info(""));
         assert_eq!(
             event_log::decode(&record[..event_log::RECORD_LEN - 1]),
             Err(event_log::DecodeError::BadLength)
@@ -194,7 +213,7 @@ mod tests {
     #[test]
     fn long_input_is_rejected() {
         let mut longer = [0u8; event_log::RECORD_LEN + 1];
-        longer[..event_log::RECORD_LEN].copy_from_slice(&event_log::encode(&info(&[])));
+        longer[..event_log::RECORD_LEN].copy_from_slice(&event_log::encode(&info("")));
         assert_eq!(
             event_log::decode(&longer),
             Err(event_log::DecodeError::BadLength)
@@ -203,7 +222,7 @@ mod tests {
 
     #[test]
     fn flipping_any_single_bit_is_rejected() {
-        let record = event_log::encode(&info(&[1, 2, 3]));
+        let record = event_log::encode(&info("abc"));
         for byte in 0..event_log::RECORD_LEN {
             for bit in 0..u8::BITS {
                 let mut damaged = record;
@@ -228,7 +247,7 @@ mod tests {
     #[test]
     fn unknown_severity_with_good_crc_is_rejected() {
         for code in [0, 4, 99] {
-            let mut record = event_log::encode(&info(&[]));
+            let mut record = event_log::encode(&info(""));
             record[event_log::SEVERITY_OFFSET] = code;
             assert_eq!(
                 event_log::decode(&resealed(record)),
@@ -238,34 +257,38 @@ mod tests {
     }
 
     #[test]
-    fn args_len_over_the_maximum_with_good_crc_is_rejected() {
-        for len in [event::EV_ARGS_MAX_BYTES as u8 + 1, u8::MAX] {
-            let mut record = event_log::encode(&info(&[]));
-            record[event_log::ARGS_LEN_OFFSET] = len;
-            assert_eq!(
-                event_log::decode(&resealed(record)),
-                Err(event_log::DecodeError::ArgsLenTooLong(len))
-            );
-        }
-    }
-
-    #[test]
-    fn nonzero_padding_with_good_crc_is_rejected() {
-        let mut record = event_log::encode(&info(&[1, 2]));
-        record[event_log::ARGS_OFFSET + 2] = 1; // the first padding byte
+    fn non_ascii_text_with_good_crc_is_rejected() {
+        let mut record = event_log::encode(&info("ab"));
+        record[event_log::TEXT_OFFSET] = 0xC3;
         assert_eq!(
             event_log::decode(&resealed(record)),
-            Err(event_log::DecodeError::NonZeroPadding)
+            Err(event_log::DecodeError::BadText(
+                fixed_str::Error::InvalidByte
+            ))
         );
     }
 
     #[test]
-    fn nonzero_padding_in_the_last_args_byte_is_rejected() {
-        let mut record = event_log::encode(&info(&[1, 2]));
-        record[event_log::CRC_OFFSET - 1] = 1;
+    fn nonzero_padding_with_good_crc_is_rejected() {
+        let mut record = event_log::encode(&info("ab"));
+        record[event_log::TEXT_OFFSET + 3] = b'x'; // after the first padding byte
         assert_eq!(
             event_log::decode(&resealed(record)),
-            Err(event_log::DecodeError::NonZeroPadding)
+            Err(event_log::DecodeError::BadText(
+                fixed_str::Error::NonZeroPadding
+            ))
+        );
+    }
+
+    #[test]
+    fn nonzero_padding_in_the_last_text_byte_is_rejected() {
+        let mut record = event_log::encode(&info("ab"));
+        record[event_log::CRC_OFFSET - 1] = b'x';
+        assert_eq!(
+            event_log::decode(&resealed(record)),
+            Err(event_log::DecodeError::BadText(
+                fixed_str::Error::NonZeroPadding
+            ))
         );
     }
 }

@@ -1,6 +1,15 @@
 //! What modules are told about how the previous run ended. The core fills this in at startup
 //! from the reset log, and modules read it through `ctx.reset`.
 
+use crate::config;
+use core::fmt;
+
+/// How many records the reset log may hold before the core rotates it at startup
+/// (`VEE_RESET_LOG_MAX_RECORDS`, default 1024). The startup code passes it to `reset_log::start`
+/// as `max_records`. (It is defined here, not in the core, so that `config.rs` can check it.)
+pub const RESET_LOG_MAX_RECORDS: u64 =
+    config::parse_or(option_env!("VEE_RESET_LOG_MAX_RECORDS"), 1024) as u64;
+
 /// Why a clean shutdown happened. An unclean end has no reason: it is inferred from a boot with
 /// no shutdown after it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,6 +26,18 @@ pub enum PreviousEnd {
     /// There is no record of a clean end. The previous run crashed, was killed, or lost power.
     /// Also the value on the very first boot, when there is no previous run at all.
     Unknown,
+}
+
+/// Short text for an event: `unknown`, `commanded` or `signal`. (A clean end shows just its
+/// reason, and `unknown` means there was no clean end.)
+impl fmt::Display for PreviousEnd {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            PreviousEnd::Unknown => "unknown",
+            PreviousEnd::Clean(ShutdownReason::Commanded) => "commanded",
+            PreviousEnd::Clean(ShutdownReason::Signal) => "signal",
+        })
+    }
 }
 
 /// The reset information for this run.
@@ -37,6 +58,32 @@ impl ResetInfo {
             count: 1,
             previous: PreviousEnd::Unknown,
             consecutive_unclean: 0,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super as reset;
+    use crate::fixed_str;
+    use core::fmt::Write as _;
+
+    #[test]
+    fn previous_end_displays_as_unknown_commanded_or_signal() {
+        for (previous, expected) in [
+            (reset::PreviousEnd::Unknown, "unknown"),
+            (
+                reset::PreviousEnd::Clean(reset::ShutdownReason::Commanded),
+                "commanded",
+            ),
+            (
+                reset::PreviousEnd::Clean(reset::ShutdownReason::Signal),
+                "signal",
+            ),
+        ] {
+            let mut text = fixed_str::FixedStr::<16>::EMPTY;
+            write!(text, "{previous}").unwrap();
+            assert_eq!(text.as_bytes(), expected.as_bytes());
         }
     }
 }

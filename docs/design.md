@@ -50,7 +50,8 @@ The core provides a minimal set of utilities to each module.
 - The core generates an ack or nak as an event on:
     - Valid/Invalid command received by the router
     - Success/Fail/Success(pending), after the module executes the command.
-- Each command sink is one event source. ACK and NAK are each an event code.
+- Acks and naks are ordinary text events (see Events), with the command's details (sink, target, opcode, seq, reason) written into the text. The ground reads them like any other event.
+- Inside Vee, a module that needs to know whether a command succeeded (an RTS that waits for success) does not read events. The router gives the sender a result for the command's `seq`, the same for every sink, and the sender collects it without blocking: it submits, keeps the `seq`, and checks for the result on a later cycle (everything runs on one thread). Not designed yet.
 - Each module has a fixed-depth command queue. A full queue is an immediate NAK.
 
 ``` rust
@@ -167,13 +168,13 @@ enum ResetLogEntry {
 
 ## Events
 - The core exposes an API for modules to emit events, through `ctx.ev`.
-- Every event has the same envelope: source (the module), code, severity, a monotonic time, and a fixed-size args payload (`EV_ARGS_MAX_BYTES`, 32 for now). Every event is the same size on the wire and on disk: an event that uses fewer args bytes is zero padded, and `len` says how many are used.
-- Each event code from a given source has a severity: info, warn, err.
-- Codes are explicit (`#[event(0x01, ...)]`, like `#[opcode(0x01)]` on commands), so reordering variants never changes the wire. A code is a `u16`, unique within its source.
-- Args are typed per event code. They are fixed-size primitives and fixed-size ASCII strings (`FixedStr<N>`, in `core-api`), so no allocation and no text formatting happens in flight. `FixedStr<N>` is exactly `N` bytes on the wire, zero padded, and the text ends at the first zero byte. Turning a longer `&str` into one cuts it off at `N` bytes, through a function whose name says so (`truncated`), never silently.
-- A derive generates the typed layer (below). It waits for a second user: the core's own events are written by hand first.
-- Each event code also has a text template, kept in the module's types crate. The ground tool uses it to render the args as text. The text is not sent over the wire.
-- Command acks and naks are ordinary events whose args carry the details (sink, command ref, reason). The reason is a `u8` code, not text, so it does not eat the args budget.
+- An event is a code and a short text. Inside a module, a code and a sentence is enough. If more detail is needed, add another code: codes are cheap. The text can carry values (`"open failed: {path} ({err})"`, written with `format_args!`), so the ground can read them. Events carry no typed args.
+- Every event has the same envelope: source (the module), code, severity, a monotonic time, and text of a fixed size (`EV_TEXT_MAX_BYTES`, 50 by default, set at build time: see Build-time settings). Every event is the same size on the wire and on disk: shorter text is zero padded.
+- The text is a `FixedStr<EV_TEXT_MAX_BYTES>` (`core-api`): ASCII only, exactly that many bytes on the wire, zero padded, ending at the first zero byte. Text that is too long is cut off and the event is still sent, because the ground log must see it (see Faults). A cut-off text ends in `~` (`fixed_str::TRUNCATED_MARK`, replacing the last kept byte), so a reader can see it was cut. A text of exactly the maximum length is not marked. Writing text with `format_args!` goes through `fmt::Write` on `FixedStr`, which cuts off the same way and never fails: a character that cannot be in the text (non-ASCII) becomes `?`. No allocation happens in flight.
+- The code is the value of an enum variant, on an enum marked `#[repr(u16)]`, one enum per source (a module's, or the core's). A code is a `u16`. Values are implicit (0, 1, 2, ... in the order written) and Rust refuses two variants with the same value, so codes are unique within an enum. The catch: a code is then the variant's position, so reordering variants or inserting one in the middle renumbers the codes after it, and old logs would decode wrongly. New events go at the end. A variant may be given an explicit value (`Started = 0x01`) to pin its code.
+- Each code has a fixed severity: info, warn, err. It is given once, on the variant, and the caller of `ctx.ev.send` never picks it.
+- `#[derive(event::Code)]` (core-derive; the trait is `event::Code`) generates the lookup (below). The core's own events use it exactly as a module's do.
+- Command acks and naks are plain events (see Commands). They have no special codes, kind bits or fields. They are written the same way as any other event, with the details in the text.
 - `ctx.ev` fills in `source` and `time`. A module cannot set either, so a module cannot claim another module's id.
 - `time` is `monotonic_us`: microseconds since this boot, from the OSAL's monotonic clock (what modules get from `ctx.monotonic()`). It restarts at every boot (it is not MET: there is no mission epoch) and it never jumps, so ordering within a run is always right. Runs are told apart by the boot event, so records carry no run id.
 - Absolute time (TAI) is not in the envelope. The core emits a time-correlation event (monotonic time plus TAI) whenever the offset is set or changes, and the ground converts. Not designed yet.
@@ -182,32 +183,34 @@ enum ResetLogEntry {
 // core-api
 enum Severity { Info, Warn, Err }
 
-const EV_ARGS_MAX_BYTES: usize = 32;
+const EV_TEXT_MAX_BYTES: usize = 50;   // the default: see `config`
 
 struct Event {
     source: u8,         // 0 = core. Filled in by ctx.ev.
     code: u16,
-    severity: Severity, // looked up from the code, not sent by the caller
+    severity: Severity, // looked up from the code, not chosen by the caller
     monotonic_us: u64,  // filled in by ctx.ev
-    len: u8,            // how many bytes of args are used
-    args: [u8; EV_ARGS_MAX_BYTES],  // encoded by the typed event
+    text: FixedStr<EV_TEXT_MAX_BYTES>,
 }
 
 /// <Module>-types.rs
-// #[derive(Event)] will generate:
-//   - per-variant arg encode/decode
-//   - a code -> severity lookup, and a compile error if a variant has no severity
-//   - a compile error if a variant's args do not fit in EV_ARGS_MAX_BYTES
-//   - a code -> text template lookup, used by ground-tool
-#[derive(Event)]
+// #[derive(event::Code)] generates `impl event::Code`, which has:
+//   - code(): the value of the variant (`Self::Started as u16`)
+//   - severity(): from the `#[severity(..)]` attribute (Info, Warn or Err). A variant without one,
+//     or with fields, is a compile error.
+#[derive(event::Code)]
+#[repr(u16)]
 enum FsEv {
-    #[event(0x01, Severity::Info, "started")]                        Started,
-    #[event(0x02, Severity::Err,  "open failed: {path} ({err})")]    OpenErr { path: FixedStr<24>, err: u8 },
+    #[severity(Info)]
+    Started,
+    #[severity(Err)]
+    OpenFailed,
 }
 
 // <Module> lib.rs
 fn do_something(&mut self, ctx: &mut Ctx) {
-    ctx.ev.send(FsEv::OpenErr { path, err });
+    ctx.ev.send(FsEv::Started, format_args!("started"));
+    ctx.ev.send(FsEv::OpenFailed, format_args!("open failed: {path} ({err})"));
 }
 ```
 
@@ -215,14 +218,14 @@ fn do_something(&mut self, ctx: &mut Ctx) {
 - The core keeps an event log on disk: every event emitted through `ctx.ev`, whatever the downlink `filter` says. The downlink may drop or filter events; the log is the on-board record.
 - It is a core feature, not a module. It sees events as they pass through the event service, so it needs no bus queue of its own.
 - The log is an append-only binary file of fixed-size records, using the same ideas as the reset log: fixed layout, explicit field-by-field encode and decode, CRC-16/CCITT-FALSE from `core-api`.
-- A record is the whole `Event` envelope plus the CRC, 47 bytes with `EV_ARGS_MAX_BYTES` at 32: `monotonic_us` (8), source (1), code (2), severity (1), len (1), args (32), CRC (2), all big-endian. Severity is stored even though it can be looked up from the code, so the log can be read without the module's types crate. Decode rejects a bad CRC, an unknown severity, `len` over the maximum, and non-zero padding.
+- A record is the whole `Event` envelope plus the CRC, 64 bytes with `EV_TEXT_MAX_BYTES` at its default of 50: `monotonic_us` (8), source (1), code (2), severity (1), text (50), CRC (2), all big-endian. Severity is stored even though it can be looked up from the code, so the log can be read without the module's types crate. Decode rejects a bad CRC, an unknown severity, and text that is not valid `FixedStr` content (a non-ASCII byte, non-zero padding).
 - There is no run id in a record. The reset report event is the first event of every run and carries the boot count, so a reader splits the log into runs at those events.
 - Writes during the tick loop must not block, so they go through the file service (a bounded request queue, like any other client). If that queue is full, the event is not written. The logger counts the missed events, and the next record that does get written carries the count (as an ordinary event, so the loss is never silent).
 - Events emitted before the tick loop starts (`init`, the reset log report) are written with blocking OSAL calls, the same way the reset log is. The loop has not started, so there is nothing to disturb.
 - Size cap: checked at startup, like the reset log. Over the cap, the log is renamed to `.1` and a new file starts. The cap is a named constant for now (see the compile-time settings open question in `progress.md`).
 - A partial last record (crash mid-append) is handled at startup like the reset log's: the whole records are kept, the log is renamed to `.1` (appending after a partial record would shift every later record), and the partial record is reported as an event.
 - A panic or abort loses whatever the file service had queued but not yet written. That is accepted; the log is for after-the-fact analysis, not a guaranteed record of the final moments.
-- The logger only writes. Reading the log (to downlink it, or to render it with the text templates) is done by ground tooling, or by a later file-dump command through the file service.
+- The logger only writes. Reading the log (to downlink it, or to show it) is done by ground tooling, or by a later file-dump command through the file service.
 - Not decided yet: whether the log is one file or one per source.
 
 ## OSAL Requirements
@@ -268,7 +271,7 @@ fn command(&mut self, cmd: FsCmd, ctx: &mut Ctx, r: CmdRef) -> CmdResult {
 
 ### Faults
 - Panics abort the process. Flight crates build with `panic = "abort"`, so there is no unwinding and no recovery from a panic.
-- A panic is the last resort, for when there is truly no alternative. Whenever there is a way to handle an error, Vee handles it and carries on, and reports it as an event. For example, an event whose args are too long is still sent, with the args cut off, because the ground log must see it. Flight code does not `unwrap` or `expect` to skip an error case.
+- A panic is the last resort, for when there is truly no alternative. Whenever there is a way to handle an error, Vee handles it and carries on, and reports it as an event. For example, an event whose text is too long is still sent, with the text cut off, because the ground log must see it. Flight code does not `unwrap` or `expect` to skip an error case.
 - The panic handler lives in the OSAL. It only reports the panic location (a plain write to stderr) and then aborts. It does not touch the reset log, so a panic leaves the last run as `Unknown`.
 - A watchdog trips if the main loop stops ticking. A trip aborts the process, the same as a panic.
 - Vee does nothing beyond aborting. Restarting the process is up to the supervisor (for example systemd), including detecting a reset loop and rebooting the system. The reset log's `consecutive_unclean` is there for modules that want to react to a loop on their own.
@@ -299,3 +302,11 @@ exec! {
 ```
 
 In the above example, note how Ctx is a universal type. Start with that, then we can derive module specific Ctx types later, to enforce device access rules at compile time.
+
+## Build-time settings
+- Important sizes and limits are fixed when Vee is built, and a deployment can override them without editing Vee. Each setting is a constant defined next to the code that uses it, with its default there. `config::parse_or` reads it. `core-api/src/config.rs` also holds the checks on every setting's value (a `const _` assert each), so they can be audited in one place.
+- A setting is an environment variable named `VEE_<NAME>`, read with `option_env!` while compiling. A deployment sets it in the `[env]` table of its own `.cargo/config.toml`, in the directory cargo is run from (`sample-deployment/.cargo/config.toml` is the example). Cargo reads config files from where it is run, not from a dependency's directory, so Vee ships no config of its own: its defaults are in the code.
+- Where a value comes from, highest first: the real environment, `cargo build --config file.toml`, the nearest `.cargo/config.toml` (then those above it), the default in the code.
+- A value that is not a plain whole number, is too big, or breaks a check stops the build with an error that points at the setting. The check runs in a `const`, so it is a compile error and never a panic in flight.
+- The core, the modules and the ground tool must all be built with the same values, because some are part of the log format (`EV_TEXT_MAX_BYTES` sets the event log record size). Nothing checks this at runtime yet.
+- To add a setting: define it where it is used (in `core-api`, because `config.rs` can only check constants it can see), add its check to `config.rs`, and add a line to the sample deployment's config. Search for `option_env!` to list them all.

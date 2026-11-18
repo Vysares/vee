@@ -3,5 +3,8 @@ name = "vee-core-api"
 edition.workspace = true
 version.workspace = true
 
+[dependencies]
+vee-core-derive = { path = "../core-derive" }
+
 [lints]
 workspace = true

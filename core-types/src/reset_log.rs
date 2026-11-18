@@ -10,6 +10,7 @@
 //! fields, zero padded up to the size of the largest variant. The CRC covers the tag and the
 //! payload. Multi-byte numbers are big-endian.
 
+use core::fmt;
 use vee_core_api::crc;
 use vee_core_api::reset;
 
@@ -70,6 +71,19 @@ pub enum DecodeError {
     NonZeroPadding,
 }
 
+/// Short text for an event, such as `bad crc` or `unknown tag 99`.
+impl fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DecodeError::BadLength => write!(f, "bad length"),
+            DecodeError::BadCrc => write!(f, "bad crc"),
+            DecodeError::UnknownTag(tag) => write!(f, "unknown tag {tag}"),
+            DecodeError::UnknownReason(reason) => write!(f, "unknown reason {reason}"),
+            DecodeError::NonZeroPadding => write!(f, "non-zero padding"),
+        }
+    }
+}
+
 impl ResetLogEntry {
     pub fn encode(&self) -> [u8; RECORD_LEN] {
         let mut record = [0u8; RECORD_LEN];
@@ -119,7 +133,9 @@ impl ResetLogEntry {
 #[cfg(test)]
 mod tests {
     use super as reset_log;
+    use core::fmt::Write as _;
     use vee_core_api::crc;
+    use vee_core_api::fixed_str;
     use vee_core_api::reset;
 
     /// Builds a record with a correct CRC from a tag and payload, so tests can make records that
@@ -253,5 +269,20 @@ mod tests {
             reset_log::ResetLogEntry::decode(&record),
             Err(reset_log::DecodeError::NonZeroPadding)
         );
+    }
+
+    #[test]
+    fn decode_errors_display_as_short_text() {
+        for (error, expected) in [
+            (reset_log::DecodeError::BadLength, "bad length"),
+            (reset_log::DecodeError::BadCrc, "bad crc"),
+            (reset_log::DecodeError::UnknownTag(99), "unknown tag 99"),
+            (reset_log::DecodeError::UnknownReason(7), "unknown reason 7"),
+            (reset_log::DecodeError::NonZeroPadding, "non-zero padding"),
+        ] {
+            let mut text = fixed_str::FixedStr::<32>::EMPTY;
+            write!(text, "{error}").unwrap();
+            assert_eq!(text.as_bytes(), expected.as_bytes());
+        }
     }
 }

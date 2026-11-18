@@ -1,0 +1,83 @@
+//! The core's own events.
+//!
+//! They are made the same way as any module's: an enum of codes with `#[derive(event::Code)]`.
+//! The derive writes `code()` and `severity()` for it (see `vee_core_api::event::Code`). An
+//! event's details are not part of the code: they are written into its text where the core sends
+//! it, for example "reset 7: previous run ended clean (signal), 3 unclean in a row".
+//!
+//! Who calls what: the core calls `code()` and `severity()` on a `CoreEvent` when it builds the
+//! `Event` for it, with `SOURCE` and the text. The methods are the `Code` trait's. To call them,
+//! import it with `use vee_core_api::event::Code as _;`.
+
+use vee_core_api::event;
+
+/// The core's source id.
+pub const SOURCE: u8 = 0;
+
+/// An event the core sends about itself. Each variant's value is its event code: they count up
+/// from 0 in the order written, so new events go at the end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, event::Code)]
+#[repr(u16)]
+pub enum CoreEvent {
+    /// Sent once at startup, after the reset log is read. It is the first event of every run,
+    /// so a reader of the event log can split the log into runs at these. The text has this
+    /// run's boot count, how the previous run ended, and how many unclean runs came before.
+    #[severity(Info)]
+    ResetReport,
+
+    /// The reset log ends part way through a record.
+    #[severity(Warn)]
+    ResetLogPartialRecord,
+
+    /// A record in the reset log could not be decoded. The text says why.
+    #[severity(Err)]
+    ResetLogCorruptRecord,
+
+    /// The reset log's records decode, but are in an order a real log never has.
+    #[severity(Err)]
+    ResetLogMisorderedRecords,
+
+    /// The reset log's last boot count is the largest a `u32` can hold.
+    #[severity(Err)]
+    ResetLogCountOverflow,
+}
+
+#[cfg(test)]
+mod tests {
+    use super as core_event;
+    use vee_core_api::event;
+    use vee_core_api::event::Code as _;
+
+    #[test]
+    fn the_core_is_source_zero() {
+        assert_eq!(core_event::SOURCE, 0);
+    }
+
+    #[test]
+    fn codes_count_up_from_zero_in_the_order_written() {
+        assert_eq!(core_event::CoreEvent::ResetReport.code(), 0);
+        assert_eq!(core_event::CoreEvent::ResetLogPartialRecord.code(), 1);
+        assert_eq!(core_event::CoreEvent::ResetLogCorruptRecord.code(), 2);
+        assert_eq!(core_event::CoreEvent::ResetLogMisorderedRecords.code(), 3);
+        assert_eq!(core_event::CoreEvent::ResetLogCountOverflow.code(), 4);
+    }
+
+    #[test]
+    fn severities_are_info_for_the_report_warn_for_a_partial_record_and_err_otherwise() {
+        assert_eq!(
+            core_event::CoreEvent::ResetReport.severity(),
+            event::Severity::Info
+        );
+        assert_eq!(
+            core_event::CoreEvent::ResetLogPartialRecord.severity(),
+            event::Severity::Warn
+        );
+        for ev in [
+            core_event::CoreEvent::ResetLogCorruptRecord,
+            core_event::CoreEvent::ResetLogMisorderedRecords,
+            core_event::CoreEvent::ResetLogCountOverflow,
+        ] {
+            assert_eq!(ev.severity(), event::Severity::Err);
+        }
+    }
+}

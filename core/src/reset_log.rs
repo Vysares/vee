@@ -3,7 +3,9 @@
 //! `read_tail` has no I/O. It works on records that have already been read, so it can be tested
 //! with plain byte arrays. `start` and `stop` do the file work, through the OSAL's `Files`.
 
+use core::fmt;
 use vee_core_api::reset;
+use vee_core_types::core_event;
 use vee_core_types::reset_log as log_types;
 use vee_osal::files;
 
@@ -198,10 +200,57 @@ pub fn stop<F: files::Files>(
     )
 }
 
+/// Turns what `start` found into the events to send: first the reset report, then one event for
+/// each problem, in the order `start` found them. It calls `send` once per event, with the event's
+/// code and its text.
+///
+/// It does no I/O and sends nothing itself, so it can be tested on its own. The startup code
+/// calls it as `report(&started, |code, text| ctx.ev.send(code, text))`. The text is given as
+/// `fmt::Arguments` (the result of `format_args!`), so the event service is the one that writes it
+/// into the event's fixed size text, and cuts it off if it does not fit.
+pub fn report<F>(started: &Started, mut send: F)
+where
+    F: FnMut(core_event::CoreEvent, fmt::Arguments<'_>),
+{
+    let reset::ResetInfo {
+        count,
+        previous,
+        consecutive_unclean,
+    } = started.info;
+    send(
+        core_event::CoreEvent::ResetReport,
+        format_args!("reset {count}: prev end {previous}, {consecutive_unclean} unclean in a row"),
+    );
+
+    for problem in started.problems.iter().flatten() {
+        match problem {
+            Problem::PartialRecord => send(
+                core_event::CoreEvent::ResetLogPartialRecord,
+                format_args!("reset log ends in a partial record"),
+            ),
+            Problem::CorruptRecord(error) => send(
+                core_event::CoreEvent::ResetLogCorruptRecord,
+                format_args!("reset log corrupt record: {error}"),
+            ),
+            Problem::MisorderedRecords => send(
+                core_event::CoreEvent::ResetLogMisorderedRecords,
+                format_args!("reset log records are out of order"),
+            ),
+            Problem::CountOverflow => send(
+                core_event::CoreEvent::ResetLogCountOverflow,
+                format_args!("reset log boot count is at its maximum"),
+            ),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super as reset_log;
+    use core::fmt::Write as _;
+    use vee_core_api::fixed_str;
     use vee_core_api::reset;
+    use vee_core_types::core_event;
     use vee_core_types::reset_log as log_types;
     use vee_osal::fake_files;
     use vee_osal::files::Files as _;
@@ -540,5 +589,170 @@ mod tests {
         expected[..log_types::RECORD_LEN].copy_from_slice(&boot(1).encode());
         expected[log_types::RECORD_LEN..].copy_from_slice(&shutdown(SIGNAL).encode());
         assert_eq!(files.get(PATH).as_deref(), Some(&expected[..]));
+    }
+
+    // ---- report ----
+
+    /// The text of one event, written the way the event service will write it. Longer than any
+    /// event's text, so these tests do not depend on `EV_TEXT_MAX_BYTES`.
+    type Sent = (core_event::CoreEvent, fixed_str::FixedStr<80>);
+
+    /// Everything `report` sends, in order, and how many events that was.
+    fn reported(started: &reset_log::Started) -> ([Option<Sent>; 3], usize) {
+        let mut sent = [None; 3];
+        let mut count = 0;
+        reset_log::report(started, |code, text| {
+            let mut written = fixed_str::FixedStr::EMPTY;
+            write!(written, "{text}").unwrap();
+            sent[count] = Some((code, written));
+            count += 1;
+        });
+        (sent, count)
+    }
+
+    fn started(
+        info: reset::ResetInfo,
+        problems: [Option<reset_log::Problem>; reset_log::MAX_START_PROBLEMS],
+    ) -> reset_log::Started {
+        reset_log::Started { info, problems }
+    }
+
+    fn info(count: u32, previous: reset::PreviousEnd, unclean: u32) -> reset::ResetInfo {
+        reset::ResetInfo {
+            count,
+            previous,
+            consecutive_unclean: unclean,
+        }
+    }
+
+    fn text_of(sent: &Option<Sent>) -> &[u8] {
+        sent.as_ref().unwrap().1.as_bytes()
+    }
+
+    #[test]
+    fn with_no_problems_only_the_reset_report_is_sent() {
+        let started = started(info(7, reset::PreviousEnd::Clean(SIGNAL), 0), no_problems());
+        let (sent, count) = reported(&started);
+        assert_eq!(count, 1);
+        assert_eq!(sent[0].unwrap().0, core_event::CoreEvent::ResetReport);
+        assert_eq!(
+            text_of(&sent[0]),
+            b"reset 7: prev end signal, 0 unclean in a row"
+        );
+    }
+
+    #[test]
+    fn the_report_text_has_the_count_how_the_last_run_ended_and_the_unclean_count() {
+        let first = started(reset::ResetInfo::first_boot(), no_problems());
+        assert_eq!(
+            text_of(&reported(&first).0[0]),
+            b"reset 1: prev end unknown, 0 unclean in a row"
+        );
+        let commanded = started(
+            info(12, reset::PreviousEnd::Clean(COMMANDED), 0),
+            no_problems(),
+        );
+        assert_eq!(
+            text_of(&reported(&commanded).0[0]),
+            b"reset 12: prev end commanded, 0 unclean in a row"
+        );
+        let crashed = started(info(5, reset::PreviousEnd::Unknown, 3), no_problems());
+        assert_eq!(
+            text_of(&reported(&crashed).0[0]),
+            b"reset 5: prev end unknown, 3 unclean in a row"
+        );
+    }
+
+    #[test]
+    fn each_problem_is_sent_as_its_own_event_with_its_own_text() {
+        for (problem, code, text) in [
+            (
+                reset_log::Problem::PartialRecord,
+                core_event::CoreEvent::ResetLogPartialRecord,
+                &b"reset log ends in a partial record"[..],
+            ),
+            (
+                reset_log::Problem::CorruptRecord(log_types::DecodeError::BadCrc),
+                core_event::CoreEvent::ResetLogCorruptRecord,
+                &b"reset log corrupt record: bad crc"[..],
+            ),
+            (
+                reset_log::Problem::CorruptRecord(log_types::DecodeError::UnknownTag(99)),
+                core_event::CoreEvent::ResetLogCorruptRecord,
+                &b"reset log corrupt record: unknown tag 99"[..],
+            ),
+            (
+                reset_log::Problem::MisorderedRecords,
+                core_event::CoreEvent::ResetLogMisorderedRecords,
+                &b"reset log records are out of order"[..],
+            ),
+            (
+                reset_log::Problem::CountOverflow,
+                core_event::CoreEvent::ResetLogCountOverflow,
+                &b"reset log boot count is at its maximum"[..],
+            ),
+        ] {
+            let started = started(reset::ResetInfo::first_boot(), [Some(problem), None]);
+            let (sent, count) = reported(&started);
+            assert_eq!(count, 2, "{problem:?}");
+            assert_eq!(sent[1].unwrap().0, code, "{problem:?}");
+            assert_eq!(text_of(&sent[1]), text, "{problem:?}");
+        }
+    }
+
+    #[test]
+    fn the_reset_report_is_first_and_problems_follow_in_the_order_start_found_them() {
+        let started = started(
+            reset::ResetInfo::first_boot(),
+            [
+                Some(reset_log::Problem::PartialRecord),
+                Some(reset_log::Problem::MisorderedRecords),
+            ],
+        );
+        let (sent, count) = reported(&started);
+        assert_eq!(count, 3);
+        assert_eq!(sent[0].unwrap().0, core_event::CoreEvent::ResetReport);
+        assert_eq!(
+            sent[1].unwrap().0,
+            core_event::CoreEvent::ResetLogPartialRecord
+        );
+        assert_eq!(
+            sent[2].unwrap().0,
+            core_event::CoreEvent::ResetLogMisorderedRecords
+        );
+    }
+
+    #[test]
+    fn a_problem_in_the_second_slot_alone_is_still_sent() {
+        let started = started(
+            reset::ResetInfo::first_boot(),
+            [None, Some(reset_log::Problem::CountOverflow)],
+        );
+        let (sent, count) = reported(&started);
+        assert_eq!(count, 2);
+        assert_eq!(
+            sent[1].unwrap().0,
+            core_event::CoreEvent::ResetLogCountOverflow
+        );
+    }
+
+    #[test]
+    fn report_works_on_what_start_returns() {
+        // A log whose last record is half written: `start` finds the problem, `report` sends it.
+        let files = files_with(&[boot(3), shutdown(COMMANDED)]);
+        let mut bytes = files.get(PATH).unwrap();
+        bytes.extend_from_slice(&[1, 2, 3]);
+        files.put(PATH, &bytes);
+        let started = reset_log::start(&files, PATH, CAP).unwrap();
+        let (sent, count) = reported(&started);
+        assert_eq!(count, 2);
+        assert_eq!(
+            text_of(&sent[0]),
+            b"reset 4: prev end commanded, 0 unclean in a row"
+        );
+        assert_eq!(
+            sent[1].unwrap().0,
+            core_event::CoreEvent::ResetLogPartialRecord
+        );
     }
 }
