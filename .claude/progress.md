@@ -33,25 +33,114 @@ source of truth for what we want, and this file is the source of truth for what 
    those through `ctx.reset` and only depend on core-api. The log's wire codes for
    `ShutdownReason` stay in core-types as private free functions.
 
+6. **OSAL file trait** (reset log step 2, first half): `osal/src/files.rs` has `trait Files`, all
+   methods `&self` (real impl is stateless; the fake uses a `Mutex`): `len` -> `Option<u64>`
+   (`None` = missing), `read_at` exact read, `read_file` / `write_file` whole file (caller's
+   buffer; write is all-or-nothing by contract, real impl must temp-file + rename), `append`
+   flushed, `rotate` to `.1`. `FileError` (see item 10 for its current variants). `osal/src/fake_files.rs` has the
+   in-memory `FakeFiles` (public, with `put` and `get` helpers for tests). 14 tests. No derives.
+   Both logs (reset and event) stay binary, decided because events can be very numerous.
+
+7. **Reset log `start` and `stop`** (`core/src/reset_log.rs`, reset log step 2 complete). Both are
+   generic over `F: Files` and return `Result<_, FileError>`. `start(files, path, max_records) ->
+   Started { info, problems: [Option<Problem>; 2] }` (slot 0 = `PartialRecord`, slot 1 = the
+   `read_tail` problem). `stop(files, path, reason)` appends `Shutdown`. Added
+   `Problem::PartialRecord`. 22 tests in core. No derives.
+   **Rotation rule:** `start` renames the log to `.1` (replacing any old `.1`) if it is over the
+   cap, ends in a partial record (appending would misalign every later record, and `Files` has no
+   truncate), or `read_tail` found a problem (else the bad record stays in the 8 record window and
+   the count restarts at 1 on every boot until it scrolls out). The count is kept across a
+   partial-record rotation, and restarts at 1 after a corrupt-record rotation.
+   A missing file skips the read (`read_at` on a missing file is `NotFound`).
+
+8. **Import style conversion** (new rule in CLAUDE.md: import modules, not items, no globs, traits
+   only as `use path::Trait as _;`). All crates converted. Test modules use `use super as <name>;`
+   (for example `reset_log::start`) in place of `use super::*`. In `core/src/reset_log.rs`,
+   `vee_core_types::reset_log` is imported as `log_types` (it clashes with this module's own name
+   and with `record` variables), and `start` and `stop` take `fs: &F` so the parameter is not
+   confused with the `files` module. In `osal` tests, the fake is called `fake`, not `files`.
+   For a generic `F: files::Files`, the trait's methods are callable without importing the trait.
+   No behaviour change; same 55 tests pass.
+
+9. **Real `Files`** (`osal/src/std_files.rs`, reset log step 3): `StdFiles`, a unit struct on
+   `std::fs`. `impl From<io::Error> for FileError` lets `?` convert std errors (see item 10). `read_at` is seek + `read_exact` (portable, not
+   the unix-only `FileExt`). `write_file` writes `<path>.tmp`, `sync_all`, then renames over the
+   real file. `append` is create + append + `sync_data`. `rotate` is `fs::rename` to `<path>.1`.
+   Not done: syncing the parent directory after a rename, so a power cut right after a rotate or
+   write can in theory lose the rename itself (the old-or-new guarantee still holds). 16 tests
+   against a temp directory under the OS temp dir (no new dependency). No derives.
+
+10. **`FileError` follows `std::io::ErrorKind`**: variants are `NotFound`, `PermissionDenied`,
+   `StorageFull`, `UnexpectedEof` (was `ShortRead`), `Other` (was `Io`), and `TooLarge`, the only
+   one with no std equivalent (a file bigger than the caller's buffer). Also implements `Display`
+   and `core::error::Error`. `std_files.rs` has `From<io::Error>` so its methods use `?`, which
+   replaced the two mapping helper functions. Any std kind not listed becomes `Other`. Add a
+   variant (same name as std's) when something needs to tell it apart. `core` only names the type,
+   so it did not change. 32 osal tests.
+
+11. **Event envelope designed** (`docs/design.md`, Events and Event Logger sections rewritten).
+    Decided: one typed envelope for all events. `Event { source: u8, code: u16, severity,
+    monotonic_us: u64, len: u8, args: [u8; EV_ARGS_MAX_BYTES] }`, `EV_ARGS_MAX_BYTES` = 32. Same
+    size on the wire and on disk, zero padded. A log record is the envelope plus CRC-16, 47 bytes
+    (8 time, 1 source, 2 code, 1 severity, 1 len, 32 args, 2 CRC), big-endian, hand-written codec
+    in core-types like the reset log. No run id in records: the reset report event is the first
+    event of each run and carries the boot count. Event codes are explicit (`#[event(0x01, ...)]`).
+    Severity is kept in the record. `ctx.ev` fills in `source` and `time`, so a module cannot set
+    them. Time is `monotonic_us`: microseconds since boot, from the OSAL's monotonic clock, and
+    modules get it from `ctx.monotonic()` (renamed from `ctx.now()`). It is NOT MET (restarts each
+    boot, no mission epoch). TAI is not in the envelope: a time-correlation event (monotonic plus
+    TAI, whenever the offset changes) lets ground convert. Not designed yet. The event log handles
+    a partial last record like the reset log (rotate at startup).
+    Considered and rejected: cFS-style text in every event (too large, no typed fields for ground);
+    a `u32` event code (24 bits of source + code is plenty); a cycle count (monotonic_us already
+    orders events). Not in the doc, still pending a yes: call-site location (`#[track_caller]`,
+    `Location::caller()`), start with in-memory only, no wire bytes.
+12. **`FixedStr<N>`** (`core-api/src/fixed_str.rs`). `struct FixedStr<const N: usize>([u8; N])`,
+    ASCII only, exactly N bytes on the wire, zero padded, text ends at the first zero byte, so no
+    length field and it can never hold a zero. `EMPTY`, `truncated(&str)` (visible name: cuts off
+    at N; rejects any invalid byte even in the cut off part), `from_bytes([u8; N])` (rejects a
+    non-ASCII byte and non-zero padding), `to_bytes`, `as_bytes`, and `Display` (prints the
+    text, for the ground's templates). `Error { InvalidByte, NonZeroPadding }`. Private field, so
+    the invariant always holds. 14 tests. No derives, no dependencies, no unsafe. Considered
+    `heapless` and `arrayvec`, but we would write the wire codec ourselves anyway.
+
+13. **Event envelope types** (`core-api/src/event.rs`, event step 1). `Severity { Info, Warn,
+    Err }`, `EV_ARGS_MAX_BYTES` (32, with a compile time assert that it fits a `u8`), `Error {
+    ArgsTooLong }`, and `Event`. `source`, `code`, `severity` and `monotonic_us` are public.
+    `len` and `args` are private so they always agree (len at most the maximum, all bytes after
+    len zero), which is why the derived `==` is correct. Only way to make one: `Event::new(source,
+    code, severity, monotonic_us, args: &[u8]) -> Result<Event, Error>`, which copies and zero
+    pads. `args()` returns the used bytes. Derives on all: `Debug, Clone, Copy, PartialEq, Eq`
+    (no `Ord` on `Severity` yet: add it when the downlink filter needs it). No wire codes for
+    `Severity` yet: they belong in core-types with the record codec, like `ShutdownReason`'s.
+    The record codec will need the full padded args, so add an accessor then. 8 tests.
+
+14. **Event log record codec** (`core-types/src/event_log.rs`, event step 2). Free functions, not
+    methods, because `Event` is defined in core-api and Rust does not allow adding methods to
+    another crate's type: `event_log::encode(&Event) -> [u8; RECORD_LEN]` and
+    `event_log::decode(&[u8]) -> Result<Event, DecodeError>`. `RECORD_LEN` is 47: monotonic_us 8,
+    source 1, code 2, severity 1, args_len 1, args 32, crc 2, big-endian, CRC over everything
+    before it. Severity wire codes are private (Info 1, Warn 2, Err 3; 0 is never valid, so a
+    zero-filled record is rejected). `DecodeError { BadLength, BadCrc, UnknownSeverity(u8),
+    ArgsLenTooLong(u8), NonZeroPadding }`. Decode builds the event with `Event::new`, so a decoded
+    event is as good as a live one. 13 tests, including every single-bit flip being rejected.
+15. **New rule** (CLAUDE.md and the design doc's Faults section): handle errors whenever there
+    is a way to, panic only when there is no alternative, and never `unwrap` or `expect` in
+    flight code to skip an error case. Example: an event with too-long args is still sent, with
+    the args cut off, because the ground log must see it. Consequence still to implement:
+    `Event::new` is strict (`ArgsTooLong`, which the record decode also relies on), so the event
+    SERVICE must handle that error by sending the event with its args cut to the maximum. Decide
+    when the service is written whether the cut event also carries a marker.
+
+Size on 2026-11-17 (cloc, working tree, no target dir): 14 Rust files, 1729 lines of code (about
+614 outside test modules, 1115 inside them), 255 comment lines, plus about 409 lines of Markdown.
+
 ## Next
-**Reset log logic in `core`, steps 2 and 3.** Step 1 is done (see Done, item 5). Scoped. Three operations, all blocking and called
-straight through the OSAL (not the file service):
-- **start** (before any module `init`): read the log tail, rotate to `.1` if over the size cap,
-  append `Boot { count + 1 }`, return `ResetInfo` plus the list of problems found.
-- **stop** (clean shutdown): append `Shutdown { reason }`.
-- **report**: emit an event with the previous end and the new count. Needs the event service,
-  so it waits. `start` returns the problems for the caller to turn into events later.
-
-`ResetInfo` = `count`, `previous` (`Clean(ShutdownReason)` or `Unknown`), `consecutive_unclean`.
-
-Steps, each separate and tested before the next:
-1. DONE. `ResetInfo` and the tail reader as pure functions. (A partial last record is NOT
-   handled by the reader. Step 2 owns it: `as_chunks::<RECORD_LEN>()` on the bytes read gives
-   whole records plus the remainder, and a non-empty remainder becomes a reported
-   `Problem::PartialRecord` that does not discard the valid records before it.)
-2. The OSAL file trait (`read_tail`, `append` with flush, `rotate`; a missing file is a distinct
-   result, not an error), an in-memory fake for tests, and `start` and `stop` built on it.
-3. The real file implementation in `vee-osal`, tested against a temp directory.
+**Event envelope in code, step 3: the core's own events, hand-written** in `core-types`. The reset
+report is the first (previous end and new count), then one event per `reset_log::Problem`. Each
+needs a code, a severity, args encode and decode, and a text template, written by hand as the
+model for the future derive. This unblocks `report` in the reset log. The event service queues and
+the logger wait for `ctx` and the file service. The derive waits for a second user.
 
 ## Decisions to remember
 - Only boots are counted. A `Boot` with no `Shutdown` after it means the run ended `Unknown`.
@@ -80,7 +169,9 @@ Steps, each separate and tested before the next:
   Needs a design pass before it spreads.
 - Whether a lone `Shutdown` as the first record of a log shorter than the tail window should be
   an error. Today it is accepted, because the reader cannot tell a cut window from a short file.
-- The OSAL file trait's exact shape (decided in step 2).
+- Event logger: one file or one per source?
+- Time correlation event (monotonic to TAI): when it is emitted, what it carries.
+- Whether to add call-site location to events (see item 11).
 
 ## Not started
 `core-derive`, command routing, software bus, tables, events, file service, `exec!`, modules,

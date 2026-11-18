@@ -2,4 +2,6 @@
 #![no_std]
 
 pub mod crc;
+pub mod event;
+pub mod fixed_str;
 pub mod reset;

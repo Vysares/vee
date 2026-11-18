@@ -167,32 +167,42 @@ enum ResetLogEntry {
 
 ## Events
 - The core exposes an API for modules to emit events, through `ctx.ev`.
-- Every event has the same envelope: source (the module), code, severity, and a small fixed-size args payload.
+- Every event has the same envelope: source (the module), code, severity, a monotonic time, and a fixed-size args payload (`EV_ARGS_MAX_BYTES`, 32 for now). Every event is the same size on the wire and on disk: an event that uses fewer args bytes is zero padded, and `len` says how many are used.
 - Each event code from a given source has a severity: info, warn, err.
-- Args are typed per event code, from a derive. They are fixed-size primitives (and fixed-capacity strings), so no allocation and no text formatting happens in flight.
+- Codes are explicit (`#[event(0x01, ...)]`, like `#[opcode(0x01)]` on commands), so reordering variants never changes the wire. A code is a `u16`, unique within its source.
+- Args are typed per event code. They are fixed-size primitives and fixed-size ASCII strings (`FixedStr<N>`, in `core-api`), so no allocation and no text formatting happens in flight. `FixedStr<N>` is exactly `N` bytes on the wire, zero padded, and the text ends at the first zero byte. Turning a longer `&str` into one cuts it off at `N` bytes, through a function whose name says so (`truncated`), never silently.
+- A derive generates the typed layer (below). It waits for a second user: the core's own events are written by hand first.
 - Each event code also has a text template, kept in the module's types crate. The ground tool uses it to render the args as text. The text is not sent over the wire.
-- Command acks and naks are ordinary events whose args carry the details (sink, command ref, reason).
+- Command acks and naks are ordinary events whose args carry the details (sink, command ref, reason). The reason is a `u8` code, not text, so it does not eat the args budget.
+- `ctx.ev` fills in `source` and `time`. A module cannot set either, so a module cannot claim another module's id.
+- `time` is `monotonic_us`: microseconds since this boot, from the OSAL's monotonic clock (what modules get from `ctx.monotonic()`). It restarts at every boot (it is not MET: there is no mission epoch) and it never jumps, so ordering within a run is always right. Runs are told apart by the boot event, so records carry no run id.
+- Absolute time (TAI) is not in the envelope. The core emits a time-correlation event (monotonic time plus TAI) whenever the offset is set or changes, and the ground converts. Not designed yet.
 
 ``` rust
-// Core's ev.rs
+// core-api
 enum Severity { Info, Warn, Err }
 
+const EV_ARGS_MAX_BYTES: usize = 32;
+
 struct Event {
-    source: u8,         // 0 = core
+    source: u8,         // 0 = core. Filled in by ctx.ev.
     code: u16,
     severity: Severity, // looked up from the code, not sent by the caller
-    args: [u8; EV_ARGS_MAX], len: u8,  // encoded by the derive
+    monotonic_us: u64,  // filled in by ctx.ev
+    len: u8,            // how many bytes of args are used
+    args: [u8; EV_ARGS_MAX_BYTES],  // encoded by the typed event
 }
 
 /// <Module>-types.rs
-// #[derive(Event)] generates:
+// #[derive(Event)] will generate:
 //   - per-variant arg encode/decode
 //   - a code -> severity lookup, and a compile error if a variant has no severity
+//   - a compile error if a variant's args do not fit in EV_ARGS_MAX_BYTES
 //   - a code -> text template lookup, used by ground-tool
 #[derive(Event)]
 enum FsEv {
-    #[event(Severity::Info, "started")]                        Started,
-    #[event(Severity::Err,  "open failed: {path} ({err})")]    OpenErr { path: Path, err: u8 },
+    #[event(0x01, Severity::Info, "started")]                        Started,
+    #[event(0x02, Severity::Err,  "open failed: {path} ({err})")]    OpenErr { path: FixedStr<24>, err: u8 },
 }
 
 // <Module> lib.rs
@@ -201,10 +211,24 @@ fn do_something(&mut self, ctx: &mut Ctx) {
 }
 ```
 
+### Event Logger
+- The core keeps an event log on disk: every event emitted through `ctx.ev`, whatever the downlink `filter` says. The downlink may drop or filter events; the log is the on-board record.
+- It is a core feature, not a module. It sees events as they pass through the event service, so it needs no bus queue of its own.
+- The log is an append-only binary file of fixed-size records, using the same ideas as the reset log: fixed layout, explicit field-by-field encode and decode, CRC-16/CCITT-FALSE from `core-api`.
+- A record is the whole `Event` envelope plus the CRC, 47 bytes with `EV_ARGS_MAX_BYTES` at 32: `monotonic_us` (8), source (1), code (2), severity (1), len (1), args (32), CRC (2), all big-endian. Severity is stored even though it can be looked up from the code, so the log can be read without the module's types crate. Decode rejects a bad CRC, an unknown severity, `len` over the maximum, and non-zero padding.
+- There is no run id in a record. The reset report event is the first event of every run and carries the boot count, so a reader splits the log into runs at those events.
+- Writes during the tick loop must not block, so they go through the file service (a bounded request queue, like any other client). If that queue is full, the event is not written. The logger counts the missed events, and the next record that does get written carries the count (as an ordinary event, so the loss is never silent).
+- Events emitted before the tick loop starts (`init`, the reset log report) are written with blocking OSAL calls, the same way the reset log is. The loop has not started, so there is nothing to disturb.
+- Size cap: checked at startup, like the reset log. Over the cap, the log is renamed to `.1` and a new file starts. The cap is a named constant for now (see the compile-time settings open question in `progress.md`).
+- A partial last record (crash mid-append) is handled at startup like the reset log's: the whole records are kept, the log is renamed to `.1` (appending after a partial record would shift every later record), and the partial record is reported as an event.
+- A panic or abort loses whatever the file service had queued but not yet written. That is accepted; the log is for after-the-fact analysis, not a guaranteed record of the final moments.
+- The logger only writes. Reading the log (to downlink it, or to render it with the text templates) is done by ground tooling, or by a later file-dump command through the file service.
+- Not decided yet: whether the log is one file or one per source.
+
 ## OSAL Requirements
 - The OSAL is a thin wrapper around std/POSIX calls. It assumes a std implementation exists on the target.
 - The OSAL is the only flight crate where std and unsafe are allowed.
-- It provides what the rest of the code cannot: threads (with priority and CPU pinning), locks, cross-thread queues, device I/O (uart, udp, files), the monotonic clock behind `ctx.now()`, and the panic handler.
+- It provides what the rest of the code cannot: threads (with priority and CPU pinning), locks, cross-thread queues, device I/O (uart, udp, files), the monotonic clock behind `ctx.monotonic()`, and the panic handler.
 
 ## Module Requirements
 - Code is split between the Core, and Modules. Each module is its own crate.
@@ -213,7 +237,7 @@ fn do_something(&mut self, ctx: &mut Ctx) {
 - A module may implement `init(ctx)`, which runs once at startup before the first tick. Use it to load tables, read `ctx.reset` (how the last run ended), and do other setup.
 - A module implements `step(ctx)`, which runs at the module's rate. It drains the module's bus queues here.
 - A module implements `command()`, which handles commands. The exec calls it at the base tick rate, not the module's rate, so commands are not delayed by a slow module.
-- Modules get time from `ctx.now()`.
+- Modules get time from `ctx.monotonic()`: microseconds since this boot. It restarts at every boot and never jumps.
 - Modules do all I/O (bus, events, files, devices, time) through `ctx`.
 
 ``` rust
@@ -244,6 +268,7 @@ fn command(&mut self, cmd: FsCmd, ctx: &mut Ctx, r: CmdRef) -> CmdResult {
 
 ### Faults
 - Panics abort the process. Flight crates build with `panic = "abort"`, so there is no unwinding and no recovery from a panic.
+- A panic is the last resort, for when there is truly no alternative. Whenever there is a way to handle an error, Vee handles it and carries on, and reports it as an event. For example, an event whose args are too long is still sent, with the args cut off, because the ground log must see it. Flight code does not `unwrap` or `expect` to skip an error case.
 - The panic handler lives in the OSAL. It only reports the panic location (a plain write to stderr) and then aborts. It does not touch the reset log, so a panic leaves the last run as `Unknown`.
 - A watchdog trips if the main loop stops ticking. A trip aborts the process, the same as a panic.
 - Vee does nothing beyond aborting. Restarting the process is up to the supervisor (for example systemd), including detecting a reset loop and rebooting the system. The reset log's `consecutive_unclean` is there for modules that want to react to a loop on their own.

@@ -55,43 +55,43 @@ pub fn crc16_ccitt_false(data: &[u8]) -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super as crc;
 
     /// The standard check value for CRC-16/CCITT-FALSE, from the CRC catalogue.
     #[test]
     fn check_value() {
-        assert_eq!(crc16_ccitt_false(b"123456789"), 0x29B1);
+        assert_eq!(crc::crc16_ccitt_false(b"123456789"), 0x29B1);
     }
 
     #[test]
     fn empty_input_is_the_initial_value() {
-        assert_eq!(crc16_ccitt_false(&[]), INITIAL_VALUE);
+        assert_eq!(crc::crc16_ccitt_false(&[]), crc::INITIAL_VALUE);
     }
 
     #[test]
     fn single_byte() {
-        assert_eq!(crc16_ccitt_false(b"A"), 0xB915);
+        assert_eq!(crc::crc16_ccitt_false(b"A"), 0xB915);
     }
 
     #[test]
     fn data_followed_by_its_own_crc_gives_zero() {
         let data = b"123456789";
-        let crc = crc16_ccitt_false(data);
+        let crc = crc::crc16_ccitt_false(data);
         let mut record = [0u8; 11];
         record[..9].copy_from_slice(data);
         record[9..].copy_from_slice(&crc.to_be_bytes());
-        assert_eq!(crc16_ccitt_false(&record), 0);
+        assert_eq!(crc::crc16_ccitt_false(&record), 0);
     }
 
     /// The plain bit-by-bit algorithm, with no table. Slow, but easy to check against the
     /// definition of the CRC, so the table version is tested against it.
     fn bitwise_reference(data: &[u8]) -> u16 {
-        let mut crc = INITIAL_VALUE;
+        let mut crc = crc::INITIAL_VALUE;
         for &byte in data {
             crc ^= u16::from(byte) << 8;
             for _ in 0..u8::BITS {
-                if crc & TOP_BIT != 0 {
-                    crc = (crc << 1) ^ POLYNOMIAL;
+                if crc & crc::TOP_BIT != 0 {
+                    crc = (crc << 1) ^ crc::POLYNOMIAL;
                 } else {
                     crc <<= 1;
                 }
@@ -103,7 +103,10 @@ mod tests {
     #[test]
     fn table_version_matches_bitwise_reference_for_every_single_byte() {
         for value in 0..=u8::MAX {
-            assert_eq!(crc16_ccitt_false(&[value]), bitwise_reference(&[value]));
+            assert_eq!(
+                crc::crc16_ccitt_false(&[value]),
+                bitwise_reference(&[value])
+            );
         }
     }
 
@@ -113,14 +116,14 @@ mod tests {
         for (i, byte) in data.iter_mut().enumerate() {
             *byte = (i * 31 + 7) as u8;
         }
-        assert_eq!(crc16_ccitt_false(&data), bitwise_reference(&data));
+        assert_eq!(crc::crc16_ccitt_false(&data), bitwise_reference(&data));
     }
 
     #[test]
     fn a_flipped_bit_is_detected() {
         let mut data = *b"123456789";
-        let good = crc16_ccitt_false(&data);
+        let good = crc::crc16_ccitt_false(&data);
         data[4] ^= 0x01;
-        assert_ne!(crc16_ccitt_false(&data), good);
+        assert_ne!(crc::crc16_ccitt_false(&data), good);
     }
 }
