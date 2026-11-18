@@ -1,32 +1,70 @@
-//! Build-time settings: how they are read, and the checks on their values.
+//! Build-time settings: a constant whose value a deployment can set when it builds Vee.
 //!
-//! A setting is a constant defined next to the code that uses it, with its default there:
+//! A setting is declared with `config::setting!`, in the crate that uses it (the core, or a
+//! module): its name, type, default, and the range of values that make sense.
 //!
 //! ```ignore
-//! pub const EV_TEXT_MAX_BYTES: usize = config::parse_or(option_env!("VEE_EV_TEXT_MAX_BYTES"), 50);
+//! config::setting! {
+//!     /// How many bytes of text an event carries.
+//!     pub EV_TEXT_MAX_BYTES: usize = 50, 1..=4096;
+//! }
 //! ```
 //!
-//! The environment variable is named `VEE_<NAME>` and read while compiling. A deployment sets it
-//! in the `[env]` table of a `.cargo/config.toml` in the directory cargo is run from (see
-//! `sample-deployment/`). Where a value can come from, highest first:
+//! What the macro writes: a constant `EV_TEXT_MAX_BYTES` that is the value of the environment
+//! variable `VEE_EV_TEXT_MAX_BYTES` (the name with `VEE_` in front) as read while compiling, or
+//! the default if it is not set, and a check that the value is inside the range.
+//!
+//! A deployment sets the variable in the `[env]` table of a `.cargo/config.toml` in the directory
+//! cargo is run from (see `sample-deployment/`). Where a value can come from, highest first:
 //!
 //! 1. the real environment (`VEE_EV_TEXT_MAX_BYTES=80 cargo build`)
 //! 2. `cargo build --config some.toml`
 //! 3. `.cargo/config.toml` files, the nearest directory first
 //! 4. the default in the code
 //!
-//! The checks on every setting's value are at the end of this file, so they can be audited in one
-//! place. A value that is not a plain whole number, is too big, or breaks a check stops the build
+//! A value that is not a plain whole number, is too big, or is outside its range stops the build
 //! with an error that points at the setting. That is a compile error, never a panic in flight.
+//! The default is checked against the range too.
 //!
-//! Everything built from a deployment (the core, the modules and the ground tool) must be built
-//! with the same values, because some of them are part of the log format.
+//! Two settings with the same name share one variable, so a module starts its names with its own
+//! name (`FS_MAX_OPEN`). Everything built from a deployment (the core, the modules and the ground
+//! tool) must be built with the same values, because some are part of the log format.
 //!
-//! To add a setting: define it where it is used (in this crate, or the check cannot see it), add
-//! its check below, and add it to the sample deployment's config.
+//! To list every setting, search for `setting!`. To add one, declare it where it is used, and add
+//! a line to the sample deployment's config.
 
-use crate::event;
-use crate::reset;
+/// Declares a build-time setting. See the module documentation.
+#[macro_export]
+macro_rules! setting {
+    (
+        $(#[$meta:meta])*
+        $vis:vis $name:ident: $ty:ty = $default:literal, $min:literal ..= $max:literal $(;)?
+    ) => {
+        $(#[$meta])*
+        // A minimum of 0 makes `$min <= value` always true for an unsigned type. That is fine.
+        #[allow(unused_comparisons)]
+        $vis const $name: $ty = {
+            // The range is checked as a `usize`, so the largest allowed value must fit the type
+            // or the `as` below could cut a value down into the range.
+            assert!(
+                $max as u128 <= <$ty>::MAX as u128,
+                concat!("the range of ", stringify!($name), " does not fit its type")
+            );
+            let value = $crate::config::parse_or(
+                option_env!(concat!("VEE_", stringify!($name))),
+                $default,
+            );
+            assert!(
+                $min <= value && value <= $max,
+                concat!("VEE_", stringify!($name), " is outside its allowed range")
+            );
+            value as $ty
+        };
+    };
+}
+
+// So a setting is declared as `config::setting!`, like a function in a module.
+pub use setting;
 
 /// The value of a setting: `text` (the environment variable, if it is set) read as a whole
 /// number, or `default` if it is not set.
@@ -62,23 +100,12 @@ pub const fn parse_or(text: Option<&str>, default: usize) -> usize {
     value
 }
 
-// ---- Checks on the settings ----
-
-const _: () = assert!(
-    event::EV_TEXT_MAX_BYTES >= 1,
-    "VEE_EV_TEXT_MAX_BYTES must be at least 1"
-);
-const _: () = assert!(
-    reset::RESET_LOG_MAX_RECORDS >= 1,
-    "VEE_RESET_LOG_MAX_RECORDS must be at least 1"
-);
-
 #[cfg(test)]
 mod tests {
     use super as config;
 
     #[test]
-    fn a_setting_that_is_not_set_is_its_default() {
+    fn parse_or_gives_the_default_when_the_variable_is_not_set() {
         assert_eq!(config::parse_or(None, 50), 50);
     }
 
@@ -147,5 +174,31 @@ mod tests {
     #[should_panic(expected = "too big")]
     fn a_number_that_does_not_fit_is_rejected() {
         config::parse_or(Some("99999999999999999999999999"), 50);
+    }
+
+    // Settings declared with the macro, to test what it writes. (Nothing sets these variables.)
+    config::setting! {
+        /// A plain setting.
+        SAMPLE_SETTING: usize = 7, 1..=10
+    }
+    config::setting! {
+        pub(super) SAMPLE_WIDE_SETTING: u64 = 1024, 1..=4_294_967_295
+    }
+    config::setting! {
+        SAMPLE_SMALL_SETTING: u8 = 200, 0..=255;
+    }
+
+    #[test]
+    fn a_setting_that_is_not_set_is_its_default() {
+        assert_eq!(SAMPLE_SETTING, 7);
+        assert_eq!(SAMPLE_WIDE_SETTING, 1024);
+        assert_eq!(SAMPLE_SMALL_SETTING, 200);
+    }
+
+    #[test]
+    fn a_setting_has_the_type_it_was_declared_with() {
+        let _: usize = SAMPLE_SETTING;
+        let _: u64 = SAMPLE_WIDE_SETTING;
+        let _: u8 = SAMPLE_SMALL_SETTING;
     }
 }

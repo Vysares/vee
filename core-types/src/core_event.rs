@@ -40,6 +40,18 @@ pub enum CoreEvent {
     /// The reset log's last boot count is the largest a `u32` can hold.
     #[severity(Err)]
     ResetLogCountOverflow,
+
+    /// The event log ends part way through a record (a crash while appending). The core renames
+    /// the log to `.1` and starts a new one.
+    #[severity(Warn)]
+    EventLogPartialRecord,
+
+    /// A source sent the same event more times in one tick than the limit
+    /// (`throttle::EV_MAX_PER_TICK`), so the extra sends were dropped. The text has the source,
+    /// the event's code and how many were dropped. One of these is sent per event per tick, no
+    /// matter how many were dropped.
+    #[severity(Err)]
+    EventsSuppressed,
 }
 
 #[cfg(test)]
@@ -60,10 +72,20 @@ mod tests {
         assert_eq!(core_event::CoreEvent::ResetLogCorruptRecord.code(), 2);
         assert_eq!(core_event::CoreEvent::ResetLogMisorderedRecords.code(), 3);
         assert_eq!(core_event::CoreEvent::ResetLogCountOverflow.code(), 4);
+        assert_eq!(core_event::CoreEvent::EventLogPartialRecord.code(), 5);
+        assert_eq!(core_event::CoreEvent::EventsSuppressed.code(), 6);
     }
 
     #[test]
     fn severities_are_info_for_the_report_warn_for_a_partial_record_and_err_otherwise() {
+        assert_eq!(
+            core_event::CoreEvent::EventLogPartialRecord.severity(),
+            event::Severity::Warn
+        );
+        assert_eq!(
+            core_event::CoreEvent::EventsSuppressed.severity(),
+            event::Severity::Err
+        );
         assert_eq!(
             core_event::CoreEvent::ResetReport.severity(),
             event::Severity::Info

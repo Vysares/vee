@@ -223,23 +223,26 @@ Size on 2026-11-17 (cloc, working tree, no target dir): 14 Rust files, 1729 line
       29, osal 32. Clippy clean.
 
 20. **Build-time settings** (`core-api/src/config.rs`, design doc section "Build-time settings").
-    Each setting is a const defined WHERE IT IS USED, with its default there:
-    `config::parse_or(option_env!("VEE_<NAME>"), default)`. The CHECKS on every setting are all in
-    `config.rs` (a `const _` assert each, at the end of the file), so they can be audited in one
-    place. That means a setting must be defined in core-api, because `config.rs` cannot see the
-    other crates. A deployment sets `VEE_<NAME>` in `[env]` in its own `.cargo/config.toml`.
-    `parse_or` is a `const fn` that reads a plain whole number; a bad value or a failed check is a
-    compile error pointing at the setting. Today: `event::EV_TEXT_MAX_BYTES`
-    (`VEE_EV_TEXT_MAX_BYTES`, 50, at least 1) and `reset::RESET_LOG_MAX_RECORDS`
-    (`VEE_RESET_LOG_MAX_RECORDS`, 1024, at least 1; moved to core-api `reset.rs` from core so the
-    check can see it; the startup code will pass it to `reset_log::start`, nothing uses it yet).
-    Precedence checked by hand with a probe of `RECORD_LEN`: real env > `--config` > nearest
-    `.cargo/config.toml` > default. Tests that depend on the text size are written in terms of the
-    constant, so they pass at any size. To add a setting: define it where used, add its check to
-    `config.rs`, add a line to the sample config. `option_env!` finds them all.
-    `sample-deployment/.cargo/config.toml` is the example deployment config (the directory is
-    otherwise empty; it will hold a sample deployment for a fake mission). Not done: a runtime check
-    that the ground tool and the core were built with the same values.
+    Declared where used with the macro `config::setting!` (a `macro_rules!`, `#[macro_export]`
+    and re-exported in `config` so it is called as `config::setting!`; it uses `$crate::`, so it
+    works from any crate, including modules): `pub NAME: ty = default, min..=max;` plus doc
+    comments. It writes `const NAME: ty`, reads `option_env!("VEE_NAME")` (the env var name is
+    made from the identifier, so it cannot drift), and checks the range (the default too) in the
+    same `const`; also that the largest allowed value fits the type. `min` and `max` must be
+    literals. `parse_or` (a `const fn`, plain whole numbers only) does the reading. All errors are
+    compile errors that name the setting and point at its declaration. No central file lists
+    settings: search for `setting!` (this replaced the checks block I first put in `config.rs`,
+    which could not see other crates). A deployment sets `VEE_<NAME>` in `[env]` in its own
+    `.cargo/config.toml`. Today: `event::EV_TEXT_MAX_BYTES` (50, 1..=4096) and
+    `reset_log::RESET_LOG_MAX_RECORDS` (1024, 1..=1000000, in core `reset_log.rs`; the startup code will pass it to
+    `reset_log::start`, nothing uses it yet). The RANGES are my guesses: the user has not set them.
+    Same-named settings in two crates would share one env var (modules should prefix names).
+    Precedence checked by hand: real env > `--config` > nearest `.cargo/config.toml` > default, and
+    an override reaches a setting declared in another crate. Compile-fail cases tried by hand
+    (default out of range, range wider than the type, env out of range, env not a number, stray
+    comma). `sample-deployment/.cargo/config.toml` is the example deployment config (the directory
+    is otherwise empty; it will hold a sample deployment for a fake mission). Not done: a runtime
+    check that the ground tool and the core were built with the same values.
 
 21. **Reset log `report`** (`core/src/reset_log.rs`). `report(&Started, send)` is pure (no I/O):
     it calls `send(core_event::CoreEvent, fmt::Arguments)` once per event: first the reset report,
@@ -257,13 +260,140 @@ Size on 2026-11-17 (cloc, working tree, no target dir): 14 Rust files, 1729 line
     core-types (30), 1 in core-api (46 + 4 integration). The tests write the text into a
     `FixedStr<80>` so they do not depend on `EV_TEXT_MAX_BYTES`.
 
+22. **Generic queue `Queue<T, N>`** (`core-api/src/queue.rs`, new file; in core-api so modules
+    can use it too). A fixed-size FIFO ring buffer on the main thread, no allocation, `T` need not
+    be `Copy` (`[const { None }; N]`). `new()` (a `const fn`), `push(item) -> Result<(), T>` (when
+    full the item is GIVEN BACK in the `Err`, so each queue picks its own policy: ignore it =
+    drop newest, `pop` then `push` = drop oldest, or turn it into a nak), `pop()` (oldest first),
+    `len()`, `is_empty()`, `Default`. No panic paths (`get_mut`, invariants in comments); `N` of 0
+    holds nothing. Not thread safe: cross-thread queues (the file service) are the OSAL's. Written
+    by hand, not `heapless`: about 40 lines, no dependency. 10 tests (core-api: 58).
+23. **The event service `Ev`** (`core-api/src/ev.rs`; it started in core and was MOVED to core-api
+    and made NON-GENERIC with the user: there is only one event queue, so its depth is the setting
+    `ev::EV_QUEUE_DEPTH` (`VEE_EV_QUEUE_DEPTH`, 32, `1..=65535`), and `Ctx`, which modules see and
+    which therefore lives in core-api, can hold a `&mut Ev` directly: NO `EventSink` trait (the user
+    chose the no-trait route; an `EventSink` would only pay off with a second implementation).
+    `Ev` holds a `Queue<Event, EV_QUEUE_DEPTH>` and a `dropped` count. `Ev::new()` (a `const fn`),
+    `send(source, monotonic_us, code: impl event::Code, text: fmt::Arguments)`, `pop()` (oldest
+    first), `len()`, `is_empty()`, `take_dropped() -> u32` (returns the count of events dropped
+    because the queue was full and resets it to 0; the logger will send it on as an event).
+    `send` never fails: the text is written into `event::Text` with `write_fmt` (too long: cut off
+    and marked; a value whose `Display` fails: the text so far is kept, the error is ignored on
+    purpose), code and severity come from `Code`, and a full queue DROPS THE NEW event (keeps the
+    oldest, since the first events of a problem matter most) and counts it. No I/O, no clock: the
+    caller passes `source` and the time. Tests: `core-api/tests/ev.rs` (new file; 10 tests, written
+    in terms of the depth setting, with a derived sample `Code`), and one in `core/src/reset_log.rs`
+    that sends `report` through `Ev` (it needs core-types, which core-api cannot see). core: 41.
+
+24. **Event log, file side** (`core/src/event_log.rs`, new file). `start(fs, path, max_records) ->
+    Result<Started { partial_record }, FileError>`: if the file has at least `max_records` whole
+    records, or its length is not a multiple of the record size, it is rotated to `.1` (like
+    `reset_log::start`); nothing is read and nothing is appended (no boot record: the reset report
+    event is the first event). `report(&Started, send)` calls `send` with
+    `CoreEvent::EventLogPartialRecord` (Warn, code 5, new, at the end of the enum) and the text
+    `event log ends in a partial record`. `append(fs, path, &Event)` encodes one record with
+    `event_log::encode` and appends it. All blocking through `Files`: this is the code the file
+    service's THREAD will run. The main thread must never call `append` in the tick loop: it will
+    encode events and hand them to the file service (possibly a thread of its own for the log) over
+    an OSAL cross-thread queue. Not written: the thread, the queue, the main-thread half (pop from
+    `Ev`, encode, push, `take_dropped` as an event), batching several records into one append (a
+    file sync per record is slow), and what to do when `start` fails with a `FileError`.
+    New setting `event_log::EVENT_LOG_MAX_RECORDS` (`VEE_EVENT_LOG_MAX_RECORDS`, default 10000,
+    range 1..=1000000; the user expects to raise the default 10x later). The setting identifier is
+    the full env name without `VEE_`, so the names stutter (`event_log::EVENT_LOG_MAX_RECORDS`).
+    Also moved `RESET_LOG_MAX_RECORDS` from core-api `reset.rs` to core `reset_log.rs` (where it
+    is used). Open question still open: one log file or one per source (kept one). 12 tests. core:
+    50.
+
+25. **Event throttling** (the pieces that do not need `ctx`). Decided with the user: limit per
+    TICK (one executive cycle / minor frame; commands run inside ticks) per source per code; a
+    separate lookup table was rejected (it can fill up), so there is ONE COUNTER PER DEFINED EVENT,
+    found by the event's position. Settings: `throttle::EV_MAX_PER_TICK` (`VEE_EV_MAX_PER_TICK`, 5,
+    `1..=255`, `u8`) and `throttle::EV_MAX_CODES` (`VEE_EV_MAX_CODES`, 256, `1..=65535`); both in
+    the sample config.
+    - `event::Code` gained `index(&self) -> usize` (the variant's position in the order written, NOT
+      the code) and `from_index(usize) -> Option<Self>`. The derive writes both (one `match` arm per
+      variant) and a `const _` assert that the enum has at most `EV_MAX_CODES` variants (compile
+      error naming the enum, saying to raise `VEE_EV_MAX_CODES`). History: first a const-generic
+      `Throttle<C, N>` with a derived alias; then NON-GENERIC with the user: every source's
+      throttle is the same size, so `Ctx` carries no `N` (the slice idea was dropped), and the
+      counters are `u8` (255 stops "far over the limit"; a `u16` gains nothing).
+    - `core-api/src/throttle.rs` (new file): `Throttle { sent: [u8; EV_MAX_CODES] }` (256 bytes per
+      source). `new()` (a `const fn`), `throttle<C: Code>(&mut self, &C) -> Option<u8>` (counts a
+      send; `None` = send it; `Some(over_by)` = suppress, `over_by` is 1 for the first suppressed
+      and stops at 255 minus the limit), `new_tick<C: Code>(&mut self, report: FnMut(C, u8))` (calls
+      `report(event, suppressed_count)` for each event of enum `C` suppressed in the tick that
+      ended, then zeroes all counters; a callback ON PURPOSE, the user reverted an array-returning
+      version as not simpler). Counts saturate at 255. An event whose index is past the counters is
+      let through (no panic). `Default`. Type safety (a module only sends its own enum) comes from
+      the typed handle behind `ctx.ev`, not from `Throttle`. 11 tests (core-api: 69 + 7 + 10).
+    - `CoreEvent::EventsSuppressed` (Err, code 6): the text has source, code and how many dropped
+      (the text is built where `new_tick` reports; not written yet).
+    - NOT written: the handle behind `ctx.ev` that owns/borrows the source's `Throttle`, calls
+      `throttle` before `Ev::send`, turns `new_tick`'s reports into `EventsSuppressed` events, and can
+      only send its own module's event enum; the executive calling `new_tick` each tick. The core's
+      own events skip the throttle.
+
+26. **`Module` and `Ctx<M>`** (core-api, new files `module.rs` and `ctx.rs`; step 1 of the Ctx
+    and exec plan). `trait Module: Sized { type Event: event::Code; fn init(&mut self, ctx: &mut
+    Ctx<'_, Self>); fn step(&mut self, ctx: &mut Ctx<'_, Self>); }` (no `command()` yet).
+    `Ctx<'a, M: Module> { pub ev: EvHandle<'a, M::Event>, pub reset: ResetInfo, monotonic_us }`;
+    `Ctx::new(ev: &mut Ev, throttle: &mut Throttle, source: u8, monotonic_us: u64, reset)` (public
+    because the exec is another crate; only the exec calls it); `ctx.monotonic()`. The time is read
+    once by the exec and fixed per call (no clock in Ctx). `EvHandle<'a, E: Code>` has private
+    fields (`&mut Ev`, `&mut Throttle`, source, time, `PhantomData<E>`) and ONE method:
+    `send(&mut self, code: E, text: fmt::Arguments)` = `throttle(&code)`; if over the limit it
+    returns without sending (the count is kept in the throttle for `new_tick`), else `Ev::send(source,
+    time, code, text)`. `PhantomData<E>` is there because `E` is only used by `send`. Checked by
+    hand that these do NOT compile: sending another module's event enum (type mismatch), `ctx.ev.pop()`
+    (no such method), setting `ctx.ev.source` or `ctx.monotonic_us` (private). The exec owns each
+    module's `Throttle` and the one `Ev` and lends them. 9 tests in `core-api/tests/ctx.rs` (new
+    file) play the exec with `run_init`/`run_step` helpers and two test modules (`Counter`, `Noisy`):
+    source and time come from the exec, one time per call, state persists across calls, throttle
+    applies and reports through `new_tick`, throttles are per source.
+    Not written: `command()`, inbound messages, hardware handles, per-module `Ctx` pieces chosen by
+    the exec config, and who sends `EventsSuppressed` from `new_tick`'s reports (the scheduler).
+
+27. **Size check** (end of session, nothing in the repo changed for it). Rust: 26 files, 3475 code
+    lines: 1140 non-test (core-api 447, core 214, core-types 182, osal 169, core-derive 128) and 2335
+    test (33% / 67%); 545 comment lines in non-test code; 677 lines of Markdown. Binary: there is no
+    executable yet, so a throwaway probe binary (outside the repo) used the event queue, throttle,
+    a module through `Ctx`, and the reset and event logs through `StdFiles`: 352,320 bytes stripped
+    with `panic = "abort"` only, 296,600 bytes stripped with `opt-level = "z"`, `lto = true`,
+    `codegen-units = 1`. A one-line hello world with the same settings is 287,824, so the Vee code
+    in the probe is about 8.8 KB; the rest is Rust's std. The workspace has NO release profile yet
+    (add `panic = "abort"`, LTO, `opt-level`, `codegen-units` when the exec binary exists).
+
+## WHERE WE LEFT OFF (end of session, 2026-11-17)
+Everything builds, all tests pass (core 41, core-api 69 + 7 + 9 + 10, core-types 30, osal 32),
+clippy is clean. Part of this session's work was committed by the user along the way; at the end
+the UNCOMMITTED changes (see `git status`) were: edits to `.claude/CLAUDE.md`, `progress.md`,
+`docs/design.md`, `core-api` (`config.rs`, `event.rs`, `lib.rs`, `reset.rs`, `tests/code_derive.rs`),
+`core-derive`, `core-types/src/core_event.rs`, `core` (`lib.rs`, `reset_log.rs`) and the sample
+deployment config, plus NEW files `core-api/src/{ctx,ev,module,queue,throttle}.rs`,
+`core-api/tests/{ctx,ev}.rs` and `core/src/event_log.rs`. Review and commit them.
+Just finished: `Module` and `Ctx<M>` (item 26). The user then explained they want `Ctx<M>` to
+eventually hold inbound messages and hardware handles too, and added a design-doc note that a
+threaded module type for slow work is a stretch goal for AFTER everything else works.
+NEXT STEP, agreed with the user: the plain hand-written scheduler in `core` (see "Next" below),
+then `exec!`. The user said to hold off on the separate file service thread. The user is learning
+Rust (comes from C++): explain syntax and generics as they come up, and follow CLAUDE.md (one
+thing at a time, simplicity, callbacks only when needed, "do we really need this?").
+
 ## Next
-**The event service**: `ctx.ev.send(code: impl event::Code, text: fmt::Arguments)`. It builds an
-`Event` (calls `code()` and `severity()` on the code; fills in `source` and `monotonic_us`; writes
-the text into a `Text` with `write!`, which cuts it off and marks it when too long) and queues it.
-This needs `ctx`, so decide how much of `ctx` to write first (probably a minimal `Ev` type with a
-fixed-size queue, tested on its own). Then the logger (needs the file service). Then the startup
-sequence that ties `reset_log::start`, `report` and the event service together.
+**The plain hand-written scheduler in core** (step 2 of the Ctx and exec plan; then `exec!`, which
+generates what the scheduler does): base rate, module rates that divide it, a fixed order, a tick
+counter; each tick it calls `new_tick` on every source's throttle and sends `EventsSuppressed` events,
+reads the clock once per module call, builds each `Ctx`, calls `init` once for each module and
+`step` at each module's rate. Test it with two or three test modules and a fake clock (the OSAL has no
+clock trait yet: write one, `Clock { monotonic_us() }`, with a fake). Design points it will raise:
+how the scheduler stores modules of different types (a trait object `dyn`, a generic list, or
+generated by `exec!`; `exec!` generating the per-module glue is probably the answer), the order
+of `init`, the `started` flag, overrun detection, where `EventsSuppressed`'s text is built.
+Later: `command()`, the file service thread (the user said to hold off), the main-thread half of
+the event logger, the startup sequence. STRETCH GOAL, only after everything else works (noted in the
+design doc, Executive Requirements): a threaded module type for slow work (image processing, say)
+that gets its own thread or core, talking through bounded queues like the file service.
 Possible follow-ups: `trybuild` for the derive's compile-fail cases (adds a dev dependency);
 the command derives (`Command`, `CmdSet`) could use the same idea (opcode = enum value).
 
@@ -278,7 +408,7 @@ the command derives (`Command`, `CmdSet`) could use the same idea (opcode = enum
   covers up to 8 unclean boots in a row, or 4 boots if every one was clean. `consecutive_unclean`
   is capped at 8.
 - Size cap is 1024 records (about 7 KB) by default: a build-time
-  setting (item 20, now `reset::RESET_LOG_MAX_RECORDS` in core-api), passed to `start` as a
+  setting (item 20: `reset_log::RESET_LOG_MAX_RECORDS`), passed to `start` as a
   parameter.
 - The reader's rules: any problem (corrupt record, misordered records, count overflow) means the
   history cannot be trusted, so the result is `ResetInfo::first_boot()` plus the problem. A first

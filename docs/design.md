@@ -36,6 +36,7 @@ The core provides a minimal set of utilities to each module.
 - The software bus uses a one-writer, N-reader paradigm.
 - Every reader gets its own fixed-depth queue per message type, so a slow reader never loses data because of a fast one. Depths are set in `exec!`.
 - A module drains its queues in `step()`, in whatever order it chooses.
+- Queues on the main thread (the bus, command queues, the event queue) are one generic type, `core_api::queue::Queue<T, N>`: a fixed-size first-in first-out queue with no allocation. `push` gives the item back when the queue is full, so each queue chooses its own policy (drop the newest, drop the oldest, or nak). Queues that cross threads belong to the OSAL.
 - A full queue is an error that is reported as an event, never a silent drop. (Which message is dropped, oldest or newest, is chosen per queue in `exec!`.)
 
 ### Command Routing
@@ -175,7 +176,9 @@ enum ResetLogEntry {
 - Each code has a fixed severity: info, warn, err. It is given once, on the variant, and the caller of `ctx.ev.send` never picks it.
 - `#[derive(event::Code)]` (core-derive; the trait is `event::Code`) generates the lookup (below). The core's own events use it exactly as a module's do.
 - Command acks and naks are plain events (see Commands). They have no special codes, kind bits or fields. They are written the same way as any other event, with the details in the text.
-- `ctx.ev` fills in `source` and `time`. A module cannot set either, so a module cannot claim another module's id.
+- Throttling: a source can send each of its events at most `EV_MAX_PER_TICK` times per tick (a tick is one executive cycle, one minor frame; events sent from a module's `command()` count, since commands run inside ticks). The default is 5, at most 255, and it is a build-time setting. Sends past the limit are dropped. At the start of the next tick the core sends one `CoreEvent::EventsSuppressed` (Err) for each event that was suppressed, with the source, the event's code and how many sends were dropped (stopping at 255 minus the limit), however many there were. The counters are `core_api::throttle::Throttle`: one `u8` counter per event, found by the event's position (`index`), so there is no table to fill up and one event can never throttle another. Every source's throttle is the same size, `EV_MAX_CODES` counters (default 256, a build-time setting), and a source uses the first few. `#[derive(event::Code)]` fails the build if an enum has more events than that. The throttle belongs to the source, so it lives with the source's handle behind `ctx.ev`, which checks it before calling `Ev::send` and can only send its own module's event enum. The core's own events do not go through a throttle, so `EventsSuppressed` cannot be suppressed. Not written yet: the handle (it needs `ctx` and `exec!`).
+- The event service is `core_api::ev::Ev` (in core-api, not the core, so `Ctx` can hold a reference to it): a `core_api::queue::Queue<Event, EV_QUEUE_DEPTH>` plus a count of dropped events, with no I/O and no clock. There is one event queue in the whole system, so its depth is a build-time setting (`EV_QUEUE_DEPTH`, default 32) and not a type parameter. `send(source, monotonic_us, code, text)` builds the `Event` and queues it. The event log and the downlink take events out with `pop`, oldest first. `send` never fails, because the sender can do nothing about a failure: text that is too long is cut off and marked (see above), a value in the text that fails to print leaves the text up to that point, and a full queue drops the new event (the oldest are kept, because the first events of a problem are the most useful) and counts it. The logger takes that count with `take_dropped` and sends it on as an event. Modules never get an `Ev`: they only get the `ctx.ev` handle, which can only send.
+- `ctx.ev` is a small handle around `Ev` that fills in the module's `source` and the time. A module cannot set either, so a module cannot claim another module's id. (Not written yet: it waits for `ctx`.)
 - `time` is `monotonic_us`: microseconds since this boot, from the OSAL's monotonic clock (what modules get from `ctx.monotonic()`). It restarts at every boot (it is not MET: there is no mission epoch) and it never jumps, so ordering within a run is always right. Runs are told apart by the boot event, so records carry no run id.
 - Absolute time (TAI) is not in the envelope. The core emits a time-correlation event (monotonic time plus TAI) whenever the offset is set or changes, and the ground converts. Not designed yet.
 
@@ -195,6 +198,8 @@ struct Event {
 
 /// <Module>-types.rs
 // #[derive(event::Code)] generates `impl event::Code`, which has:
+//   - index() and from_index(): the variant's position (0, 1, 2, ...), and back. Used by Throttle.
+//   - a compile error if there are more variants than EV_MAX_CODES (see Throttling).
 //   - code(): the value of the variant (`Self::Started as u16`)
 //   - severity(): from the `#[severity(..)]` attribute (Info, Warn or Err). A variant without one,
 //     or with fields, is a compile error.
@@ -222,9 +227,10 @@ fn do_something(&mut self, ctx: &mut Ctx) {
 - There is no run id in a record. The reset report event is the first event of every run and carries the boot count, so a reader splits the log into runs at those events.
 - Writes during the tick loop must not block, so they go through the file service (a bounded request queue, like any other client). If that queue is full, the event is not written. The logger counts the missed events, and the next record that does get written carries the count (as an ordinary event, so the loss is never silent).
 - Events emitted before the tick loop starts (`init`, the reset log report) are written with blocking OSAL calls, the same way the reset log is. The loop has not started, so there is nothing to disturb.
-- Size cap: checked at startup, like the reset log. Over the cap, the log is renamed to `.1` and a new file starts. The cap is a named constant for now (see the compile-time settings open question in `progress.md`).
+- Size cap: checked at startup, like the reset log. At or over the cap (`EVENT_LOG_MAX_RECORDS`, a build-time setting, default 10000 records, at most 1000000), the log is renamed to `.1` and a new file starts.
 - A partial last record (crash mid-append) is handled at startup like the reset log's: the whole records are kept, the log is renamed to `.1` (appending after a partial record would shift every later record), and the partial record is reported as an event.
 - A panic or abort loses whatever the file service had queued but not yet written. That is accepted; the log is for after-the-fact analysis, not a guaranteed record of the final moments.
+- The file side is `core::event_log`: `start` (rotate if full or ending in a partial record, and report a partial record) and `append` (one event, one record), both blocking through the OSAL `Files`. `append` is what the file service's thread will run. The main thread never calls it in the tick loop: it will encode events and hand them to the file service, which may be a thread of its own for the log. Not written yet.
 - The logger only writes. Reading the log (to downlink it, or to show it) is done by ground tooling, or by a later file-dump command through the file service.
 - Not decided yet: whether the log is one file or one per source.
 
@@ -242,6 +248,11 @@ fn do_something(&mut self, ctx: &mut Ctx) {
 - A module implements `command()`, which handles commands. The exec calls it at the base tick rate, not the module's rate, so commands are not delayed by a slow module.
 - Modules get time from `ctx.monotonic()`: microseconds since this boot. It restarts at every boot and never jumps.
 - Modules do all I/O (bus, events, files, devices, time) through `ctx`.
+- `Module` (core-api) is the trait a module implements: `type Event` (its own event enum), `init(&mut self, ctx)` and `step(&mut self, ctx)`. `command()` is not in the trait yet.
+- `Ctx<'a, M>` (core-api) is generic over the module `M`, and what is inside comes from what `M` declares. The executive builds one for every call into a module and passes `&mut Ctx`; the module uses it for that call only. It holds pieces the core owns, which the module borrows: a module never holds a reference to core state of its own. Today it has `ctx.ev` (an `EvHandle<M::Event>`), `ctx.monotonic()` and `ctx.reset`; the bus, files, tables and devices will be added, and the exec config (`uses`, `reads`) will decide which of them each module's `Ctx` gets. A module may only reach core types, its own types and what the exec config connects.
+- `ctx.ev.send(code, text)` takes only the module's own event enum (`M::Event`), so the compiler stops a module from sending another module's events. The handle's fields are private and it has only `send`: a module cannot read events or set its own source. The module's source and the time are fixed by the executive. `send` checks the module's `Throttle` first; an event over the limit is not queued.
+- The time is read from the clock once by the executive, before each call, and fixed into the `Ctx`: `ctx.monotonic()` and the time of every event sent in that call are the same. There is no clock inside `Ctx`.
+- Rust visibility stops at the crate, so everything `pub` in core-api is visible to a module (it depends on core-api). That is harmless: a module has no way to get at the core's instances (the event queue, the throttle) except through its `Ctx`. If an item ever becomes risky to expose, it moves to a crate that modules do not depend on.
 
 ``` rust
 // fs module
@@ -268,6 +279,7 @@ fn command(&mut self, cmd: FsCmd, ctx: &mut Ctx, r: CmdRef) -> CmdResult {
 - The exec has the core run its startup reset log step first (see Reset Log).
 - The exec calls each module's `init` once, in order, then sets the `started` flag (arming the allocation check) before the first tick.
 - The exec cannot preempt a module. An overrun is detected and reported, and `overrun` says what to shed. A module that never returns is caught by the watchdog.
+- Stretch goal, after everything else works: a threaded module type for slow work that deserves a thread of its own or another core (image processing, for example). It would talk to the rest of the system through bounded queues, as the file service does, so the single-threaded executive stays deterministic and testable. (A second executive on another core, with its own modules and queues between the executives, is another way to get there.) Until then, slow work is cut into steps that return, or goes to an interface thread.
 
 ### Faults
 - Panics abort the process. Flight crates build with `panic = "abort"`, so there is no unwinding and no recovery from a panic.
@@ -289,7 +301,7 @@ exec! {
                                 clients: [core, ats, recorder], timeout: 200 ticks } ];
     tables:  [ dir: "/data/tables", boot: [ats.ats[0] -> ats_a ] ];
     bus:     [ nav_state: NavState { writer: survival, readers: [fdir: 4, ats: 4] } ];  // reader: queue depth
-    events:  [ out: gnd, depth: 32, filter: Info ];
+    events:  [ out: gnd, filter: Info ];                   // queue depth: the EV_QUEUE_DEPTH setting
 
     order: [
         link: Link @ 100 Hz { essential, step: 1 ms, dispatch: 0.1 ms, cmd_depth: 8,
@@ -304,9 +316,18 @@ exec! {
 In the above example, note how Ctx is a universal type. Start with that, then we can derive module specific Ctx types later, to enforce device access rules at compile time.
 
 ## Build-time settings
-- Important sizes and limits are fixed when Vee is built, and a deployment can override them without editing Vee. Each setting is a constant defined next to the code that uses it, with its default there. `config::parse_or` reads it. `core-api/src/config.rs` also holds the checks on every setting's value (a `const _` assert each), so they can be audited in one place.
-- A setting is an environment variable named `VEE_<NAME>`, read with `option_env!` while compiling. A deployment sets it in the `[env]` table of its own `.cargo/config.toml`, in the directory cargo is run from (`sample-deployment/.cargo/config.toml` is the example). Cargo reads config files from where it is run, not from a dependency's directory, so Vee ships no config of its own: its defaults are in the code.
+- Important sizes and limits are fixed when Vee is built, and a deployment can override them without editing Vee. A setting is declared where it is used (in the core or in any module) with `config::setting!` (`core-api/src/config.rs`): its name, type, default and the range of values that make sense, on one line:
+  ``` rust
+  config::setting! {
+      /// How many bytes of text an event carries.
+      pub EV_TEXT_MAX_BYTES: usize = 50, 1..=4096;
+  }
+  ```
+  It writes a constant of that name, and checks the value against the range (the default too).
+- The value is read from an environment variable named after the setting with `VEE_` in front (`VEE_EV_TEXT_MAX_BYTES`), with `option_env!` while compiling. A deployment sets it in the `[env]` table of its own `.cargo/config.toml`, in the directory cargo is run from (`sample-deployment/.cargo/config.toml` is the example). Cargo reads config files from where it is run, not from a dependency's directory, so Vee ships no config of its own: its defaults are in the code.
 - Where a value comes from, highest first: the real environment, `cargo build --config file.toml`, the nearest `.cargo/config.toml` (then those above it), the default in the code.
-- A value that is not a plain whole number, is too big, or breaks a check stops the build with an error that points at the setting. The check runs in a `const`, so it is a compile error and never a panic in flight.
+- A value that is not a plain whole number, is too big, or is outside its range stops the build with an error that names the setting and points at its declaration. The check runs in a `const`, so it is a compile error and never a panic in flight.
+- Two settings with the same name would share one variable, so a module starts its setting names with its own name (`FS_MAX_OPEN`).
 - The core, the modules and the ground tool must all be built with the same values, because some are part of the log format (`EV_TEXT_MAX_BYTES` sets the event log record size). Nothing checks this at runtime yet.
-- To add a setting: define it where it is used (in `core-api`, because `config.rs` can only check constants it can see), add its check to `config.rs`, and add a line to the sample deployment's config. Search for `option_env!` to list them all.
+- There is no single list of settings. Search for `setting!` to find them all; each shows its default and range. A deployment's config lists the ones it sets.
+- To add a setting: declare it where it is used, and add a line to the sample deployment's config.

@@ -3,6 +3,7 @@
 
 use vee_core_api::event;
 use vee_core_api::event::Code as _;
+use vee_core_api::throttle;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, event::Code)]
 #[repr(u16)]
@@ -54,4 +55,51 @@ fn a_code_can_be_used_through_the_trait_by_a_generic_function() {
         code_and_severity(&SampleEv::OpenFailed),
         (2, event::Severity::Err)
     );
+}
+
+#[test]
+fn the_index_is_the_position_in_the_order_written_not_the_code() {
+    assert_eq!(SampleEv::Started.index(), 0);
+    assert_eq!(SampleEv::Slow.index(), 1);
+    assert_eq!(SampleEv::OpenFailed.index(), 2);
+    // Pinned has code 0x1000, but it is the fourth variant.
+    assert_eq!(SampleEv::Pinned.index(), 3);
+    assert_eq!(SampleEv::AfterPinned.index(), 4);
+    assert_eq!(SampleEv::Largest.index(), 5);
+}
+
+#[test]
+fn from_index_is_the_reverse_of_index_and_none_past_the_last_variant() {
+    for event in [
+        SampleEv::Started,
+        SampleEv::Slow,
+        SampleEv::OpenFailed,
+        SampleEv::Pinned,
+        SampleEv::AfterPinned,
+        SampleEv::Largest,
+    ] {
+        assert_eq!(SampleEv::from_index(event.index()), Some(event));
+    }
+    assert_eq!(SampleEv::from_index(6), None);
+    assert_eq!(SampleEv::from_index(usize::MAX), None);
+}
+
+#[test]
+fn a_derived_enum_works_with_a_throttle() {
+    let mut throttle = throttle::Throttle::new();
+    let limit = throttle::EV_MAX_PER_TICK;
+    for _ in 0..limit {
+        assert_eq!(throttle.throttle(&SampleEv::Largest), None);
+    }
+    assert_eq!(throttle.throttle(&SampleEv::Largest), Some(1));
+    // The last variant has the last counter, and the others are not touched.
+    assert_eq!(throttle.throttle(&SampleEv::Started), None);
+
+    let mut reports = 0;
+    throttle.new_tick(|code: SampleEv, suppressed| {
+        assert_eq!(code, SampleEv::Largest);
+        assert_eq!(suppressed, 1);
+        reports += 1;
+    });
+    assert_eq!(reports, 1);
 }

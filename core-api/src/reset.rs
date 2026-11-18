@@ -1,14 +1,7 @@
 //! What modules are told about how the previous run ended. The core fills this in at startup
 //! from the reset log, and modules read it through `ctx.reset`.
 
-use crate::config;
 use core::fmt;
-
-/// How many records the reset log may hold before the core rotates it at startup
-/// (`VEE_RESET_LOG_MAX_RECORDS`, default 1024). The startup code passes it to `reset_log::start`
-/// as `max_records`. (It is defined here, not in the core, so that `config.rs` can check it.)
-pub const RESET_LOG_MAX_RECORDS: u64 =
-    config::parse_or(option_env!("VEE_RESET_LOG_MAX_RECORDS"), 1024) as u64;
 
 /// Why a clean shutdown happened. An unclean end has no reason: it is inferred from a boot with
 /// no shutdown after it.

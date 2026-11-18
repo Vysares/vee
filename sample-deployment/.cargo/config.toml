@@ -1,14 +1,27 @@
 # Build-time settings for this deployment. Run cargo from this directory (or pass
 # `--config sample-deployment/.cargo/config.toml`) and these override Vee's defaults.
 #
-# Every setting is optional: leave a line out to use the default. Each default is next to the code
-# that uses the setting (search for `option_env!`). A real environment variable of the same name
-# wins over this file. Everything in a deployment, including the ground tool, must be built with
-# the same values.
+# Every setting is optional: leave a line out to use the default. Each setting is declared next to
+# the code that uses it, with its default and allowed range (search for `setting!`). A real
+# environment variable of the same name wins over this file. Everything in a deployment, including
+# the ground tool, must be built with the same values.
 
 [env]
-# How many bytes of text an event carries. Sets the event log record size. Default 50.
+# How many bytes of text an event carries. Sets the event log record size. Default 50, 1..=4096.
 VEE_EV_TEXT_MAX_BYTES = "50"
 
-# How many records the reset log holds before it is rotated at startup. Default 1024.
+# How many records the reset log holds before it is rotated at startup. Default 1024, 1..=1000000.
 VEE_RESET_LOG_MAX_RECORDS = "1024"
+
+# How many records the event log holds before it is rotated at startup. Default 10000, 1..=1000000.
+VEE_EVENT_LOG_MAX_RECORDS = "10000"
+
+# How many times each event can be sent in one tick before extra sends are suppressed.
+# Default 5, 1..=255.
+VEE_EV_MAX_PER_TICK = "5"
+
+# How many events the event queue holds. Default 32, 1..=65535.
+VEE_EV_QUEUE_DEPTH = "32"
+
+# The most events one module (or the core) can define. Default 256, 1..=65535.
+VEE_EV_MAX_CODES = "256"

@@ -4,6 +4,7 @@
 //! with plain byte arrays. `start` and `stop` do the file work, through the OSAL's `Files`.
 
 use core::fmt;
+use vee_core_api::config;
 use vee_core_api::reset;
 use vee_core_types::core_event;
 use vee_core_types::reset_log as log_types;
@@ -13,6 +14,12 @@ use vee_osal::files;
 /// `Shutdown` record, so this covers up to this many unclean boots in a row, or half as many
 /// boots if every run was clean. It also caps `consecutive_unclean`.
 pub const TAIL_RECORDS: usize = 8;
+
+config::setting! {
+    /// How many records the reset log may hold before `start` rotates it. The startup code passes
+    /// it to `start` as `max_records`.
+    pub RESET_LOG_MAX_RECORDS: u64 = 1024, 1..=1000000;
+}
 
 /// Something wrong with the log that the caller should report. Every problem except
 /// `PartialRecord` makes `read_tail` fall back to `ResetInfo::first_boot()`, because the history
@@ -248,6 +255,8 @@ where
 mod tests {
     use super as reset_log;
     use core::fmt::Write as _;
+    use vee_core_api::ev;
+    use vee_core_api::event;
     use vee_core_api::fixed_str;
     use vee_core_api::reset;
     use vee_core_types::core_event;
@@ -754,5 +763,30 @@ mod tests {
             sent[1].unwrap().0,
             core_event::CoreEvent::ResetLogPartialRecord
         );
+    }
+
+    #[test]
+    fn the_reset_report_goes_through_the_event_service_in_order() {
+        let started = started(
+            info(4, reset::PreviousEnd::Unknown, 1),
+            [Some(reset_log::Problem::PartialRecord), None],
+        );
+        let mut queue = ev::Ev::new();
+        reset_log::report(&started, |code, text| {
+            queue.send(core_event::SOURCE, 5, code, text);
+        });
+
+        let report = queue.pop().unwrap();
+        assert_eq!(report.source, core_event::SOURCE);
+        assert_eq!(report.code, 0);
+        assert_eq!(report.severity, event::Severity::Info);
+        assert_eq!(
+            report.text.as_bytes(),
+            b"reset 4: prev end unknown, 1 unclean in a row"
+        );
+        let partial = queue.pop().unwrap();
+        assert_eq!(partial.code, 1);
+        assert_eq!(partial.severity, event::Severity::Warn);
+        assert_eq!(queue.pop(), None);
     }
 }

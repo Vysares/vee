@@ -24,11 +24,13 @@ pub enum Severity {
     Err,
 }
 
-/// How many bytes of text an event can carry (`VEE_EV_TEXT_MAX_BYTES`, default 50). Every event is
-/// the same size, so shorter text is zero padded, and longer text is cut off and ends in
-/// `fixed_str::TRUNCATED_MARK`. It sets the size of an event log record, so changing it makes
-/// existing event logs unreadable (they are rotated away at startup, not trusted).
-pub const EV_TEXT_MAX_BYTES: usize = config::parse_or(option_env!("VEE_EV_TEXT_MAX_BYTES"), 50);
+config::setting! {
+    /// How many bytes of text an event can carry. Every event is the same size, so shorter text is
+    /// zero padded, and longer text is cut off and ends in `fixed_str::TRUNCATED_MARK`. It sets
+    /// the size of an event log record, so changing it makes existing event logs unreadable
+    /// (they are rotated away at startup, not trusted).
+    pub EV_TEXT_MAX_BYTES: usize = 50, 1..=4096;
+}
 
 /// An event's text.
 pub type Text = fixed_str::FixedStr<EV_TEXT_MAX_BYTES>;
@@ -50,12 +52,23 @@ pub struct Event {
 /// An enum of event codes, one module's (or the core's). `#[derive(event::Code)]` writes this.
 ///
 /// Who calls what: `ctx.ev.send` calls `code` and `severity` on the code it is given, and puts
-/// them in the `Event` it builds.
+/// them in the `Event` it builds. `Throttle` calls `index` and `from_index`.
 pub trait Code {
     /// Unique within the enum. It is the value given to the variant.
     fn code(&self) -> u16;
 
     fn severity(&self) -> Severity;
+
+    /// The variant's position among the variants, in the order written: 0 for the first, 1 for
+    /// the second, and so on. It is not the code, which can be any value. It is the index into
+    /// an array with one slot per event (see `throttle`).
+    fn index(&self) -> usize;
+
+    /// The reverse of `index`: the variant at a position, or `None` if there is no such
+    /// variant.
+    fn from_index(index: usize) -> Option<Self>
+    where
+        Self: Sized;
 }
 
 #[cfg(test)]

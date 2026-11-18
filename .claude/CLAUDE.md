@@ -7,3 +7,4 @@
 - Handle errors whenever there is a way to. Vee panics only when there is no alternative. Example: an event whose args are too long is still sent, with the args cut off, because the ground log needs to see it. Never `unwrap` or `expect` in flight code to skip an error case.
 - Always ask yourself and the user: "Do we really need this to accomplish the goal?" And make sure you're clear on the goal and use case of code before you write it.
 - One common implementation over two is always preferred **if** would simplify things.
+- Use callbacks (closures passed as arguments) only when needed. Prefer returning a value, because callbacks are harder to read. A real reason is, for example, that `format_args!` values cannot be returned.

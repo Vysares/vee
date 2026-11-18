@@ -24,9 +24,14 @@ use proc_macro::TokenStream;
 /// - `#[severity(Level)]` on every variant. The level is `Info`, `Warn` or `Err`.
 /// - Variants have no fields: the event's details go in its text, not in the code.
 ///
-/// What it generates: `code` and `severity`, which are everything in the `Code` trait. Each is
-/// one `match` with an arm per variant (`code` casts the variant with `as u16`). The generated code names the core-api crate as
-/// `::vee_core_api`, so the crate using the derive must depend on it.
+/// What it generates:
+/// - `impl event::Code`: `code`, `severity`, `index` and `from_index`. Each is one `match` with
+///   an arm per variant (`code` casts the variant with `as u16`).
+/// - A check, made when the code is compiled, that the enum has no more variants than
+///   `throttle::EV_MAX_CODES`, the number of counters in a `Throttle`.
+///
+/// The generated code names the core-api crate as `::vee_core_api`, so the crate using the
+/// derive must depend on it.
 #[proc_macro_derive(Code, attributes(severity))]
 pub fn derive_code(input: TokenStream) -> TokenStream {
     let input = syn::parse_macro_input!(input as syn::DeriveInput);
@@ -76,8 +81,28 @@ fn expand_code(input: &syn::DeriveInput) -> syn::Result<proc_macro2::TokenStream
         quote::quote! { Self::#name => ::vee_core_api::event::Severity::#severity, }
     });
 
+    // A variant's position, in the order written. Not the code, which can be any value.
+    let index_arms = variants.iter().enumerate().map(|(position, variant)| {
+        let name = variant.name;
+        quote::quote! { Self::#name => #position, }
+    });
+    let from_index_arms = variants.iter().enumerate().map(|(position, variant)| {
+        let name = variant.name;
+        quote::quote! { #position => ::core::option::Option::Some(Self::#name), }
+    });
+
     let name = &input.ident;
+    let variant_count = variants.len();
+    let too_many_message = format!(
+        "{name} has more events than throttle::EV_MAX_CODES: raise VEE_EV_MAX_CODES, or split it"
+    );
     Ok(quote::quote! {
+        // Every source's `Throttle` has `EV_MAX_CODES` counters, one for each event by `index`.
+        const _: () = assert!(
+            #variant_count <= ::vee_core_api::throttle::EV_MAX_CODES,
+            #too_many_message
+        );
+
         impl ::vee_core_api::event::Code for #name {
             fn code(&self) -> u16 {
                 match self { #(#code_arms)* }
@@ -85,6 +110,17 @@ fn expand_code(input: &syn::DeriveInput) -> syn::Result<proc_macro2::TokenStream
 
             fn severity(&self) -> ::vee_core_api::event::Severity {
                 match self { #(#severity_arms)* }
+            }
+
+            fn index(&self) -> usize {
+                match self { #(#index_arms)* }
+            }
+
+            fn from_index(index: usize) -> ::core::option::Option<Self> {
+                match index {
+                    #(#from_index_arms)*
+                    _ => ::core::option::Option::None,
+                }
             }
         }
     })
