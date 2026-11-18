@@ -38,17 +38,16 @@ impl<T, const N: usize> Queue<T, N> {
         if self.len >= N {
             return Err(item);
         }
-        // `len < N`, so `N` is not 0 and the remainder is a valid index.
-        let tail = (self.head + self.len) % N;
-        match self.slots.get_mut(tail) {
-            Some(slot) => {
-                *slot = Some(item);
-                self.len += 1;
-                Ok(())
-            }
-            // Not reachable, but if it ever were, the item is returned and not lost.
-            None => Err(item),
-        }
+        // The slot after the last item, wrapping round. `head` and `len` are both below `N`, so
+        // none of these steps can fail. If one ever did, the item is returned and not lost.
+        let tail = self.head.checked_add(self.len).and_then(|end| end.checked_rem(N));
+        let Some(slot) = tail.and_then(|index| self.slots.get_mut(index)) else {
+            return Err(item);
+        };
+        *slot = Some(item);
+        // `len < N` here, so this cannot reach the limit that `saturating_add` guards.
+        self.len = self.len.saturating_add(1);
+        Ok(())
     }
 
     /// Takes the oldest item out of the queue, or `None` if it is empty.
@@ -58,8 +57,10 @@ impl<T, const N: usize> Queue<T, N> {
         }
         // `len > 0`, so `N` is not 0 and `head` is a valid index.
         let item = self.slots.get_mut(self.head)?.take();
-        self.head = (self.head + 1) % N;
-        self.len -= 1;
+        // Move on one slot, wrapping round. `N` is not 0, so `checked_rem` does not give `None`.
+        self.head = self.head.saturating_add(1).checked_rem(N).unwrap_or(0);
+        // `len > 0` here, so this cannot reach the limit that `saturating_sub` guards.
+        self.len = self.len.saturating_sub(1);
         item
     }
 

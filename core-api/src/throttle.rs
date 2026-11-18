@@ -134,6 +134,10 @@ mod tests {
     const LIMIT: u8 = throttle::EV_MAX_PER_TICK;
 
     /// Everything `new_tick` reports, in order, and how many reports there were.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "test helper: at most 3 reports"
+    )]
     fn ended(throttle: &mut throttle::Throttle) -> ([Option<(Sample, u8)>; 3], usize) {
         let mut reports = [None; 3];
         let mut count = 0;

@@ -59,6 +59,10 @@ impl Ev {
         let mut written = event::Text::EMPTY;
         // `FixedStr` never fails to take text. Only a value's own `Display` can, and then the
         // text so far is what the ground gets, which is better than losing the event.
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "a failing `Display` keeps the text so far; the event is still sent"
+        )]
         let _ = written.write_fmt(text);
 
         let event = event::Event {

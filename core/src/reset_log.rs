@@ -3,6 +3,7 @@
 //! `read_tail` has no I/O. It works on records that have already been read, so it can be tested
 //! with plain byte arrays. `start` and `stop` do the file work, through the OSAL's `Files`.
 
+use crate::records;
 use core::fmt;
 use vee_core_api::config;
 use vee_core_api::reset;
@@ -82,7 +83,7 @@ fn scan(records: &[[u8; log_types::RECORD_LEN]]) -> Result<reset::ResetInfo, Pro
             log_types::ResetLogEntry::Boot { count } => {
                 // A new boot while a run is still open means that run never shut down.
                 if previous_run_open {
-                    unclean_runs += 1;
+                    unclean_runs = unclean_runs.saturating_add(1);
                 }
                 previous_run_open = true;
                 last_boot_count = Some(count);
@@ -110,7 +111,7 @@ fn scan(records: &[[u8; log_types::RECORD_LEN]]) -> Result<reset::ResetInfo, Pro
         .ok_or(Problem::CountOverflow)?;
 
     // If the last run is still open, it is the most recent unclean run.
-    let consecutive_unclean = unclean_runs + u32::from(previous_run_open);
+    let consecutive_unclean = unclean_runs.saturating_add(u32::from(previous_run_open));
 
     Ok(reset::ResetInfo {
         count,
@@ -151,24 +152,30 @@ pub fn start<F: files::Files>(
 ) -> Result<Started, files::FileError> {
     // A missing file and an empty file mean the same thing here: there are no records.
     let len = fs.len(path)?.unwrap_or(0);
-    let record_len = log_types::RECORD_LEN as u64;
-    let whole_records = len / record_len;
-    let has_partial_record = len % record_len != 0;
+    let shape = records::shape(len, log_types::RECORD_LEN);
+    let whole_records = shape.whole;
+    let has_partial_record = shape.has_partial;
 
     // Read only the last `TAIL_RECORDS` whole records. The partial record, if any, is after
     // them and is not read.
-    let read_count = whole_records.min(TAIL_RECORDS as u64) as usize; // at most TAIL_RECORDS
-    let first_offset = (whole_records - read_count as u64) * record_len;
+    // (If `whole_records` does not even fit a `usize`, it is more than the window anyway.)
+    let read_count = usize::try_from(whole_records)
+        .unwrap_or(TAIL_RECORDS)
+        .min(TAIL_RECORDS);
+    // The records before the ones read: at most `whole_records`, so no subtraction can go below 0
+    // and the product is at most `len`.
+    let skipped_records = whole_records.saturating_sub(read_count as u64);
+    let first_offset = skipped_records.saturating_mul(log_types::RECORD_LEN as u64);
     let mut records = [[0u8; log_types::RECORD_LEN]; TAIL_RECORDS];
+    let Some(read_records) = records.get_mut(..read_count) else {
+        // Cannot happen: `read_count` is at most `TAIL_RECORDS`, the length of `records`.
+        return Err(files::FileError::Other);
+    };
     // Nothing to read from a missing or empty file (and a missing file would be `NotFound`).
     if read_count > 0 {
-        fs.read_at(
-            path,
-            first_offset,
-            &mut records.as_flattened_mut()[..read_count * log_types::RECORD_LEN],
-        )?;
+        fs.read_at(path, first_offset, read_records.as_flattened_mut())?;
     }
-    let reading = read_tail(&records[..read_count]);
+    let reading = read_tail(read_records);
 
     let mut problems = [None; MAX_START_PROBLEMS];
     if has_partial_record {
@@ -357,14 +364,12 @@ mod tests {
 
     #[test]
     fn a_full_window_of_unclean_boots_hits_the_cap() {
+        let window = u32::try_from(reset_log::TAIL_RECORDS).unwrap();
         let records: [[u8; log_types::RECORD_LEN]; reset_log::TAIL_RECORDS] =
-            core::array::from_fn(|i| boot(i as u32 + 10).encode());
+            core::array::from_fn(|i| boot(u32::try_from(i).unwrap() + 10).encode());
         let reading = reset_log::read_tail(&records);
-        assert_eq!(reading.info.count, 10 + reset_log::TAIL_RECORDS as u32);
-        assert_eq!(
-            reading.info.consecutive_unclean,
-            reset_log::TAIL_RECORDS as u32
-        );
+        assert_eq!(reading.info.count, 10 + window);
+        assert_eq!(reading.info.consecutive_unclean, window);
     }
 
     #[test]
@@ -614,7 +619,7 @@ mod tests {
             let mut written = fixed_str::FixedStr::EMPTY;
             write!(written, "{text}").unwrap();
             sent[count] = Some((code, written));
-            count += 1;
+            count = count.saturating_add(1);
         });
         (sent, count)
     }

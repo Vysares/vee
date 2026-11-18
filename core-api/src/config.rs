@@ -42,7 +42,14 @@ macro_rules! setting {
     ) => {
         $(#[$meta])*
         // A minimum of 0 makes `$min <= value` always true for an unsigned type. That is fine.
-        #[allow(unused_comparisons)]
+        #[allow(
+            unused_comparisons,
+            reason = "a minimum of 0 on an unsigned type is always true, which is fine"
+        )]
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "the `narrowed as usize == value` assert checks that the cast lost nothing"
+        )]
         $vis const $name: $ty = {
             // The range is checked as a `usize`, so the largest allowed value must fit the type
             // or the `as` below could cut a value down into the range.
@@ -58,7 +65,13 @@ macro_rules! setting {
                 $min <= value && value <= $max,
                 concat!("VEE_", stringify!($name), " is outside its allowed range")
             );
-            value as $ty
+            let narrowed = value as $ty;
+            // The proof that the cast above lost nothing: turning it back gives the same number.
+            assert!(
+                narrowed as usize == value,
+                concat!(stringify!($name), " does not fit its type")
+            );
+            narrowed
         };
     };
 }
@@ -71,6 +84,12 @@ pub use setting;
 ///
 /// It is a `const fn` because it runs while the code is compiled. A `panic!` or a failed `assert!`
 /// in a `const` is a compile error that stops the build, so a bad setting cannot reach flight.
+#[allow(
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    reason = "runs at compile time, where a panic is the build error we want"
+)]
 pub const fn parse_or(text: Option<&str>, default: usize) -> usize {
     let Some(text) = text else {
         return default;

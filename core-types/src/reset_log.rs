@@ -10,6 +10,7 @@
 //! fields, zero padded up to the size of the largest variant. The CRC covers the tag and the
 //! payload. Multi-byte numbers are big-endian.
 
+use crate::record;
 use core::fmt;
 use vee_core_api::crc;
 use vee_core_api::reset;
@@ -111,15 +112,17 @@ impl ResetLogEntry {
             return Err(DecodeError::BadCrc);
         }
 
-        let payload = &bytes[PAYLOAD_OFFSET..CRC_OFFSET];
-        match bytes[TAG_OFFSET] {
+        let [tag] = record::field(bytes, TAG_OFFSET, DecodeError::BadLength)?;
+        let payload: [u8; PAYLOAD_LEN] =
+            record::field(bytes, PAYLOAD_OFFSET, DecodeError::BadLength)?;
+        match tag {
             TAG_BOOT => {
-                let count = u32::from_be_bytes(core::array::from_fn(|i| payload[i]));
+                let count = u32::from_be_bytes(payload);
                 Ok(ResetLogEntry::Boot { count })
             }
             TAG_SHUTDOWN => {
-                let reason = shutdown_reason_from_code(payload[0])?;
-                let padding = &payload[1..];
+                let [reason_code, padding @ ..] = payload;
+                let reason = shutdown_reason_from_code(reason_code)?;
                 if padding.iter().any(|&byte| byte != 0) {
                     return Err(DecodeError::NonZeroPadding);
                 }

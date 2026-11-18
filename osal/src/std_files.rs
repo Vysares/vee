@@ -92,11 +92,21 @@ mod tests {
         dir: path::PathBuf,
     }
 
+    /// Deletes a directory and everything in it. Cleanup failing, or the directory not being
+    /// there, is not a test failure.
+    #[allow(
+        clippy::let_underscore_must_use,
+        reason = "test cleanup: a failure to delete, or nothing to delete, does not matter"
+    )]
+    fn remove_dir(dir: &path::Path) {
+        let _ = fs::remove_dir_all(dir);
+    }
+
     impl TempDir {
         fn new(test_name: &str) -> Self {
             let dir =
                 std::env::temp_dir().join(format!("vee-osal-{}-{test_name}", std::process::id()));
-            let _ = fs::remove_dir_all(&dir);
+            remove_dir(&dir);
             fs::create_dir_all(&dir).unwrap();
             TempDir { dir }
         }
@@ -109,7 +119,7 @@ mod tests {
 
     impl Drop for TempDir {
         fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.dir);
+            remove_dir(&self.dir);
         }
     }
 

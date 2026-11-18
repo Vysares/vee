@@ -2,6 +2,7 @@
 //! compiler, and write Rust code that the compiler then compiles as if it had been typed.
 //!
 //! `#[derive(Code)]`: see the example on `derive_code`.
+#![forbid(unsafe_code)]
 
 use proc_macro::TokenStream;
 

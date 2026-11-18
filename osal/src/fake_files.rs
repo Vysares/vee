@@ -19,28 +19,32 @@ impl FakeFiles {
         Self::default()
     }
 
+    /// Locks the map. A poisoned lock only means another test thread panicked while holding
+    /// it, and the map is still usable, so take it anyway.
+    fn lock(&self) -> sync::MutexGuard<'_, collections::HashMap<String, Vec<u8>>> {
+        self.files.lock().unwrap_or_else(sync::PoisonError::into_inner)
+    }
+
     /// Test setup: creates or replaces a file with exactly these bytes.
     pub fn put(&self, path: &str, bytes: &[u8]) {
-        self.files
-            .lock()
-            .unwrap()
+        self.lock()
             .insert(path.to_string(), bytes.to_vec());
     }
 
     /// Test inspection: a copy of the file's bytes, or `None` if it does not exist.
     pub fn get(&self, path: &str) -> Option<Vec<u8>> {
-        self.files.lock().unwrap().get(path).cloned()
+        self.lock().get(path).cloned()
     }
 }
 
 impl files::Files for FakeFiles {
     fn len(&self, path: &str) -> Result<Option<u64>, files::FileError> {
-        let files = self.files.lock().unwrap();
+        let files = self.lock();
         Ok(files.get(path).map(|bytes| bytes.len() as u64))
     }
 
     fn read_at(&self, path: &str, offset: u64, buf: &mut [u8]) -> Result<(), files::FileError> {
-        let files = self.files.lock().unwrap();
+        let files = self.lock();
         let bytes = files.get(path).ok_or(files::FileError::NotFound)?;
         let start = usize::try_from(offset).map_err(|_| files::FileError::UnexpectedEof)?;
         let end = start
@@ -54,7 +58,7 @@ impl files::Files for FakeFiles {
     }
 
     fn read_file(&self, path: &str, buf: &mut [u8]) -> Result<usize, files::FileError> {
-        let files = self.files.lock().unwrap();
+        let files = self.lock();
         let bytes = files.get(path).ok_or(files::FileError::NotFound)?;
         let dest = buf
             .get_mut(..bytes.len())
@@ -64,17 +68,13 @@ impl files::Files for FakeFiles {
     }
 
     fn write_file(&self, path: &str, bytes: &[u8]) -> Result<(), files::FileError> {
-        self.files
-            .lock()
-            .unwrap()
+        self.lock()
             .insert(path.to_string(), bytes.to_vec());
         Ok(())
     }
 
     fn append(&self, path: &str, bytes: &[u8]) -> Result<(), files::FileError> {
-        self.files
-            .lock()
-            .unwrap()
+        self.lock()
             .entry(path.to_string())
             .or_default()
             .extend_from_slice(bytes);
@@ -82,7 +82,7 @@ impl files::Files for FakeFiles {
     }
 
     fn rotate(&self, path: &str) -> Result<(), files::FileError> {
-        let mut files = self.files.lock().unwrap();
+        let mut files = self.lock();
         // Rotating a file that does not exist is a caller bug, so it is an error, not a no-op.
         let bytes = files.remove(path).ok_or(files::FileError::NotFound)?;
         files.insert(format!("{path}.1"), bytes);

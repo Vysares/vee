@@ -11,6 +11,7 @@
 //!
 //! `Event` is defined in core-api, so the codec is a pair of free functions here, not methods.
 
+use crate::record;
 use vee_core_api::crc;
 use vee_core_api::event;
 use vee_core_api::fixed_str;
@@ -87,13 +88,20 @@ pub fn decode(bytes: &[u8]) -> Result<event::Event, DecodeError> {
         return Err(DecodeError::BadCrc);
     }
 
-    let severity = severity_from_code(bytes[SEVERITY_OFFSET])?;
-    let text = fixed_str::FixedStr::from_bytes(core::array::from_fn(|i| bytes[TEXT_OFFSET + i]))
-        .map_err(DecodeError::BadText)?;
-    let monotonic_us = u64::from_be_bytes(core::array::from_fn(|i| bytes[TIME_OFFSET + i]));
-    let code = u16::from_be_bytes(core::array::from_fn(|i| bytes[CODE_OFFSET + i]));
+    let [severity_code] = record::field(bytes, SEVERITY_OFFSET, DecodeError::BadLength)?;
+    let severity = severity_from_code(severity_code)?;
+    let text = fixed_str::FixedStr::from_bytes(record::field(
+        bytes,
+        TEXT_OFFSET,
+        DecodeError::BadLength,
+    )?)
+    .map_err(DecodeError::BadText)?;
+    let monotonic_us =
+        u64::from_be_bytes(record::field(bytes, TIME_OFFSET, DecodeError::BadLength)?);
+    let code = u16::from_be_bytes(record::field(bytes, CODE_OFFSET, DecodeError::BadLength)?);
+    let [source] = record::field(bytes, SOURCE_OFFSET, DecodeError::BadLength)?;
     Ok(event::Event {
-        source: bytes[SOURCE_OFFSET],
+        source,
         code,
         severity,
         monotonic_us,

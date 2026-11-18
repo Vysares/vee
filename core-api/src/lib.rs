@@ -1,4 +1,5 @@
 //! Shared types and traits between the core and modules.
+#![forbid(unsafe_code)]
 #![no_std]
 
 pub mod config;

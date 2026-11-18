@@ -3,4 +3,6 @@ name = "vee-osal"
 edition.workspace = true
 version.workspace = true
 
-# No `[lints] workspace = true` here: the osal is the only crate allowed to use std and unsafe.
+# The osal is the only crate allowed to use std and (specific, documented) unsafe blocks.
+[lints]
+workspace = true

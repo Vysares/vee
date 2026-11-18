@@ -36,7 +36,7 @@ impl module::Module for Counter {
     }
 
     fn step(&mut self, ctx: &mut ctx::Ctx<'_, Self>) {
-        self.steps += 1;
+        self.steps = self.steps.saturating_add(1);
         let (steps, now) = (self.steps, ctx.monotonic());
         ctx.ev
             .send(CounterEv::Stepped, format_args!("step {steps} at {now}"));

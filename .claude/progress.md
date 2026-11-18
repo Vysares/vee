@@ -364,6 +364,66 @@ Size on 2026-11-17 (cloc, working tree, no target dir): 14 Rust files, 1729 line
     in the probe is about 8.8 KB; the rest is Rust's std. The workspace has NO release profile yet
     (add `panic = "abort"`, LTO, `opt-level`, `codegen-units` when the exec binary exists).
 
+28. **OSAL clock** (session 2026-11-18). Files `osal/src/{clock,std_clock,fake_clock}.rs`, same split
+    as `Files`. `trait Clock { fn monotonic_us(&self) -> u64 }` (microseconds since the clock
+    started, NOT mission time). `StdClock` (`new()` captures an `Instant`; a `u64` overflow, which
+    cannot happen in practice, stays at `u64::MAX` rather than panicking). `FakeClock` (`new()`,
+    `set`, `advance`; an `AtomicU64`, so `&self` works without a lock). 7 new tests (osal: 39).
+    Design decisions made this session, in the discussion before the clock (NOT yet in design.md):
+    - The scheduler loop does NOT belong in `core`: `Module` has an associated type and `Ctx<M>` is
+      generic, so no `dyn` list or generic list can hold different modules. Only the deployment
+      (`exec!`) knows every module type, so `exec!` generates the loop. Hand-write one in a test
+      first and design the macro from what repeats.
+    - The core is scheduled like a module (every tick, no divisor) but is NOT a `Module` (it owns
+      `Ev` and the logs, and its events skip the throttle). ONE `Core` struct owns the services and
+      calls them in a fixed order; the services stay separate plain structs. ONE entry point per
+      tick, `core.tick(now)`, no begin/end split: the loop comes back around, so drain, watchdog and
+      overrun detection (compare consecutive tick start times) can all happen at the top of the next
+      cycle. Shutdown needs a separate `stop()` anyway.
+    - Loop shape: for each module report its suppressed events (`Throttle::new_tick`, which also
+      starts the new tick's count; generic over the module's event enum, so the exec calls it per
+      module, and the core provides a generic helper that builds the `EventsSuppressed` text);
+      then `core.tick(now)`; then for each module build `Ctx` and `step`.
+
+29. **Clippy lints for flight code** (root `Cargo.toml` `[workspace.lints.clippy]`, all `deny`; the
+    four flight crates inherit them; plus a root `clippy.toml` that lets tests use `unwrap`,
+    `expect`, `panic!` and indexing). Panic paths: `unwrap_used`, `expect_used`, `panic`,
+    `indexing_slicing`, `string_slice`, `unreachable`, `todo`, `unimplemented`,
+    `arithmetic_side_effects` (use `checked_`, `saturating_` or `wrapping_`). Casts:
+    `cast_possible_truncation`, `cast_sign_loss`, `cast_possible_wrap`. Discipline: `wildcard_imports`,
+    `enum_glob_use`, `allow_attributes_without_reason` (every `#[allow]` needs `reason = "..."`),
+    `dbg_macro`, `print_stdout`, `print_stderr`, `exit`, `mem_forget`, `let_underscore_must_use`,
+    `undocumented_unsafe_blocks`. `cargo clippy --workspace --all-targets` is clean.
+    What changed to get there:
+    - `#[allow(.., reason)]` only where the code runs at COMPILE time (a panic or overflow there is
+      a build error, which we want): `config::parse_or`, the `setting!` macro's `as $ty`, the CRC
+      table builder. One more at `crc::table_entry` (a `u8` index into a 256 entry table cannot be
+      out of range) and one at `Ev::send` (`let _ = write_fmt`, on purpose).
+    - `FixedStr::truncated` copies with `zip` (no indexing, and shorter).
+    - New `core-types/src/record.rs` (private): `field::<N, E>(record, offset, error) -> Result<[u8;
+      N], E>`; both log decoders use it instead of indexing (N comes from the use, such as
+      `u64::from_be_bytes(record::field(..)?)`). A too-short record gives `BadLength` (cannot happen
+      after the length check, but it is an error and not a panic).
+    - `Queue` uses `checked_add`, `checked_rem`, `saturating_add/sub` and `get_mut`.
+    - New `core/src/records.rs` (private): `shape(len, record_len) -> Shape { whole, has_partial }`,
+      replacing the same division in both logs' `start`. A `record_len` of 0 gives an empty shape.
+      5 tests (core: 46).
+    - `reset_log::start`: `get_mut(..read_count)` (the `else` returns `FileError::Other`, cannot
+      happen), `usize::try_from(..).unwrap_or(TAIL_RECORDS)`, saturating counters.
+    - `osal` IS covered (same lint list, `[lints] workspace = true`). The workspace `unsafe_code`
+      is `deny` (not `forbid`), so `osal` can write `#[allow(unsafe_code, reason = "...")]` on a
+      specific block; `undocumented_unsafe_blocks` then also requires a `// SAFETY:` comment.
+      Every flight crate has `#![forbid(unsafe_code)]` at the top of its lib.rs (a new flight
+      crate must add it too), and `forbid` cannot be overridden even by an `allow`. Checked by
+      hand: unsafe in core-api fails even with an allow; in osal it fails with no allow, fails with
+      an allow and no SAFETY comment, and passes with both. `FakeFiles` has one private `lock()`
+      helper that recovers a poisoned lock (`unwrap_or_else(PoisonError::into_inner)`), replacing
+      8 `unwrap`s. `std_files` tests have one `remove_dir` helper with the `let _` allow.
+    - The `setting!` macro now proves its `value as $ty` cast: it casts back (`narrowed as usize ==
+      value`) and asserts the number is unchanged, so the allow's reason is checked at the cast.
+    - Ideas not enabled: `as_conversions` (every `as`), `std_instead_of_core`, `missing_docs`.
+    Tests now: core 46, core-api 69 + 7 + 9 + 10, core-types 32, osal 39.
+
 ## WHERE WE LEFT OFF (end of session, 2026-11-17)
 Everything builds, all tests pass (core 41, core-api 69 + 7 + 9 + 10, core-types 30, osal 32),
 clippy is clean. Part of this session's work was committed by the user along the way; at the end
@@ -381,6 +441,12 @@ Rust (comes from C++): explain syntax and generics as they come up, and follow C
 thing at a time, simplicity, callbacks only when needed, "do we really need this?").
 
 ## Next
+UPDATE 2026-11-18: the clock is done (item 28). The scheduler does NOT live in core (see item 28).
+Order now: (1) the generic helper in core that turns `Throttle::new_tick` reports into
+`EventsSuppressed` events, with tests; (2) a `Core` struct with `tick(now)`; (3) a hand-written loop in a
+test with two or three test modules and a `FakeClock`; (4) design `exec!` from what repeats.
+The paragraph below is the older plan; where it conflicts with item 28, item 28 wins.
+
 **The plain hand-written scheduler in core** (step 2 of the Ctx and exec plan; then `exec!`, which
 generates what the scheduler does): base rate, module rates that divide it, a fixed order, a tick
 counter; each tick it calls `new_tick` on every source's throttle and sends `EventsSuppressed` events,

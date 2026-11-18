@@ -6,7 +6,38 @@ members = ["core-api", "core-derive", "core-types", "core", "osal"]
 edition = "2024"
 version = "0.1.0"
 
-# Flight crates opt in with `[lints] workspace = true`.
-# The osal does not opt in, because it is the only crate allowed to use unsafe.
+# Every crate opts in with `[lints] workspace = true`.
+# `unsafe_code` is `deny` here so the osal, the only crate that may use unsafe, can allow a
+# specific block with `#[allow(unsafe_code, reason = "...")]`. Every flight crate also says
+# `#![forbid(unsafe_code)]` at the top of its lib.rs, and `forbid` cannot be overridden.
 [workspace.lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
+
+# Panic paths: flight code handles the error instead (see CLAUDE.md). Tests may allow these.
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+
+# Easy ones: no or few hits expected.
+wildcard_imports = "deny"        # the no-glob import rule
+enum_glob_use = "deny"
+allow_attributes_without_reason = "deny"
+string_slice = "deny"            # `&s[..n]` panics off a character boundary
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+exit = "deny"
+mem_forget = "deny"
+let_underscore_must_use = "deny"
+undocumented_unsafe_blocks = "deny"
+
+# Harder ones, added one at a time.
+arithmetic_side_effects = "deny" # `a + b` panics in debug and wraps in release: say which you mean
+cast_possible_truncation = "deny" # `x as u8` silently drops the high bits
+cast_sign_loss = "deny"
+cast_possible_wrap = "deny"

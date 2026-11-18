@@ -9,6 +9,10 @@ const TABLE_LEN: usize = u8::MAX as usize + 1;
 
 /// What the register becomes after shifting `byte` (placed in its top 8 bits) out one bit at a
 /// time. Each time a 1 falls off the top, the polynomial is folded in.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "runs at compile time, where an overflow would be a build error"
+)]
 const fn crc_of_one_byte(byte: u8) -> u16 {
     let mut crc = (byte as u16) << 8;
     let mut bit = 0;
@@ -25,6 +29,12 @@ const fn crc_of_one_byte(byte: u8) -> u16 {
 
 /// One entry for each possible byte value. Built by the compiler, so it is read-only data in
 /// the binary: 512 bytes, with no code running at startup.
+#[allow(
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::cast_possible_truncation,
+    reason = "runs at compile time (an overflow would be a build error), and `value < TABLE_LEN` is the loop condition, so `value` fits a u8"
+)]
 const fn build_table() -> [u16; TABLE_LEN] {
     let mut table = [0u16; TABLE_LEN];
     let mut value = 0;
@@ -37,6 +47,16 @@ const fn build_table() -> [u16; TABLE_LEN] {
 
 static TABLE: [u16; TABLE_LEN] = build_table();
 
+/// The one place the table is indexed. `TABLE_LEN` is `u8::MAX + 1`, so every `u8` is in range
+/// and the index cannot fail. Taking a `u8` (not a `usize`) is what makes that true.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "a u8 index is always below TABLE_LEN, which is u8::MAX + 1"
+)]
+fn table_entry(index: u8) -> u16 {
+    TABLE[usize::from(index)]
+}
+
 /// Computes the CRC over `data`.
 ///
 /// To check a record that ends with its own CRC (stored big-endian), compute the CRC over the
@@ -47,8 +67,8 @@ pub fn crc16_ccitt_false(data: &[u8]) -> u16 {
         // The register's top byte mixed with the input byte decides which polynomial
         // multiples get folded in. The table has that result for all 256 values.
         // The register's low byte shifts up to become the new top byte.
-        let index = usize::from((crc >> 8) as u8 ^ byte);
-        crc = (crc << 8) ^ TABLE[index];
+        let index = (crc >> 8) as u8 ^ byte;
+        crc = (crc << 8) ^ table_entry(index);
     }
     crc
 }
@@ -113,8 +133,11 @@ mod tests {
     #[test]
     fn table_version_matches_bitwise_reference_for_a_long_input() {
         let mut data = [0u8; 1024];
-        for (i, byte) in data.iter_mut().enumerate() {
-            *byte = (i * 31 + 7) as u8;
+        // A repeating pattern of bytes that wraps round at 256.
+        let mut next: u8 = 7;
+        for byte in &mut data {
+            *byte = next;
+            next = next.wrapping_add(31);
         }
         assert_eq!(crc::crc16_ccitt_false(&data), bitwise_reference(&data));
     }

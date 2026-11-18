@@ -8,6 +8,7 @@
 //! hand them to the file service, and `append` is what the file service's thread will run. That
 //! service and the main-thread half (taking events out of `Ev`) are not written yet.
 
+use crate::records;
 use core::fmt;
 use vee_core_api::config;
 use vee_core_api::event;
@@ -43,15 +44,15 @@ pub fn start<F: files::Files>(
 ) -> Result<Started, files::FileError> {
     // A missing file and an empty file mean the same thing here: there are no records.
     let len = fs.len(path)?.unwrap_or(0);
-    let record_len = log_types::RECORD_LEN as u64;
-    let whole_records = len / record_len;
-    let partial_record = len % record_len != 0;
+    let shape = records::shape(len, log_types::RECORD_LEN);
 
-    let full = whole_records >= max_records;
-    if full || partial_record {
+    let full = shape.whole >= max_records;
+    if full || shape.has_partial {
         fs.rotate(path)?;
     }
-    Ok(Started { partial_record })
+    Ok(Started {
+        partial_record: shape.has_partial,
+    })
 }
 
 /// Turns what `start` found into the events to send, in the same way as `reset_log::report`: it
@@ -220,10 +221,10 @@ mod tests {
     /// The first event `report` sends (as its code), and how many it sent.
     fn reported(started: &event_log::Started) -> (Option<core_event::CoreEvent>, usize) {
         let mut first = None;
-        let mut count = 0;
+        let mut count: usize = 0;
         event_log::report(started, |code, _text| {
             first.get_or_insert(code);
-            count += 1;
+            count = count.saturating_add(1);
         });
         (first, count)
     }

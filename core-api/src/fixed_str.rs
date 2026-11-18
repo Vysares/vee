@@ -49,13 +49,14 @@ impl<const N: usize> FixedStr<N> {
             return Err(Error::InvalidByte);
         }
         let mut bytes = [0u8; N];
-        if text.len() <= N {
-            bytes[..text.len()].copy_from_slice(text.as_bytes());
-        } else {
-            bytes.copy_from_slice(&text.as_bytes()[..N]);
-            if let Some(last) = bytes.last_mut() {
-                *last = TRUNCATED_MARK;
-            }
+        // `zip` stops at the shorter side, so this copies at most `N` bytes.
+        for (dest, &src) in bytes.iter_mut().zip(text.as_bytes()) {
+            *dest = src;
+        }
+        if text.len() > N
+            && let Some(last) = bytes.last_mut()
+        {
+            *last = TRUNCATED_MARK;
         }
         Ok(FixedStr(bytes))
     }
@@ -138,6 +139,10 @@ mod tests {
     }
 
     impl fmt::Write for Collector {
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "test helper: the text is a few bytes"
+        )]
         fn write_str(&mut self, text: &str) -> fmt::Result {
             let end = self.len + text.len();
             self.bytes
