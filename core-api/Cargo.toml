@@ -5,6 +5,8 @@ version.workspace = true
 
 [dependencies]
 vee-core-derive = { path = "../core-derive" }
+# The system log's facade: `Ev::send` mirrors each event into it.
+log = { workspace = true }
 
 [lints]
 workspace = true

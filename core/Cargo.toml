@@ -8,5 +8,9 @@ vee-core-api = { path = "../core-api" }
 vee-core-types = { path = "../core-types" }
 vee-osal = { path = "../osal" }
 
+[dev-dependencies]
+# For the `log::` calls in the loop test. The core itself will call `log` later.
+log = { workspace = true }
+
 [lints]
 workspace = true

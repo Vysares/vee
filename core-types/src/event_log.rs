@@ -90,12 +90,9 @@ pub fn decode(bytes: &[u8]) -> Result<event::Event, DecodeError> {
 
     let [severity_code] = record::field(bytes, SEVERITY_OFFSET, DecodeError::BadLength)?;
     let severity = severity_from_code(severity_code)?;
-    let text = fixed_str::FixedStr::from_bytes(record::field(
-        bytes,
-        TEXT_OFFSET,
-        DecodeError::BadLength,
-    )?)
-    .map_err(DecodeError::BadText)?;
+    let text =
+        fixed_str::FixedStr::from_bytes(record::field(bytes, TEXT_OFFSET, DecodeError::BadLength)?)
+            .map_err(DecodeError::BadText)?;
     let monotonic_us =
         u64::from_be_bytes(record::field(bytes, TIME_OFFSET, DecodeError::BadLength)?);
     let code = u16::from_be_bytes(record::field(bytes, CODE_OFFSET, DecodeError::BadLength)?);

@@ -20,8 +20,12 @@ use core::fmt::Write as _;
 config::setting! {
     /// How many events the event queue holds. Events wait in it until the event log and the
     /// downlink take them, so it has to cover a burst between two turns of the loop. It is the
-    /// same for the whole system, because there is only one queue.
-    pub EV_QUEUE_DEPTH: usize = 32, 1..=65535;
+    /// same for the whole system, because there is only one queue. Each slot is 80 bytes with the
+    /// default `EV_TEXT_MAX_BYTES` of 64 (the 12 byte envelope and the text, rounded up to a
+    /// multiple of 8), so the default of 1024 is 80 KiB. There is no per source cap, so the worst
+    /// case in one tick is
+    /// every source sending every one of its events `EV_MAX_PER_TICK` times; size for that.
+    pub EV_QUEUE_DEPTH: usize = 1024, 1..=65535;
 }
 
 /// A first-in first-out queue of up to `EV_QUEUE_DEPTH` events, and a count of the events that
@@ -46,6 +50,10 @@ impl Ev {
 
     /// Builds an event and queues it. The event's code and severity come from `code`, and its
     /// text is `text` written into the event's fixed size text.
+    ///
+    /// It also writes the event to the system log (`log::`, target `event`), whether or not the
+    /// queue has room. That is the one thing here besides the queue: no I/O of its own, and no
+    /// clock.
     ///
     /// It never fails, because the sender can do nothing about a failure:
     /// - Text that is too long is cut off and ends in `~`. The event is still sent.
@@ -76,6 +84,18 @@ impl Ev {
             monotonic_us,
             text: written,
         };
+        // The system log gets the event now, before the queue, so an event the queue cannot take
+        // is still seen there. Its own time is in the line, because the line's time is when it
+        // was written, which can be later.
+        log::log!(
+            target: "event",
+            log_level(event.severity),
+            "src={} code={} t={} us: {}",
+            event.source,
+            event.code,
+            event.monotonic_us,
+            event.text
+        );
         // `push` gives the event back if the queue is full. Here it is dropped and counted.
         if self.queue.push(event).is_err() {
             self.dropped = self.dropped.saturating_add(1);
@@ -101,6 +121,15 @@ impl Ev {
     /// silent.
     pub fn take_dropped(&mut self) -> u32 {
         core::mem::take(&mut self.dropped)
+    }
+}
+
+/// The system log's level for an event's severity: `Err` is `Error`, the others have the same name.
+fn log_level(severity: event::Severity) -> log::Level {
+    match severity {
+        event::Severity::Info => log::Level::Info,
+        event::Severity::Warn => log::Level::Warn,
+        event::Severity::Err => log::Level::Error,
     }
 }
 

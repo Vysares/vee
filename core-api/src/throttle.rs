@@ -1,8 +1,8 @@
 //! Limits how many times one event can be sent in a tick, so a module that sends the same event
 //! over and over cannot fill the event queue and the log.
 //!
-//! A tick is one cycle of the executive (one minor frame). Commands run inside ticks, so events
-//! sent from a module's `command()` count too.
+//! A tick is one cycle of the executive (one minor frame). Commands run in a module's step, which
+//! is inside a tick, so events sent from a module's `command()` count too.
 //!
 //! There is one counter for each event a source can send, found by the event's `index`. Every
 //! source's throttle is the same size, `EV_MAX_CODES` counters, and a source uses the first few

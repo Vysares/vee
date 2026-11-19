@@ -29,7 +29,7 @@ config::setting! {
     /// zero padded, and longer text is cut off and ends in `fixed_str::TRUNCATED_MARK`. It sets
     /// the size of an event log record, so changing it makes existing event logs unreadable
     /// (they are rotated away at startup, not trusted).
-    pub EV_TEXT_MAX_BYTES: usize = 50, 1..=4096;
+    pub EV_TEXT_MAX_BYTES: usize = 64, 1..=4096;
 }
 
 /// An event's text.

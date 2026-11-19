@@ -22,13 +22,14 @@ impl FakeFiles {
     /// Locks the map. A poisoned lock only means another test thread panicked while holding
     /// it, and the map is still usable, so take it anyway.
     fn lock(&self) -> sync::MutexGuard<'_, collections::HashMap<String, Vec<u8>>> {
-        self.files.lock().unwrap_or_else(sync::PoisonError::into_inner)
+        self.files
+            .lock()
+            .unwrap_or_else(sync::PoisonError::into_inner)
     }
 
     /// Test setup: creates or replaces a file with exactly these bytes.
     pub fn put(&self, path: &str, bytes: &[u8]) {
-        self.lock()
-            .insert(path.to_string(), bytes.to_vec());
+        self.lock().insert(path.to_string(), bytes.to_vec());
     }
 
     /// Test inspection: a copy of the file's bytes, or `None` if it does not exist.
@@ -68,8 +69,7 @@ impl files::Files for FakeFiles {
     }
 
     fn write_file(&self, path: &str, bytes: &[u8]) -> Result<(), files::FileError> {
-        self.lock()
-            .insert(path.to_string(), bytes.to_vec());
+        self.lock().insert(path.to_string(), bytes.to_vec());
         Ok(())
     }
 

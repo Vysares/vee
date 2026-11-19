@@ -52,6 +52,14 @@ pub enum CoreEvent {
     /// matter how many were dropped.
     #[severity(Err)]
     EventsSuppressed,
+
+    /// The event queue was full, so events were dropped. The text has how many. The events
+    /// themselves are not kept, only this count: the newest events of the burst are the lost
+    /// ones (the queue keeps the oldest). They were still written to the system log, which has
+    /// every event as it was sent. See `EventsSuppressed` for the limit on each source, which
+    /// is meant to make this rare.
+    #[severity(Err)]
+    EventsDropped,
 }
 
 #[cfg(test)]
@@ -74,6 +82,7 @@ mod tests {
         assert_eq!(core_event::CoreEvent::ResetLogCountOverflow.code(), 4);
         assert_eq!(core_event::CoreEvent::EventLogPartialRecord.code(), 5);
         assert_eq!(core_event::CoreEvent::EventsSuppressed.code(), 6);
+        assert_eq!(core_event::CoreEvent::EventsDropped.code(), 7);
     }
 
     #[test]
@@ -98,6 +107,7 @@ mod tests {
             core_event::CoreEvent::ResetLogCorruptRecord,
             core_event::CoreEvent::ResetLogMisorderedRecords,
             core_event::CoreEvent::ResetLogCountOverflow,
+            core_event::CoreEvent::EventsDropped,
         ] {
             assert_eq!(ev.severity(), event::Severity::Err);
         }

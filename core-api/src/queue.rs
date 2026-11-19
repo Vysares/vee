@@ -40,7 +40,10 @@ impl<T, const N: usize> Queue<T, N> {
         }
         // The slot after the last item, wrapping round. `head` and `len` are both below `N`, so
         // none of these steps can fail. If one ever did, the item is returned and not lost.
-        let tail = self.head.checked_add(self.len).and_then(|end| end.checked_rem(N));
+        let tail = self
+            .head
+            .checked_add(self.len)
+            .and_then(|end| end.checked_rem(N));
         let Some(slot) = tail.and_then(|index| self.slots.get_mut(index)) else {
             return Err(item);
         };

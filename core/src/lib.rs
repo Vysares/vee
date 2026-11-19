@@ -3,6 +3,7 @@
 #![no_std]
 
 pub mod event_log;
+pub mod events;
 mod records;
 pub mod reset_log;
 pub mod suppressed;

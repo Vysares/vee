@@ -24,8 +24,8 @@ fn send(queue: &mut ev::Ev, time: u64, text: fmt::Arguments<'_>) {
 }
 
 #[test]
-fn the_default_depth_is_thirty_two() {
-    assert_eq!(ev::EV_QUEUE_DEPTH, 32);
+fn the_default_depth_is_1024() {
+    assert_eq!(ev::EV_QUEUE_DEPTH, 1024);
 }
 
 #[test]

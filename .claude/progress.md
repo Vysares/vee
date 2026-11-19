@@ -270,7 +270,7 @@ Size on 2026-11-17 (cloc, working tree, no target dir): 14 Rust files, 1729 line
     by hand, not `heapless`: about 40 lines, no dependency. 10 tests (core-api: 58).
 23. **The event service `Ev`** (`core-api/src/ev.rs`; it started in core and was MOVED to core-api
     and made NON-GENERIC with the user: there is only one event queue, so its depth is the setting
-    `ev::EV_QUEUE_DEPTH` (`VEE_EV_QUEUE_DEPTH`, 32, `1..=65535`), and `Ctx`, which modules see and
+    `ev::EV_QUEUE_DEPTH` (`VEE_EV_QUEUE_DEPTH`, 1024 since 2026-11-19, was 32; `1..=65535`), and `Ctx`, which modules see and
     which therefore lives in core-api, can hold a `&mut Ev` directly: NO `EventSink` trait (the user
     chose the no-trait route; an `EventSink` would only pay off with a second implementation).
     `Ev` holds a `Queue<Event, EV_QUEUE_DEPTH>` and a `dropped` count. `Ev::new()` (a `const fn`),
@@ -436,27 +436,136 @@ Size on 2026-11-17 (cloc, working tree, no target dir): 14 Rust files, 1729 line
     `Ctx`'s handle `ctx.ev` holds them (modules depend only on core-api; a cycle otherwise).
     7 tests (core: 53).
 
-## WHERE WE LEFT OFF (end of session, 2026-11-17)
-Everything builds, all tests pass (core 41, core-api 69 + 7 + 9 + 10, core-types 30, osal 32),
-clippy is clean. Part of this session's work was committed by the user along the way; at the end
-the UNCOMMITTED changes (see `git status`) were: edits to `.claude/CLAUDE.md`, `progress.md`,
-`docs/design.md`, `core-api` (`config.rs`, `event.rs`, `lib.rs`, `reset.rs`, `tests/code_derive.rs`),
-`core-derive`, `core-types/src/core_event.rs`, `core` (`lib.rs`, `reset_log.rs`) and the sample
-deployment config, plus NEW files `core-api/src/{ctx,ev,module,queue,throttle}.rs`,
-`core-api/tests/{ctx,ev}.rs` and `core/src/event_log.rs`. Review and commit them.
-Just finished: `Module` and `Ctx<M>` (item 26). The user then explained they want `Ctx<M>` to
-eventually hold inbound messages and hardware handles too, and added a design-doc note that a
-threaded module type for slow work is a stretch goal for AFTER everything else works.
-NEXT STEP, agreed with the user: the plain hand-written scheduler in `core` (see "Next" below),
-then `exec!`. The user said to hold off on the separate file service thread. The user is learning
-Rust (comes from C++): explain syntax and generics as they come up, and follow CLAUDE.md (one
-thing at a time, simplicity, callbacks only when needed, "do we really need this?").
+31. **Core services written down** (`docs/design.md`, new section "Core services" under "Core"; no
+    code). Decided with the user, 2026-11-19: the core has seven domains: **Health** (the reset log
+    goes INSIDE it, as "related but not a service"; also overrun detection, the watchdog kick,
+    core counters), **Time**, **Events**, **Message Bus**, **Command Router** (kept separate from
+    the bus), **Tables** and **Files** (the file service, added by the user's decision). Hooks per
+    domain are planned (`start`, `tick`, `stop`; the bus has none), not written. One `Core` struct
+    owns them, one `core.tick(now)`, order of the domains inside it decided when each is written.
+    The per tick loop is in the doc (report suppressed per module, then `core.tick`, then step
+    the modules due). Also this session: `EV_QUEUE_DEPTH` default 32 to 1024 (64 KiB; a slot is 64
+    bytes; no per source cap, only the per event throttle, by the user's decision; the range
+    maximum 65535 stays). Tests now: core 53, core-api 69 + 7 + 9 + 10, core-types 32, osal 39.
+
+32. **Commands are handled in the module's step** (`docs/design.md`; no code). Decided with the user,
+    2026-11-19, REPLACING the earlier decision that the exec calls `command()` at the base rate every
+    tick. Now: the router puts a command into the target module's queue when it arrives (in the
+    core's tick); the module handles its queued commands in its OWN step, at its own rate. So a
+    command can wait up to one module period, and a slow module's command queue must cover what
+    arrives in that time. The ack for "received" is sent at queueing; the ack for the outcome after
+    the module handles it. The `dispatch` budget in the `exec!` example is now part of the step's
+    time. NOT designed: how `command()` is called inside the step (before `step()` in the same call
+    with one `Ctx`, or another way) and whether a step may handle every queued command or has a
+    limit. Edited: Module Requirements, Command Routing, Executive Requirements, the throttling
+    paragraph (commands run in the module's step), the Core services table and loop, and the doc
+    comment at the top of `core-api/src/throttle.rs`.
+
+33. **The loop test** (`core/tests/exec_loop.rs`, new; first integration test in `core`). A hand
+    written executive for three test modules (`Heartbeat`, every tick; `Slow`, every 4th tick,
+    reports the time it sees; `Noisy`, every tick, sends `Spam` over the limit) on a `FakeClock`.
+    `Slot<M: Module>` (module, `Throttle`, source, period; methods `init`, `report_suppressed`,
+    `step`) is GENERIC, so the per module logic is written once. `Exec` has one `Slot` per module
+    and the three phases of a tick: (1) each slot's `report_suppressed` (core events at `now`), (2) a
+    placeholder for `core.tick(now)`, (3) each slot's `step`, with the fake clock advancing 100 us
+    after every slot so each call sees its own time. What this says about `exec!`: it only has to
+    generate the struct fields (one `Slot<_>` per module) and the ordered calls in `tick` and `init`;
+    no per module logic. 5 tests (all pass; two deliberate breakages of the loop were each caught by
+    two tests): init order, source and time; the slow rate (ticks 0 and 4); the time each call sees;
+    a noisy module limited per tick and reported at the top of the next (the last tick's report waits
+    for the next tick); the order within a tick (core's report, then modules in order). Not covered:
+    the core's tick, commands, `start` and `stop`, overrun, the real clock.
+    Also: ran `cargo fmt`, which reformatted four committed files (`core-api/src/queue.rs`,
+    `core-types/src/event_log.rs`, `osal/src/fake_files.rs`, `core/src/suppressed.rs`; whitespace
+    only). `cargo fmt --check` is clean now. Test files outside `#[test]` fns need their own
+    `#![allow(clippy::unwrap_used, reason = ..)]` (clippy.toml's exemption covers only `#[test]` fns and
+    `#[cfg(test)]` modules). Tests now: core 53 + 5, core-api 69 + 7 + 9 + 10, core-types 32, osal 39.
+
+34. **System log, step 1 of 4** (the `log` facade; design in `docs/design.md`, "System Log"). Chosen
+    by the user (option C) after I measured std `sync_channel`/`try_send` alternatives. Done:
+    workspace dependency `log` (no default features); `osal/src/syslog.rs` (new): `Line` (Display:
+    `<time_us> <LEVEL> <target>: <message>`), a private `Logger` (writes to stderr, ignoring write
+    errors on purpose), `init(clock, level)` (one global logger via `OnceLock`, then
+    `log::set_logger`/`set_max_level`); 5 tests. `core/tests/exec_loop.rs` calls `init_log()` from
+    `run()`, which installs the logger only if `VEE_TEST_LOG` names a level (stderr is not captured by
+    `cargo test`, so always installing would print on every run); the exec logs init, each tick, each
+    step and each drained event. Try: `VEE_TEST_LOG=debug cargo test -p vee-core --test exec_loop
+    a_noisy -- --test-threads=1`. Tests now: osal 44, core 53 + 5. Remaining steps: (2) bounded
+    queue (`sync_channel` + `try_send`) + a polling writer thread, switched on when `started` is set;
+    (3) mirror events into the log in the Events drain; (4) persisted file plus an in-memory ring
+    dumpable by command. Open: lines queued at a panic are lost under `panic = abort`.
+    **Step 2a done** (`osal/src/syslog.rs`): `LineBuf` (256 byte fixed buffer holding the FINISHED
+    line: text cut at a whole character at `TEXT_MAX` = 254, then `~` if cut, then `\n`; once cut,
+    later pieces are ignored; `from_line`, `finish`, `as_bytes`), `Logger::new`, `Logger::emit`
+    (formats into a `LineBuf` in both modes, then `queue` empty = one `write_all` to stderr;
+    filled = `try_send`, and on failure `dropped += 1`), `log` is now the level check plus `emit`.
+    SPLIT (user's request, applies to the whole OSAL): interface files use only `core` (`clock`,
+    `files`, `syslog`: `Line`, `LineBuf`), implementation files are named for the platform or the
+    double (`std_*`, `fake_*`). `syslog.rs` was mixed, so the logger, `init`, stderr and the queue
+    moved to the new `osal/src/std_syslog.rs`; `init` is now `std_syslog::init`. Rule recorded in
+    `osal/src/lib.rs` and in design.md's OSAL Requirements. Tests: 6 in `syslog`, 3 in
+    `std_syslog`.
+    **Step 2b DONE** (`osal/src/std_syslog.rs`): `start_queue()` (global) and `Logger::start_queue`
+    (makes `sync_channel(QUEUE_DEPTH)`, spawns the writer with `thread::Builder` so a failure is an
+    `Err` and not a panic, THEN fills `queue`); `StartError { NotInstalled, AlreadyStarted,
+    Thread(io::Error) }`; `Logger::drain` (one writer pass: at most `QUEUE_DEPTH` lines, then a
+    Warn line "N lines dropped: the queue was full" straight to the output; returns false when the
+    queue is closed); the writer loops `drain` + sleep `POLL` (10 ms). The user chose to handle a
+    failed spawn (stay in direct mode) AND to make forgetting `start_queue` impossible: the
+    executive's start sequence (not written yet) must be one function that calls `start_queue`
+    then sets `started`, and report any `Err` with `log::error!` plus an event. Written in
+    design.md. Tests: 8 in `std_syslog`. NOT tested: the real thread writing to the real stderr
+    (only `start_queue` returning Ok and the mode switching); lines still queued at process exit or
+    at a panic are lost. The old warning (unused `QUEUE_DEPTH`) is gone. OLD NOTE (done now),
+    expected warning: `QUEUE_DEPTH` unused. **2b still to do**: a
+    `start_queue()` that creates `sync_channel(QUEUE_DEPTH)`, fills `queue`, and spawns the polling
+    writer thread (`try_recv` + sleep; writes each line to stderr; also reports and clears
+    `dropped`); handle a failed thread spawn by staying in direct mode; call it before `started`,
+    since spawning allocates. The writer loop should take an `impl io::Write` so it can be tested.
+
+35. **Events into the system log (step 3), text size 64, `EventsDropped`**. Decided with the user:
+    mirror each event at SEND time in `Ev::send` (`core-api/src/ev.rs`; after the throttle, before
+    the queue), not in a drain, so an event a full queue drops is still in the log, and lines are in
+    order with the rest of the log. `core-api` now depends on `log`. Line: `INFO|WARN|ERROR event:
+    src=3 code=1 t=10200 us: spam` (Err is ERROR; `log_level(severity)`). The drain therefore does
+    not log. `EV_TEXT_MAX_BYTES` default 50 to 64: the log record is 78 bytes (was 64) and an `Event`
+    slot is 80 bytes (was 64), the queue 80 KiB. Docs updated (design.md, `ev.rs`, `suppressed.rs`,
+    `sample-deployment/.cargo/config.toml`); old numbers in the history items above are history.
+    New `CoreEvent::EventsDropped` (Err, code 7) and `core/src/events.rs` (new): `report_dropped(ev,
+    now)` sends it from `ev.take_dropped()` (text `N events dropped: the queue was full`, at most
+    45 bytes). The caller must call it AFTER emptying the queue, or the report itself can be dropped
+    (then it is counted for the next call). The drain (the pop loop that hands events to the event
+    log and downlink) is NOT written: no sinks exist (needs the file service and the bus). Tests:
+    `core-api/tests/ev_log.rs` (new, 4 tests: its own program, a capturing logger, one test fills
+    the queue and checks the overflowing event is still logged), `core/src/events.rs` (4), `core_event`
+    tests updated. Open: the log's queue (256) is smaller than the event queue (1024), so a burst of
+    more than 256 events at once overflows the log's queue (reported as "N lines dropped"); decide
+    whether to raise `QUEUE_DEPTH`. Step 4 (persisted file plus in-memory ring) is not started.
+    `exec_loop.rs` no longer logs in its drain; it does not call `report_dropped` (nothing empties
+    the queue until the end of a test).
+
+## WHERE WE LEFT OFF (2026-11-19)
+Everything builds, all tests pass, clippy (with the strict lints of item 29) is clean. Committed by
+the user: `a3c2ef6` (stricter lints, basic clock: items 28 and 29) and `92a65d3` (the suppressed
+reporter: item 30). NOT yet committed: items 31 to 34 (the queue depth change, the "Core services"
+section and the commands-in-step change in `docs/design.md`, the loop test `core/tests/exec_loop.rs`,
+the `cargo fmt` whitespace changes, the system log step 1 and its "System Log" design section, and
+this file). The user commits.
+The user is learning Rust (comes from C++): explain syntax and generics as they come up, and follow
+CLAUDE.md (one thing at a time, simplicity, callbacks only when needed, "do we really need this?",
+and after any edit name each file touched and what was done in it).
 
 ## Next
-UPDATE 2026-11-18: the clock is done (item 28). The scheduler does NOT live in core (see item 28).
-Order now: (1) DONE (item 30): the generic helper that turns `Throttle::new_tick` reports into
-`EventsSuppressed` events; (2) a `Core` struct with `tick(now)`; (3) a hand-written loop in a
-test with two or three test modules and a `FakeClock`; (4) design `exec!` from what repeats.
+UPDATE 2026-11-19 (latest): the user approved the system log in 4 steps (item 34). Step 1 is done;
+next is step 2 (the queued mode), unless the user redirects. After that, the plan below.
+UPDATE 2026-11-19: the loop test is DONE (item 33). What is left of that plan: see what `Core` needs to
+own (the loop has a placeholder for `core.tick(now)`), then design `exec!` from the loop (the generic
+`Slot<M>` and the ordered calls). The smallest domains the loop needs first: Time, the Events drain
+(`Ev` to the event log, `take_dropped` as an event), Health (overrun, watchdog). Commands are next
+after that, with the new rule of item 32 (handled in the module's step).
+UPDATE 2026-11-18 (still true): the clock is done (item 28). The scheduler does NOT live in core
+(see item 28). Order was: (1) DONE (item 30) the suppressed reporter; (2) a `Core` struct with
+`tick(now)`; (3) the hand-written loop; (4) design `exec!`. Now (3) comes before (2).
 The paragraph below is the older plan; where it conflicts with item 28, item 28 wins.
 
 **The plain hand-written scheduler in core** (step 2 of the Ctx and exec plan; then `exec!`, which

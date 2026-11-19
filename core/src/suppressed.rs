@@ -17,7 +17,7 @@ use vee_core_types::core_event;
 ///
 /// The text has the source, the event's code and how many sends were dropped, for example
 /// `suppressed: source 3 code 7, 12 dropped`. At most 46 bytes, so it fits the default
-/// `EV_TEXT_MAX_BYTES` of 50. The count stops at 255 minus the limit
+/// `EV_TEXT_MAX_BYTES` of 64. The count stops at 255 minus the limit
 /// (`throttle::EV_MAX_PER_TICK`), so it can be "at least this many".
 ///
 /// The executive calls this at the top of every tick, for every module, before the core's own
@@ -109,10 +109,7 @@ mod tests {
         send_times(&mut throttle, Sample::First, LIMIT.saturating_add(1));
         let (sent, count) = reported(&mut throttle, 3);
         assert_eq!(count, 1);
-        assert_eq!(
-            sent[0].unwrap().0,
-            core_event::CoreEvent::EventsSuppressed
-        );
+        assert_eq!(sent[0].unwrap().0, core_event::CoreEvent::EventsSuppressed);
         assert_eq!(text_of(&sent[0]), b"suppressed: source 3 code 0, 1 dropped");
     }
 
@@ -122,7 +119,10 @@ mod tests {
         send_times(&mut throttle, Sample::Second, LIMIT.saturating_add(12));
         let (sent, count) = reported(&mut throttle, 3);
         assert_eq!(count, 1);
-        assert_eq!(text_of(&sent[0]), b"suppressed: source 3 code 7, 12 dropped");
+        assert_eq!(
+            text_of(&sent[0]),
+            b"suppressed: source 3 code 7, 12 dropped"
+        );
     }
 
     #[test]
@@ -158,6 +158,6 @@ mod tests {
         assert!(text_of(&sent[0]).len() <= MAX_TEXT_LEN);
     }
 
-    /// What `report`'s doc says: it fits the default `EV_TEXT_MAX_BYTES` of 50.
+    /// What `report`'s doc says: it fits the default `EV_TEXT_MAX_BYTES` of 64.
     const MAX_TEXT_LEN: usize = 46;
 }

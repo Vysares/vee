@@ -30,6 +30,32 @@ This repo contains the core, a set of standard modules, and an example mission c
 ## Core
 The core provides a minimal set of utilities to each module.
 
+### Core services
+The core is split into domains. Each is a plain struct with one job and its own file in the `core` crate, sections below. They are the seven services:
+
+| Domain | What it provides | Hooks (planned) | State today |
+| --- | --- | --- | --- |
+| Health | The reset log (how the last run ended, `ctx.reset`), overrun detection, the watchdog kick, and the core's own counters | `start`, `tick`, `stop` | the reset log exists (`reset_log`) |
+| Time | The clock, read once per call and fixed into each `Ctx`; the tick count. Later, the monotonic to TAI correlation event | `tick` | `Clock` in the OSAL |
+| Events | The event queue (`Ev`), per event throttling, the report of suppressed events, the event log | `start`, `tick` (drain), `stop` (last drain) | `ev`, `throttle`, `suppressed`, `event_log` (file side) |
+| Message Bus | One writer, N readers, a queue per reader | none planned: a send queues, a module drains in `step` | not started |
+| Command Router | Commands to a module's `command()`, acks, and a result for the sender's `seq` | `tick` (route into the modules' command queues) | not started |
+| Tables | The table sets, the one load buffer and one dump buffer | `start` (load), `tick` (follow file results), `stop` (dump) | not started |
+| Files | The file service: a thread, bounded request queues, results back. Clients are Tables, the event log and modules (`ctx.file`) | `start`, `tick` (collect results), `stop` | `Files` in the OSAL (blocking, for startup and shutdown) |
+
+- The reset log is in Health because it is related to it, but it is not a service: nothing calls it during a run. `start` produces `ctx.reset` and `stop` records a clean shutdown. A panic leaves the last run `Unknown` (see Faults).
+- The Bus and the Command Router stay separate. The bus is publish and subscribe with a queue per reader. The router is point to point (target and opcode) with acks and results. They share only `queue::Queue`.
+- Files is the only domain that owns a thread. Its clients never block: a request goes into a bounded queue (a full queue is an immediate nak or a counted loss) and the answer comes back on a later tick.
+- Health reports what it finds as events, so it sends through Events. Events and Tables both send through Files.
+
+The executive schedules the core like a module, every tick and with no divisor (`core { budget: .. }` in `order`), but the core is not a `Module`: it owns `Ev` and the logs, and its own events skip the throttle. The core is one struct, `Core`, that owns the domains and calls their hooks in an order the core fixes, so a deployment cannot get it wrong. It has one entry point per tick, `core.tick(now)`, and no begin and end split: the loop comes back around, so draining events, the watchdog kick and overrun detection (compare the start times of consecutive ticks) can happen at the top of the next tick. Start and shutdown are separate calls, `start` and `stop`. `exec!` generates the loop, because only the deployment knows every module type (`Module` has an associated type, so no list of modules fits in `core`). Each tick:
+
+1. For each module, report its suppressed events (`suppressed::report`, generic over the module's event enum). This also zeroes that module's throttle, which starts the tick's count.
+2. `core.tick(now)`.
+3. For each module due this tick, read the clock, build its `Ctx` and call `step`. The module's queued commands are handled in this step (see Command Routing), not every tick.
+
+Not written yet: `Core`, `exec!`, the order of the domains inside `core.tick` (decided as each domain is written), and the Bus, Router, Tables and Files domains.
+
 ### Software Bus
 - The core provides a typed software bus between modules.
 - Types are defined in each module, in a dedicated types crate that other modules can use to learn about those types (to avoid a dependency loop between modules).
@@ -54,6 +80,7 @@ The core provides a minimal set of utilities to each module.
 - Acks and naks are ordinary text events (see Events), with the command's details (sink, target, opcode, seq, reason) written into the text. The ground reads them like any other event.
 - Inside Vee, a module that needs to know whether a command succeeded (an RTS that waits for success) does not read events. The router gives the sender a result for the command's `seq`, the same for every sink, and the sender collects it without blocking: it submits, keeps the `seq`, and checks for the result on a later cycle (everything runs on one thread). Not designed yet.
 - Each module has a fixed-depth command queue. A full queue is an immediate NAK.
+- The router puts a command into the target module's queue when it arrives. The module handles it in its own step (see Module Requirements), so how long a command waits depends on the module's rate. The ack for "command received" is sent when the router queues it, and the ack for the outcome is sent after the module has handled it, which can be a period or more later. Not designed yet: how the exec calls `command()` inside the step (for each queued command before `step()` in the same call, with one `Ctx`, or another way), and whether one step may handle every queued command or has a limit.
 
 ``` rust
 /// in ats-types.rs, for example
@@ -170,14 +197,14 @@ enum ResetLogEntry {
 ## Events
 - The core exposes an API for modules to emit events, through `ctx.ev`.
 - An event is a code and a short text. Inside a module, a code and a sentence is enough. If more detail is needed, add another code: codes are cheap. The text can carry values (`"open failed: {path} ({err})"`, written with `format_args!`), so the ground can read them. Events carry no typed args.
-- Every event has the same envelope: source (the module), code, severity, a monotonic time, and text of a fixed size (`EV_TEXT_MAX_BYTES`, 50 by default, set at build time: see Build-time settings). Every event is the same size on the wire and on disk: shorter text is zero padded.
+- Every event has the same envelope: source (the module), code, severity, a monotonic time, and text of a fixed size (`EV_TEXT_MAX_BYTES`, 64 by default, set at build time: see Build-time settings). Every event is the same size on the wire and on disk: shorter text is zero padded.
 - The text is a `FixedStr<EV_TEXT_MAX_BYTES>` (`core-api`): ASCII only, exactly that many bytes on the wire, zero padded, ending at the first zero byte. Text that is too long is cut off and the event is still sent, because the ground log must see it (see Faults). A cut-off text ends in `~` (`fixed_str::TRUNCATED_MARK`, replacing the last kept byte), so a reader can see it was cut. A text of exactly the maximum length is not marked. Writing text with `format_args!` goes through `fmt::Write` on `FixedStr`, which cuts off the same way and never fails: a character that cannot be in the text (non-ASCII) becomes `?`. No allocation happens in flight.
 - The code is the value of an enum variant, on an enum marked `#[repr(u16)]`, one enum per source (a module's, or the core's). A code is a `u16`. Values are implicit (0, 1, 2, ... in the order written) and Rust refuses two variants with the same value, so codes are unique within an enum. The catch: a code is then the variant's position, so reordering variants or inserting one in the middle renumbers the codes after it, and old logs would decode wrongly. New events go at the end. A variant may be given an explicit value (`Started = 0x01`) to pin its code.
 - Each code has a fixed severity: info, warn, err. It is given once, on the variant, and the caller of `ctx.ev.send` never picks it.
 - `#[derive(event::Code)]` (core-derive; the trait is `event::Code`) generates the lookup (below). The core's own events use it exactly as a module's do.
 - Command acks and naks are plain events (see Commands). They have no special codes, kind bits or fields. They are written the same way as any other event, with the details in the text.
-- Throttling: a source can send each of its events at most `EV_MAX_PER_TICK` times per tick (a tick is one executive cycle, one minor frame; events sent from a module's `command()` count, since commands run inside ticks). The default is 5, at most 255, and it is a build-time setting. Sends past the limit are dropped. At the start of the next tick the core sends one `CoreEvent::EventsSuppressed` (Err) for each event that was suppressed, with the source, the event's code and how many sends were dropped (stopping at 255 minus the limit), however many there were. The counters are `core_api::throttle::Throttle`: one `u8` counter per event, found by the event's position (`index`), so there is no table to fill up and one event can never throttle another. Every source's throttle is the same size, `EV_MAX_CODES` counters (default 256, a build-time setting), and a source uses the first few. `#[derive(event::Code)]` fails the build if an enum has more events than that. The throttle belongs to the source, so it lives with the source's handle behind `ctx.ev`, which checks it before calling `Ev::send` and can only send its own module's event enum. The core's own events do not go through a throttle, so `EventsSuppressed` cannot be suppressed. Not written yet: the handle (it needs `ctx` and `exec!`).
-- The event service is `core_api::ev::Ev` (in core-api, not the core, so `Ctx` can hold a reference to it): a `core_api::queue::Queue<Event, EV_QUEUE_DEPTH>` plus a count of dropped events, with no I/O and no clock. There is one event queue in the whole system, so its depth is a build-time setting (`EV_QUEUE_DEPTH`, default 32) and not a type parameter. `send(source, monotonic_us, code, text)` builds the `Event` and queues it. The event log and the downlink take events out with `pop`, oldest first. `send` never fails, because the sender can do nothing about a failure: text that is too long is cut off and marked (see above), a value in the text that fails to print leaves the text up to that point, and a full queue drops the new event (the oldest are kept, because the first events of a problem are the most useful) and counts it. The logger takes that count with `take_dropped` and sends it on as an event. Modules never get an `Ev`: they only get the `ctx.ev` handle, which can only send.
+- Throttling: a source can send each of its events at most `EV_MAX_PER_TICK` times per tick (a tick is one executive cycle, one minor frame; events sent from a module's `command()` count, since commands run in the module's step, which is inside a tick). The default is 5, at most 255, and it is a build-time setting. Sends past the limit are dropped. At the start of the next tick the core sends one `CoreEvent::EventsSuppressed` (Err) for each event that was suppressed, with the source, the event's code and how many sends were dropped (stopping at 255 minus the limit), however many there were. The counters are `core_api::throttle::Throttle`: one `u8` counter per event, found by the event's position (`index`), so there is no table to fill up and one event can never throttle another. Every source's throttle is the same size, `EV_MAX_CODES` counters (default 256, a build-time setting), and a source uses the first few. `#[derive(event::Code)]` fails the build if an enum has more events than that. The throttle belongs to the source, so it lives with the source's handle behind `ctx.ev`, which checks it before calling `Ev::send` and can only send its own module's event enum. The core's own events do not go through a throttle, so `EventsSuppressed` cannot be suppressed. Not written yet: the handle (it needs `ctx` and `exec!`).
+- The event service is `core_api::ev::Ev` (in core-api, not the core, so `Ctx` can hold a reference to it): a `core_api::queue::Queue<Event, EV_QUEUE_DEPTH>` plus a count of dropped events, with no I/O of its own (only the system log write below) and no clock. There is one event queue in the whole system, so its depth is a build-time setting (`EV_QUEUE_DEPTH`, default 1024, which is 80 KiB at 80 bytes a slot) and not a type parameter. There is no cap per source, only the per event throttle, so the worst case in one tick is every source sending each of its events `EV_MAX_PER_TICK` times: size the queue for that. `send(source, monotonic_us, code, text)` builds the `Event`, writes it to the system log, and queues it (see System Log: the write comes first, so an event the queue cannot take is still seen). The event log and the downlink take events out with `pop`, oldest first. `send` never fails, because the sender can do nothing about a failure: text that is too long is cut off and marked (see above), a value in the text that fails to print leaves the text up to that point, and a full queue drops the new event (the oldest are kept, because the first events of a problem are the most useful) and counts it. The core takes that count with `take_dropped` once per tick, after it has emptied the queue, and sends it on as one `CoreEvent::EventsDropped` (Err, code 7, text like `37 events dropped: the queue was full`): `core::events::report_dropped`. Only the count is kept; the dropped events themselves are the newest of the burst, and the system log has them. Modules never get an `Ev`: they only get the `ctx.ev` handle, which can only send.
 - `ctx.ev` is a small handle around `Ev` that fills in the module's `source` and the time. A module cannot set either, so a module cannot claim another module's id. (Not written yet: it waits for `ctx`.)
 - `time` is `monotonic_us`: microseconds since this boot, from the OSAL's monotonic clock (what modules get from `ctx.monotonic()`). It restarts at every boot (it is not MET: there is no mission epoch) and it never jumps, so ordering within a run is always right. Runs are told apart by the boot event, so records carry no run id.
 - Absolute time (TAI) is not in the envelope. The core emits a time-correlation event (monotonic time plus TAI) whenever the offset is set or changes, and the ground converts. Not designed yet.
@@ -186,7 +213,7 @@ enum ResetLogEntry {
 // core-api
 enum Severity { Info, Warn, Err }
 
-const EV_TEXT_MAX_BYTES: usize = 50;   // the default: see `config`
+const EV_TEXT_MAX_BYTES: usize = 64;   // the default: see `config`
 
 struct Event {
     source: u8,         // 0 = core. Filled in by ctx.ev.
@@ -223,7 +250,7 @@ fn do_something(&mut self, ctx: &mut Ctx) {
 - The core keeps an event log on disk: every event emitted through `ctx.ev`, whatever the downlink `filter` says. The downlink may drop or filter events; the log is the on-board record.
 - It is a core feature, not a module. It sees events as they pass through the event service, so it needs no bus queue of its own.
 - The log is an append-only binary file of fixed-size records, using the same ideas as the reset log: fixed layout, explicit field-by-field encode and decode, CRC-16/CCITT-FALSE from `core-api`.
-- A record is the whole `Event` envelope plus the CRC, 64 bytes with `EV_TEXT_MAX_BYTES` at its default of 50: `monotonic_us` (8), source (1), code (2), severity (1), text (50), CRC (2), all big-endian. Severity is stored even though it can be looked up from the code, so the log can be read without the module's types crate. Decode rejects a bad CRC, an unknown severity, and text that is not valid `FixedStr` content (a non-ASCII byte, non-zero padding).
+- A record is the whole `Event` envelope plus the CRC, 78 bytes with `EV_TEXT_MAX_BYTES` at its default of 64: `monotonic_us` (8), source (1), code (2), severity (1), text (64), CRC (2), all big-endian. Severity is stored even though it can be looked up from the code, so the log can be read without the module's types crate. Decode rejects a bad CRC, an unknown severity, and text that is not valid `FixedStr` content (a non-ASCII byte, non-zero padding).
 - There is no run id in a record. The reset report event is the first event of every run and carries the boot count, so a reader splits the log into runs at those events.
 - Writes during the tick loop must not block, so they go through the file service (a bounded request queue, like any other client). If that queue is full, the event is not written. The logger counts the missed events, and the next record that does get written carries the count (as an ordinary event, so the loss is never silent).
 - Events emitted before the tick loop starts (`init`, the reset log report) are written with blocking OSAL calls, the same way the reset log is. The loop has not started, so there is nothing to disturb.
@@ -234,10 +261,26 @@ fn do_something(&mut self, ctx: &mut Ctx) {
 - The logger only writes. Reading the log (to downlink it, or to show it) is done by ground tooling, or by a later file-dump command through the file service.
 - Not decided yet: whether the log is one file or one per source.
 
+## System Log
+Free-form text for developers, and for failures the event system cannot report (an event log that will not open, say). Code you cannot see working is hard to trust, so this is how Vee shows what it is doing, in SIL testing and on a real deployment. It is the lowest level of output Vee makes: real events are the first approach, and the system log is downlinked only as a contingency.
+- It is the `log` crate's facade (a dependency with no default features, so it works without std). Any crate writes `log::info!("...")`; the logger behind it is `osal::std_syslog`, installed by `std_syslog::init(clock, level)`.
+- This is the one exception to "all I/O through `ctx`". A module's data goes through `ctx` because that data is typed and the module needs its types. A log line is only text, and `log::` is a static interface.
+- `init` is the first thing `main` does, before anything can fail: a `log::` call made before it is thrown away with no sign. It shares the executive's `StdClock` origin, so a line's time and an event's `monotonic_us` count from the same start.
+- Level: set by `init`, default `Info`. A message below the level costs one atomic load and a branch. It is not compiled out (the `log` crate's `max_level_*` features stay available but unused), because it is a debugging tool worth having in flight, and it is low risk.
+- A line is `<time_us> <LEVEL> <target>: <message>` (`osal::syslog::Line`, which implements `Display`, so the same line goes to stderr, a buffer or a test comparison without allocating). A finished line is a `syslog::LineBuf`: a fixed 256 byte buffer holding the text (at most 254 bytes, cut at a whole character), then `~` if it was cut, then a newline. Both modes below format into one first.
+- The push into any queue must NEVER wait. This is why there are two modes:
+  - Direct (written): the calling thread writes the line to stderr. A blocking write is acceptable before startup completes, because it is the only way to see a very early startup failure. A write error is ignored on purpose (there is nowhere else to report it; `eprintln!` would panic).
+  - Queued (`std_syslog::start_queue`): the logger switches to a bounded queue (`QUEUE_DEPTH` lines, 256). The calling thread formats the line and does a `try_send`, dropping and counting when it is full. A writer thread polls with `try_recv` and a 10 ms sleep, never a blocking `recv`: measured, a blocked consumer makes each producer's send cost about 18 times more (the wake path takes a lock and a futex call). Each pass writes at most one queue full of lines, then writes a warning line with the number of lines dropped since the last pass, straight to the output (not through the queue, which may be full).
+  - The executive's start sequence is one function that calls `start_queue` and then sets `started`, so the queue cannot be forgotten, and nothing else sets `started`. Starting the thread allocates, so it comes first. If it fails (`StartError::Thread`: the OS refused a thread, from a limit on threads or on memory) the logger stays in direct mode and the executive reports it with `log::error!` (which prints directly) and an event. `NotInstalled` (no `init`) and `AlreadyStarted` are bugs in the start sequence and are reported the same way.
+- Events are also written to the system log, by `Ev::send`, when the event is sent: after the throttle and before the queue. So the log shows an event the full queue drops (the log is what was sent after throttling, and the event log is what was kept), and the lines come in order with the rest of the log, not in a block when the queue is drained. The line is `<time> <LEVEL> event: src=<source> code=<code> t=<monotonic_us> us: <text>`, with the level from the severity (Info is INFO, Warn is WARN, Err is ERROR). The event's own time is in the line because the line's time is when it was written. They are only written; the log is not downlinked unless needed. The log's queue (256 lines) is smaller than the event queue (1024), so a burst of more than 256 events at once can overflow it. The writer then reports how many lines were dropped.
+- A panic with `panic = abort` loses the lines still in the queue. Accepted for now. Later options: an mmap'd ring file, or a persisted file plus an in-memory ring of recent lines that a command can dump (like cFS's system log).
+- No capture backend for unit tests: the benefit is for real deployments and SIL runs, not unit tests. Test programs install the logger only if asked (see `core/tests/exec_loop.rs`: `VEE_TEST_LOG=debug cargo test -p vee-core --test exec_loop -- --test-threads=1`).
+
 ## OSAL Requirements
 - The OSAL is a thin wrapper around std/POSIX calls. It assumes a std implementation exists on the target.
 - The OSAL is the only flight crate where std and unsafe are allowed.
-- It provides what the rest of the code cannot: threads (with priority and CPU pinning), locks, cross-thread queues, device I/O (uart, udp, files), the monotonic clock behind `ctx.monotonic()`, and the panic handler.
+- Each OSAL service is split into an interface file, with the traits and plain types, using only `core` (`clock`, `files`, `syslog`), and one file for each implementation, named for its platform (`std_clock`, `std_files`, `std_syslog`) or for a test double (`fake_clock`, `fake_files`). The rest of Vee uses the interface, and a new platform adds files without changing the interface. New services follow this.
+- It provides what the rest of the code cannot: threads (with priority and CPU pinning), locks, cross-thread queues, device I/O (uart, udp, files), the monotonic clock behind `ctx.monotonic()`, the system log (`syslog`, the logger behind the `log` crate, which is the OSAL's one dependency), and the panic handler.
 
 ## Module Requirements
 - Code is split between the Core, and Modules. Each module is its own crate.
@@ -245,9 +288,9 @@ fn do_something(&mut self, ctx: &mut Ctx) {
 - Each module owns its sets of command definitions.
 - A module may implement `init(ctx)`, which runs once at startup before the first tick. Use it to load tables, read `ctx.reset` (how the last run ended), and do other setup.
 - A module implements `step(ctx)`, which runs at the module's rate. It drains the module's bus queues here.
-- A module implements `command()`, which handles commands. The exec calls it at the base tick rate, not the module's rate, so commands are not delayed by a slow module.
+- A module implements `command()`, which handles commands. The exec calls it as part of that module's step, so a module handles its commands at its own rate, not every tick. Commands wait in the module's command queue until its next step (see Command Routing). So a command can wait up to one period of the module, and a slow module needs a command queue deep enough for what arrives in that time.
 - Modules get time from `ctx.monotonic()`: microseconds since this boot. It restarts at every boot and never jumps.
-- Modules do all I/O (bus, events, files, devices, time) through `ctx`.
+- Modules do all I/O (bus, events, files, devices, time) through `ctx`. The one exception is the system log: a module may call `log::info!` and the like directly (see System Log).
 - `Module` (core-api) is the trait a module implements: `type Event` (its own event enum), `init(&mut self, ctx)` and `step(&mut self, ctx)`. `command()` is not in the trait yet.
 - `Ctx<'a, M>` (core-api) is generic over the module `M`, and what is inside comes from what `M` declares. The executive builds one for every call into a module and passes `&mut Ctx`; the module uses it for that call only. It holds pieces the core owns, which the module borrows: a module never holds a reference to core state of its own. Today it has `ctx.ev` (an `EvHandle<M::Event>`), `ctx.monotonic()` and `ctx.reset`; the bus, files, tables and devices will be added, and the exec config (`uses`, `reads`) will decide which of them each module's `Ctx` gets. A module may only reach core types, its own types and what the exec config connects.
 - `ctx.ev.send(code, text)` takes only the module's own event enum (`M::Event`), so the compiler stops a module from sending another module's events. The handle's fields are private and it has only `send`: a module cannot read events or set its own source. The module's source and the time are fixed by the executive. `send` checks the module's `Throttle` first; an event over the limit is not queued.
@@ -273,7 +316,7 @@ fn command(&mut self, cmd: FsCmd, ctx: &mut Ctx, r: CmdRef) -> CmdResult {
 - The executive is constructed from an `exec!` macro for the specific deployment.
 - The executive sets up the main loop, run rates and order, and interface threads (for the filesystem and blocking I/O, as defined in the deployment)
 - The executive runs at a defined tick rate (100Hz, for example)
-    - The exec dispatches commands every tick
+    - The router puts arriving commands into the modules' command queues in the core's tick. Each module handles its queued commands in its own step, at its own rate. (In the example below, `dispatch` is the time budget for that command handling, now part of the step.)
     - Modules run at a defined, fixed rate, which must divide the base rate. (the major frame is the least common multiple of these periods)
     - Changing rates at runtime is a possible future feature. A module that needs an internal rate (every n steps) makes it table driven.
 - The exec has the core run its startup reset log step first (see Reset Log).
@@ -320,7 +363,7 @@ In the above example, note how Ctx is a universal type. Start with that, then we
   ``` rust
   config::setting! {
       /// How many bytes of text an event carries.
-      pub EV_TEXT_MAX_BYTES: usize = 50, 1..=4096;
+      pub EV_TEXT_MAX_BYTES: usize = 64, 1..=4096;
   }
   ```
   It writes a constant of that name, and checks the value against the range (the default too).
