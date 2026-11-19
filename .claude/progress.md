@@ -424,6 +424,18 @@ Size on 2026-11-17 (cloc, working tree, no target dir): 14 Rust files, 1729 line
     - Ideas not enabled: `as_conversions` (every `as`), `std_instead_of_core`, `missing_docs`.
     Tests now: core 46, core-api 69 + 7 + 9 + 10, core-types 32, osal 39.
 
+30. **`EventsSuppressed` reporter** (`core/src/suppressed.rs`, new file). `suppressed::report::<C, _>(
+    &mut Throttle, source: u8, send)` calls `Throttle::new_tick` and, for each event suppressed in the
+    tick that ended, calls `send(CoreEvent::EventsSuppressed, fmt::Arguments)` (same callback shape as
+    `reset_log::report`; no I/O). Text: `suppressed: source {source} code {code}, {dropped} dropped`,
+    at most 46 bytes (fits the default 50). `{code}` is the event's code (not its index). `dropped`
+    stops at 255 minus `EV_MAX_PER_TICK`, so it can mean "at least". Generic over the module's event
+    enum `C`, so the exec calls it once per module with that module's type; it also zeroes the
+    counters, so calling it IS how a new tick starts. No `>=` marker in the text (decided: skip).
+    Also: doc comments on `Throttle` and `Ev` saying they are the exec's and `pub` only because
+    `Ctx`'s handle `ctx.ev` holds them (modules depend only on core-api; a cycle otherwise).
+    7 tests (core: 53).
+
 ## WHERE WE LEFT OFF (end of session, 2026-11-17)
 Everything builds, all tests pass (core 41, core-api 69 + 7 + 9 + 10, core-types 30, osal 32),
 clippy is clean. Part of this session's work was committed by the user along the way; at the end
@@ -442,8 +454,8 @@ thing at a time, simplicity, callbacks only when needed, "do we really need this
 
 ## Next
 UPDATE 2026-11-18: the clock is done (item 28). The scheduler does NOT live in core (see item 28).
-Order now: (1) the generic helper in core that turns `Throttle::new_tick` reports into
-`EventsSuppressed` events, with tests; (2) a `Core` struct with `tick(now)`; (3) a hand-written loop in a
+Order now: (1) DONE (item 30): the generic helper that turns `Throttle::new_tick` reports into
+`EventsSuppressed` events; (2) a `Core` struct with `tick(now)`; (3) a hand-written loop in a
 test with two or three test modules and a `FakeClock`; (4) design `exec!` from what repeats.
 The paragraph below is the older plan; where it conflicts with item 28, item 28 wins.
 

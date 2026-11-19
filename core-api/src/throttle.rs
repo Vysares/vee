@@ -33,6 +33,10 @@ config::setting! {
 }
 
 /// The counters for one source's events.
+///
+/// This is the executive's, not a module's. It is `pub` and lives in this crate only because
+/// `Ctx` (which modules see) holds the handle `ctx.ev`, and that handle holds a `&mut Throttle`.
+/// A module reaches it only through `ctx.ev.send`.
 pub struct Throttle {
     /// How many times each event was sent this tick, by `index`. Each stops at 255.
     sent: [u8; EV_MAX_CODES],

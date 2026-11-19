@@ -5,3 +5,4 @@
 pub mod event_log;
 mod records;
 pub mod reset_log;
+pub mod suppressed;

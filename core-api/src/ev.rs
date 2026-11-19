@@ -26,6 +26,10 @@ config::setting! {
 
 /// A first-in first-out queue of up to `EV_QUEUE_DEPTH` events, and a count of the events that
 /// did not fit. Nothing is allocated.
+///
+/// This is the core's, not a module's. It is `pub` and lives in this crate only because `Ctx`
+/// (which modules see) holds the handle `ctx.ev`, and that handle holds a `&mut Ev`. A module
+/// reaches it only through `ctx.ev.send`.
 pub struct Ev {
     queue: queue::Queue<event::Event, EV_QUEUE_DEPTH>,
     /// Events that were sent while the queue was full, since `take_dropped` was last called.

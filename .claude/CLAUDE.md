@@ -8,3 +8,5 @@
 - Always ask yourself and the user: "Do we really need this to accomplish the goal?" And make sure you're clear on the goal and use case of code before you write it.
 - One common implementation over two is always preferred **if** would simplify things.
 - Use callbacks (closures passed as arguments) only when needed. Prefer returning a value, because callbacks are harder to read. A real reason is, for example, that `format_args!` values cannot be returned.
+- Do similar things the same way. Follow consistent templates. Think about ease of use for developers.
+- After you make any edits, name each file you touched and what you did in it.
