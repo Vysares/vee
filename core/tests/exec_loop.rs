@@ -1,6 +1,6 @@
 //! A hand written executive: the loop that `exec!` will one day generate. It runs three test
-//! modules against a fake clock, and the tests look at the events that come out of the one event
-//! queue.
+//! modules and the real `Core` against a fake clock and a fake file system, and the tests read the
+//! events from the event log the core writes.
 //!
 //! What it shows about `exec!`:
 //! - Everything one module needs is the same for every module, so it is one generic type,
@@ -8,9 +8,13 @@
 //!   generate that logic, only the list of slots and their order.
 //! - `Exec` is the part `exec!` generates: one field for each module, and a `tick` that does the
 //!   same three steps for every module, in order.
-//! - Not here yet: the core's own tick (`core.tick(now)`), commands, the bus, and the real
-//!   startup (the reset log and the event log, and `std_syslog::start_queue` followed by
-//!   `started`). The system log stays in direct mode here, so its lines come out in order.
+//! - `core.tick(now)` is the core's step: it takes the events out of the queue and writes them to
+//!   the event log (for now with a blocking write, until the file service exists).
+//! - `Exec::new` is the core's startup, `vee_core::Core::start` (the reset log and the event log),
+//!   so the first event of the run is the core's reset report.
+//! - Not here yet: commands, the bus, the other core services, and the end of the real startup
+//!   (`std_syslog::start_queue` followed by `started`). The system log stays in direct mode here,
+//!   so its lines come out in order.
 
 #![allow(
     clippy::unwrap_used,
@@ -23,16 +27,24 @@ use vee_core::suppressed;
 use vee_core_api::ctx;
 use vee_core_api::ev;
 use vee_core_api::event;
+use vee_core_api::event::Code as _;
 use vee_core_api::module;
 use vee_core_api::reset;
 use vee_core_api::throttle;
 use vee_core_types::core_event;
+use vee_core_types::event_log as log_types;
 use vee_osal::clock;
+use vee_osal::clock::Clock as _;
 use vee_osal::fake_clock;
+use vee_osal::fake_files;
 use vee_osal::std_clock;
 use vee_osal::std_syslog;
 
 const LIMIT: u8 = throttle::EV_MAX_PER_TICK;
+
+/// Where the core writes the event log, and keeps the reset log.
+const EVENT_LOG: &str = "events.log";
+const RESET_LOG: &str = "reset.log";
 
 /// The time between the start of one tick and the start of the next.
 const TICK_US: u64 = 10_000;
@@ -190,8 +202,7 @@ impl<M: module::Module> Slot<M> {
 /// What `exec!` will generate: a field for each module, and the same steps for each, in order.
 struct Exec {
     clock: fake_clock::FakeClock,
-    ev: ev::Ev,
-    reset: reset::ResetInfo,
+    core: vee_core::Core<fake_files::FakeFiles>,
     /// How many ticks have run.
     tick: u64,
     heartbeat: Slot<Heartbeat>,
@@ -200,11 +211,18 @@ struct Exec {
 }
 
 impl Exec {
+    /// The core's startup (the reset log and the event log), before any module's `init`.
     fn new() -> Self {
+        let clock = fake_clock::FakeClock::new();
+        let core = vee_core::Core::start(
+            fake_files::FakeFiles::new(),
+            RESET_LOG,
+            EVENT_LOG,
+            clock.monotonic_us(),
+        );
         Exec {
-            clock: fake_clock::FakeClock::new(),
-            ev: ev::Ev::new(),
-            reset: reset::ResetInfo::first_boot(),
+            clock,
+            core,
             tick: 0,
             heartbeat: Slot::new(Heartbeat { beats: 0 }, HEARTBEAT, 1),
             slow: Slot::new(Slow, SLOW, 4),
@@ -214,51 +232,69 @@ impl Exec {
 
     /// Startup: `init` for each module once, in order. Each call takes `MODULE_COST_US`.
     fn init(&mut self) {
-        self.heartbeat.init(&mut self.ev, &self.clock, self.reset);
+        let reset = self.core.reset();
+        self.heartbeat.init(&mut self.core.ev, &self.clock, reset);
         self.clock.advance(MODULE_COST_US);
-        self.slow.init(&mut self.ev, &self.clock, self.reset);
+        self.slow.init(&mut self.core.ev, &self.clock, reset);
         self.clock.advance(MODULE_COST_US);
-        self.noisy.init(&mut self.ev, &self.clock, self.reset);
+        self.noisy.init(&mut self.core.ev, &self.clock, reset);
         self.clock.advance(MODULE_COST_US);
     }
 
     /// One tick. Tick `n` starts at `(n + 1) * TICK_US`, after the startup calls.
     fn tick(&mut self) {
+        let reset = self.core.reset();
         let now = self.tick.saturating_add(1).saturating_mul(TICK_US);
         self.clock.set(now);
         // The line's own time is real time, not the fake clock, so the fake time is in the text.
         log::info!("tick {} starts at {now} us", self.tick);
 
         // 1. Each module's suppressed events from the tick before, and a new count for each.
-        self.heartbeat.report_suppressed(&mut self.ev, now);
-        self.slow.report_suppressed(&mut self.ev, now);
-        self.noisy.report_suppressed(&mut self.ev, now);
+        self.heartbeat.report_suppressed(&mut self.core.ev, now);
+        self.slow.report_suppressed(&mut self.core.ev, now);
+        self.noisy.report_suppressed(&mut self.core.ev, now);
 
-        // 2. `core.tick(now)` will go here. The core has nothing to do yet.
+        // 2. The core takes the events out of the queue (the reports above, and the modules'
+        //    events from the tick before) and writes them to the event log.
+        self.core.tick(now);
 
         // 3. Each module that is due steps, in order. Each call takes `MODULE_COST_US`, due or not,
         //    so a module always sees the same time within its tick.
         self.heartbeat
-            .step(self.tick, &mut self.ev, &self.clock, self.reset);
+            .step(self.tick, &mut self.core.ev, &self.clock, reset);
         self.clock.advance(MODULE_COST_US);
         self.slow
-            .step(self.tick, &mut self.ev, &self.clock, self.reset);
+            .step(self.tick, &mut self.core.ev, &self.clock, reset);
         self.clock.advance(MODULE_COST_US);
         self.noisy
-            .step(self.tick, &mut self.ev, &self.clock, self.reset);
+            .step(self.tick, &mut self.core.ev, &self.clock, reset);
         self.clock.advance(MODULE_COST_US);
 
         self.tick = self.tick.saturating_add(1);
     }
 
-    /// Takes every event out of the queue, oldest first. (The system log already has each event:
-    /// `Ev::send` writes it when it is sent.)
-    fn drain(&mut self) -> Vec<event::Event> {
-        let mut events = Vec::new();
-        while let Some(event) = self.ev.pop() {
-            events.push(event);
-        }
-        events
+    /// Shutdown, after the last tick: the core's `stop`, with the time now.
+    fn stop(&mut self) {
+        let now = self.clock.monotonic_us();
+        self.core.stop(now, reset::ShutdownReason::Commanded);
+    }
+
+    /// The events in the event log so far, oldest first. The events of the last tick's modules
+    /// are not in it yet: they are still in the queue until the core's next tick.
+    fn event_log(&self) -> Vec<event::Event> {
+        let bytes = self.core.files().get(EVENT_LOG).unwrap_or_default();
+        bytes
+            .chunks(log_types::RECORD_LEN)
+            .map(|record| log_types::decode(record).unwrap())
+            .collect()
+    }
+
+    /// The events in the event log, oldest first, after one more core tick has written the last
+    /// tick's module events. (A test that stops the executive reads `event_log` after `stop`.)
+    fn logged(&mut self) -> Vec<event::Event> {
+        let now = self.tick.saturating_add(1).saturating_mul(TICK_US);
+        self.core.tick(now);
+        self.event_log()
     }
 }
 
@@ -302,7 +338,7 @@ fn from_source(events: &[event::Event], source: u8) -> Vec<&event::Event> {
 
 #[test]
 fn init_runs_once_for_each_module_in_order_with_its_own_source_and_time() {
-    let events = run(0).drain();
+    let events = run(0).logged();
     let seen: Vec<(u8, u64, &str)> = events
         .iter()
         .map(|e| (e.source, e.monotonic_us, text(e)))
@@ -310,6 +346,11 @@ fn init_runs_once_for_each_module_in_order_with_its_own_source_and_time() {
     assert_eq!(
         seen,
         [
+            (
+                core_event::SOURCE,
+                0,
+                "reset 1: prev end unknown, 0 unclean in a row"
+            ),
             (HEARTBEAT, 0, "started"),
             (SLOW, MODULE_COST_US, "started"),
             (NOISY, 2 * MODULE_COST_US, "started"),
@@ -320,7 +361,7 @@ fn init_runs_once_for_each_module_in_order_with_its_own_source_and_time() {
 #[test]
 fn modules_step_at_their_own_rates() {
     // Ticks 0 to 7. The slow module steps on ticks 0 and 4.
-    let events = run(8).drain();
+    let events = run(8).logged();
 
     let beats = from_source(&events, HEARTBEAT);
     assert_eq!(beats.len(), 1 + 8); // the init event, then one a tick
@@ -342,8 +383,8 @@ fn modules_step_at_their_own_rates() {
 #[test]
 fn each_call_sees_the_time_read_just_before_it() {
     // Tick 0: starts at TICK_US, and each call before this one took MODULE_COST_US.
-    let events = run(1).drain();
-    let init_events = 3;
+    let events = run(1).logged();
+    let init_events = 4; // the core's reset report, and the three modules' `started`
     let tick_events: Vec<_> = events.iter().skip(init_events).collect();
 
     assert_eq!(tick_events[0].source, HEARTBEAT);
@@ -359,7 +400,7 @@ fn each_call_sees_the_time_read_just_before_it() {
 
 #[test]
 fn a_noisy_module_is_limited_in_each_tick_and_reported_at_the_top_of_the_next() {
-    let events = run(3).drain();
+    let events = run(3).logged();
 
     let noisy = from_source(&events, NOISY);
     let spam = noisy.iter().filter(|e| text(e) == "spam").count();
@@ -368,7 +409,10 @@ fn a_noisy_module_is_limited_in_each_tick_and_reported_at_the_top_of_the_next() 
     assert_eq!(quiet, 3); // a different event has its own count
 
     // The third tick's suppressed sends are reported at the top of the fourth, which has not run.
-    let reports = from_source(&events, core_event::SOURCE);
+    let reports: Vec<_> = from_source(&events, core_event::SOURCE)
+        .into_iter()
+        .filter(|e| e.code == core_event::CoreEvent::EventsSuppressed.code())
+        .collect();
     assert_eq!(reports.len(), 2);
     let expected = format!("suppressed: source {NOISY} code 1, {SPAM_OVER_LIMIT} dropped");
     assert_eq!(text(reports[0]), expected);
@@ -379,11 +423,11 @@ fn a_noisy_module_is_limited_in_each_tick_and_reported_at_the_top_of_the_next() 
 
 #[test]
 fn each_tick_has_the_core_report_first_then_the_modules_in_order() {
-    let events = run(2).drain();
+    let events = run(2).logged();
     let sources: Vec<u8> = events.iter().map(|e| e.source).collect();
 
     let noisy_tick = vec![NOISY; usize::from(LIMIT) + 1]; // the allowed Spam, and Quiet
-    let mut expected = vec![HEARTBEAT, SLOW, NOISY]; // init
+    let mut expected = vec![core_event::SOURCE, HEARTBEAT, SLOW, NOISY]; // startup, then init
     // Tick 0: no report yet. Heartbeat, slow (it steps on tick 0), noisy.
     expected.extend([HEARTBEAT, SLOW]);
     expected.extend(&noisy_tick);
@@ -392,4 +436,35 @@ fn each_tick_has_the_core_report_first_then_the_modules_in_order() {
     expected.push(HEARTBEAT);
     expected.extend(&noisy_tick);
     assert_eq!(sources, expected);
+}
+
+#[test]
+fn a_clean_stop_writes_the_last_ticks_events_and_the_next_start_sees_a_clean_end() {
+    let mut exec = run(2);
+    let before = exec.event_log();
+
+    exec.stop();
+
+    // The last tick's module events were still queued. Now they are all in the log, and the
+    // queue is empty.
+    let after = exec.event_log();
+    assert!(exec.core.ev.is_empty());
+    assert!(after.len() > before.len());
+    let last = after.last().unwrap();
+    assert_eq!((last.source, text(last)), (NOISY, "quiet"));
+    assert_eq!(last.monotonic_us, 2 * TICK_US + 2 * MODULE_COST_US); // tick 1, the third call
+    assert!(before.last().unwrap().monotonic_us < last.monotonic_us);
+
+    // The next boot, on a copy of what this run left in the reset log, sees a clean end.
+    let files = fake_files::FakeFiles::new();
+    files.put(RESET_LOG, &exec.core.files().get(RESET_LOG).unwrap());
+    let next = vee_core::Core::start(files, RESET_LOG, EVENT_LOG, 0);
+    assert_eq!(
+        next.reset(),
+        reset::ResetInfo {
+            count: 2,
+            previous: reset::PreviousEnd::Clean(reset::ShutdownReason::Commanded),
+            consecutive_unclean: 0,
+        }
+    );
 }

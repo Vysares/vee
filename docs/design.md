@@ -9,7 +9,7 @@ This repo contains the core, a set of standard modules, and an example mission c
 - No std or unsafe is enforced everywhere except the OSAL. Host-side tools (ground-tool, proc-macro crates) may use std.
 - Static allocation is the goal: every queue, table, and buffer is sized at compile time (const generics, sizes from `exec!`).
 - Allocation at startup is tolerated only where static is not practical.
-- No allocation after startup. Enforced by a global allocator (in the OSAL) that panics on any allocation once the exec sets its `started` flag.
+- No allocation after startup. This is a rule for the code, and it is checked in development, not enforced in flight: a global allocator (provided by the OSAL, declared by the deployment's `main`, behind a Cargo feature that dev, SIL and CI builds turn on) aborts with a fixed message on any allocation once the exec sets its `started` flag. A flight build has no guard. An allocation after startup that succeeds is a bug to find before flight, and killing the process for it would turn that bug into an outage.
 - Keep dependencies to a minimum.
 - Developers should never touch command, table, or message raw bytes. The only time they should deal with raw bytes is I/O.
 
@@ -37,7 +37,7 @@ The core is split into domains. Each is a plain struct with one job and its own 
 | --- | --- | --- | --- |
 | Health | The reset log (how the last run ended, `ctx.reset`), overrun detection, the watchdog kick, and the core's own counters | `start`, `tick`, `stop` | the reset log exists (`reset_log`) |
 | Time | The clock, read once per call and fixed into each `Ctx`; the tick count. Later, the monotonic to TAI correlation event | `tick` | `Clock` in the OSAL |
-| Events | The event queue (`Ev`), per event throttling, the report of suppressed events, the event log | `start`, `tick` (drain), `stop` (last drain) | `ev`, `throttle`, `suppressed`, `event_log` (file side) |
+| Events | The event queue (`Ev`), per event throttling, the report of suppressed events, the event log | `start`, `tick` (drain), `stop` (last drain) | `ev`, `throttle`, `suppressed`, `events` (`report_dropped`), `event_log` (file side), and `Core::tick` taking events out and writing them to the event log (blocking, temporarily) |
 | Message Bus | One writer, N readers, a queue per reader | none planned: a send queues, a module drains in `step` | not started |
 | Command Router | Commands to a module's `command()`, acks, and a result for the sender's `seq` | `tick` (route into the modules' command queues) | not started |
 | Tables | The table sets, the one load buffer and one dump buffer | `start` (load), `tick` (follow file results), `stop` (dump) | not started |
@@ -54,7 +54,7 @@ The executive schedules the core like a module, every tick and with no divisor (
 2. `core.tick(now)`.
 3. For each module due this tick, read the clock, build its `Ctx` and call `step`. The module's queued commands are handled in this step (see Command Routing), not every tick.
 
-Not written yet: `Core`, `exec!`, the order of the domains inside `core.tick` (decided as each domain is written), and the Bus, Router, Tables and Files domains.
+`Core` (`vee_core::Core<F: Files>`, in `core/src/lib.rs`) exists with the Events domain and Health's reset info. `Core::start` and `Core::stop` are its startup and shutdown (see Executive Requirements). It owns the event queue (`pub ev`, which the executive lends to every `Ctx`), the file system `F` and the event log path. Its `tick(now)` does: (1) take every event out of the queue and append it to the event log, then (2) `events::report_dropped`, in that order, so the report has room in the queue. Until the file service exists the append is a blocking write in the tick, which the design forbids in the loop: it is temporary, and the file service will replace the `append` call with a request, leaving the loop as it is. A failed append loses that event (nothing else can be done with it) but the queue is still emptied, and the failures are reported once per tick to the system log. The events of a tick's modules are written in the next tick, and the suppressed reports in the same one. Not written yet: `exec!`, the other domains inside `core.tick` (their order is decided as each is written), and the Bus, Router, Tables and Files domains.
 
 ### Software Bus
 - The core provides a typed software bus between modules.
@@ -181,7 +181,8 @@ enum ResetLogEntry {
     1. The core reads the tail of the log through the OSAL: the last `Boot` (for its count), and whether a `Shutdown` follows it.
     2. The core appends `Boot { count + 1 }`.
     3. The core emits an event reporting the previous shutdown reason and the new reset count.
-    4. The core makes the result available to modules as `ctx.reset` (see below).
+    4. The core makes the result available to modules as `ctx.reset` (see below). This is `Core::start`, and the core keeps the result (`core.reset()`).
+    5. If the log cannot be read or written at all, the core carries on with `ResetInfo::first_boot()` and sends `CoreEvent::ResetLogUnavailable` with the file error (see Executive Requirements).
 - These reads and writes are blocking calls made directly from the core through the OSAL. They only happen at startup and shutdown, so they do not go through the file service and do not affect the tick loop.
 - A missing log (first boot) starts the count at 0. A file whose size is not a multiple of the record size (a crash mid-append) has its partial last record ignored and reported as an event. A record with a bad CRC, or any other unreadable content, is reported as an error event and the count restarts. It is never silently treated as valid.
 - The log has a size cap. It is checked at startup: if the cap is passed, the core renames the log to `.1` and starts a new file with the new `Boot { count + 1 }`. The count carries forward by itself, because it lives in the `Boot` record.
@@ -319,13 +320,19 @@ fn command(&mut self, cmd: FsCmd, ctx: &mut Ctx, r: CmdRef) -> CmdResult {
     - The router puts arriving commands into the modules' command queues in the core's tick. Each module handles its queued commands in its own step, at its own rate. (In the example below, `dispatch` is the time budget for that command handling, now part of the step.)
     - Modules run at a defined, fixed rate, which must divide the base rate. (the major frame is the least common multiple of these periods)
     - Changing rates at runtime is a possible future feature. A module that needs an internal rate (every n steps) makes it table driven.
-- The exec has the core run its startup reset log step first (see Reset Log).
-- The exec calls each module's `init` once, in order, then sets the `started` flag (arming the allocation check) before the first tick.
+- Startup order, in the exec's one start function (so a step cannot be forgotten):
+    1. `std_syslog::init`, first thing in `main`, before anything can fail.
+    2. `Core::start(files, reset_log_path, event_log_path, now)`: the reset log (works out how the last run ended, records this boot, sends the reset report and any problems) and then the event log (rotates it if full or partial, reports a partial record). The core keeps the result: `core.reset()` is what modules see as `ctx.reset`.
+    3. Each module's `init`, once, in order, with the time read just before each call.
+    4. `std_syslog::start_queue()`, then the `started` flag (arming the allocation check). Starting the queue's thread allocates, so it comes before `started`. If it fails, the logger stays in direct mode and the exec reports it.
+    5. The first tick.
+- Shutdown, after the last tick: `Core::stop(now, reason)`. It records a clean shutdown in the reset log (`reset_log::stop`, so the next boot sees `Clean(reason)` and not `Unknown`), then writes every queued event to the event log, which is two `tick`s: the first writes the queue and queues the report of dropped events, if any, and the second writes that report. If the reset log cannot be written, it sends `ResetLogUnavailable`, as startup does, and the final ticks write that event too. A panic, a kill or a power loss never reaches `stop`, which is how a run ends `Unknown`.
+- Startup does not fail. If the reset log or the event log cannot be opened, the core carries on without it and sends an Err event that says so (`ResetLogUnavailable`, `EventLogUnavailable`, with the file error). With the reset log down, modules get `ResetInfo::first_boot()`, so a module that reacts to `consecutive_unclean` cannot see a reset loop until the log works again. A broken disk is not a reason to stop a flight computer.
 - The exec cannot preempt a module. An overrun is detected and reported, and `overrun` says what to shed. A module that never returns is caught by the watchdog.
 - Stretch goal, after everything else works: a threaded module type for slow work that deserves a thread of its own or another core (image processing, for example). It would talk to the rest of the system through bounded queues, as the file service does, so the single-threaded executive stays deterministic and testable. (A second executive on another core, with its own modules and queues between the executives, is another way to get there.) Until then, slow work is cut into steps that return, or goes to an interface thread.
 
 ### Faults
-- Panics abort the process. Flight crates build with `panic = "abort"`, so there is no unwinding and no recovery from a panic.
+- Panics abort the process in flight builds (`panic = "abort"`: no unwinding and no recovery). Abort is fail-stop: a panic in any thread, including the file service and the system log writer, stops the whole process, so a supervisor restarts it. With unwinding, a panic in one of those threads would leave the process running without it, and a panic holding a lock would leave half-updated state. Unwinding is for development and test builds only (tests need it, and `#[should_panic]` too). No module fault isolation (`catch_unwind` around a module's `step`) is planned: that is a decision for when `exec!` is designed.
 - A panic is the last resort, for when there is truly no alternative. Whenever there is a way to handle an error, Vee handles it and carries on, and reports it as an event. For example, an event whose text is too long is still sent, with the text cut off, because the ground log must see it. Flight code does not `unwrap` or `expect` to skip an error case.
 - The panic handler lives in the OSAL. It only reports the panic location (a plain write to stderr) and then aborts. It does not touch the reset log, so a panic leaves the last run as `Unknown`.
 - A watchdog trips if the main loop stops ticking. A trip aborts the process, the same as a panic.

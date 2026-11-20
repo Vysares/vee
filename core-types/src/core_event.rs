@@ -60,6 +60,18 @@ pub enum CoreEvent {
     /// is meant to make this rare.
     #[severity(Err)]
     EventsDropped,
+
+    /// The reset log could not be read or written, at startup or at shutdown. The text has the
+    /// file error. At startup the core carries on with no history (`ResetInfo::first_boot()`), so
+    /// modules that react to `consecutive_unclean` cannot see a reset loop while this lasts.
+    #[severity(Err)]
+    ResetLogUnavailable,
+
+    /// The event log could not be checked at startup. The text has the file error. The core
+    /// carries on. Events are still sent to the system log and the downlink, and each tick's failed
+    /// writes to the event log are reported to the system log.
+    #[severity(Err)]
+    EventLogUnavailable,
 }
 
 #[cfg(test)]
@@ -83,6 +95,8 @@ mod tests {
         assert_eq!(core_event::CoreEvent::EventLogPartialRecord.code(), 5);
         assert_eq!(core_event::CoreEvent::EventsSuppressed.code(), 6);
         assert_eq!(core_event::CoreEvent::EventsDropped.code(), 7);
+        assert_eq!(core_event::CoreEvent::ResetLogUnavailable.code(), 8);
+        assert_eq!(core_event::CoreEvent::EventLogUnavailable.code(), 9);
     }
 
     #[test]
@@ -108,6 +122,8 @@ mod tests {
             core_event::CoreEvent::ResetLogMisorderedRecords,
             core_event::CoreEvent::ResetLogCountOverflow,
             core_event::CoreEvent::EventsDropped,
+            core_event::CoreEvent::ResetLogUnavailable,
+            core_event::CoreEvent::EventLogUnavailable,
         ] {
             assert_eq!(ev.severity(), event::Severity::Err);
         }

@@ -7,9 +7,7 @@ version.workspace = true
 vee-core-api = { path = "../core-api" }
 vee-core-types = { path = "../core-types" }
 vee-osal = { path = "../osal" }
-
-[dev-dependencies]
-# For the `log::` calls in the loop test. The core itself will call `log` later.
+# The system log's facade: the core reports problems it cannot send as events.
 log = { workspace = true }
 
 [lints]

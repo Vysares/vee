@@ -544,6 +544,73 @@ Size on 2026-11-17 (cloc, working tree, no target dir): 14 Rust files, 1729 line
     `exec_loop.rs` no longer logs in its drain; it does not call `report_dropped` (nothing empties
     the queue until the end of a test).
 
+36. **`Core` with `tick(now)`** (`core/src/lib.rs`; `vee_core::Core<F: files::Files>`). Chosen by the
+    user over a sink closure: write the events to the event log, blocking, for now. Fields: `pub ev:
+    ev::Ev` (the executive lends it to every `Ctx`), `files: F` (read back through `files()`), and
+    `event_log_path: &'static str`; `Core::new(files, path)` (the caller runs `event_log::start`
+    first). `tick(now)` = `write_events()` (pop every event and `event_log::append` it; a failed
+    append loses that event, still empties the queue, counts failures and reports ONCE per tick with
+    `log::error!` and the first error) then `events::report_dropped(&mut self.ev, now)`. The
+    blocking `append` is TEMPORARY (the design forbids blocking in the loop); the file service
+    will replace it with a request and the loop stays. `core/Cargo.toml`: `log` is now a normal
+    dependency. 4 tests in lib.rs (order and emptying, nothing queued, dropped events reported
+    AFTER emptying and written next tick, a failing file system still empties the queue).
+    `core/tests/exec_loop.rs` now uses the real `Core<FakeFiles>`: `Exec` has `core` instead of
+    `ev`; step 2 of `tick` is `self.core.tick(now)`; `Exec::logged()` (was `drain`) runs one more
+    core tick (the last tick's module events are still queued) and decodes the records from the fake
+    event log. The 5 loop tests are unchanged apart from `.drain()` to `.logged()`. A module named
+    `core` is impossible (it would clash with Rust's `core`), hence `Core` lives in `lib.rs`. Not
+    done: `Core` does not own the reset info or the clock yet (the exec still holds them).
+
+37. **Startup: `Core::start`** (`core/src/lib.rs`). `Core::new` is now PRIVATE; `Core::start(files,
+    reset_log_path, event_log_path, now) -> Core` is the one way to make a core. Order: (1)
+    `reset_log::start` + `reset_log::report` (the reset report is the first event of every run);
+    (2) `event_log::start` + `event_log::report`. `Core` now owns the `ResetInfo` (`core.reset()`),
+    so Health's piece is in; the loop test's `Exec` no longer holds its own. User decision (asked):
+    startup does NOT fail: on a `FileError` the core carries on and sends a new Err event, with the
+    error in the text: `CoreEvent::ResetLogUnavailable` (code 8; modules then get
+    `ResetInfo::first_boot()`, which hides a reset loop) and `EventLogUnavailable` (code 9). Tests: 5
+    new in lib.rs (first boot, second boot after an unclean run, a partial event log rotated and
+    reported after the reset report, both logs failing, startup events written by the first tick);
+    `core_event` tests for codes 8 and 9. Loop test: `Exec::new` calls `Core::start`; its expectations
+    got the core's reset report as the first event (the noisy test filters the core's events by
+    code). The full startup order is in design.md (Executive Requirements): syslog init, `Core::start`,
+    module inits, `start_queue`, `started`, first tick. NOT written: the exec's one start function
+    (steps 1, 3 and 4 are the exec's), `started` and the allocation guard, the stop path
+    (`reset_log::stop`). `Core::start` has a TIME parameter only for the startup events.
+
+38. **Shutdown: `Core::stop(now, reason)`** (`core/src/lib.rs`). (1) `reset_log::stop` records the
+    clean shutdown (so the next boot sees `Clean(reason)`, not `Unknown`); on a `FileError` it sends
+    `ResetLogUnavailable` through a helper shared with `start` (`send_reset_log_unavailable`; the
+    event's doc now says "at startup or at shutdown"); (2) `self.tick(now)` TWICE: the first writes
+    the queue and queues the dropped-events report, the second writes it (no second copy of the
+    drain). `&mut self`, not consuming: the doc says do not tick after it. `Core` now stores
+    `reset_log_path` too (`Core::new(files, reset_log_path, event_log_path)`, private). Tests (3,
+    in lib.rs): a stop then a new `start` on a copy of the reset log sees `Clean(Commanded)`, count 2,
+    0 unclean; stop writes all queued events plus the dropped report; with a double where only the
+    reset log fails (`ResetLogDown`), stop sends event 8 and the event log has it after the earlier
+    event. Core tests: 69. design.md: a "Shutdown" bullet in Executive Requirements. NOT done: nothing
+    calls `stop` yet (the exec's signal handling and the commanded-shutdown path are future work),
+    and the loop test now does (see below).
+    Loop test added (`core/tests/exec_loop.rs`, 6 tests now): `a_clean_stop_writes_the_last_ticks_events_
+    and_the_next_start_sees_a_clean_end`: after 2 ticks the last tick's module events are queued, not in
+    the log; after `Exec::stop` they are all in it and the queue is empty; a new `Core::start` on a copy
+    of the reset log sees `Clean(Commanded)`, count 2. `Exec` got `stop()` and `event_log()` (a pure
+    read); `logged()` is `event_log()` after one more core tick.
+
+39. **Decisions on the allocation guard and panics (no code)**, with the user. (a) The guard is a
+    DEV/SIL/CI check, not a flight protection: behind a Cargo feature, off in flight builds (an
+    allocation after startup that succeeds is a bug to find before flight, and aborting would turn it
+    into an outage); where on, it aborts with a fixed message (a panic could allocate inside the
+    allocator). The OSAL provides the `GuardAlloc` type, the deployment's `main` declares
+    `#[global_allocator]` (one per program). Counting mode for tests (per-thread flag, assert 0
+    allocations around `emit`, `drain` and `Core::tick`). NOT written. (b) Flight builds keep
+    `panic = "abort"` (fail-stop: no zombie threads, no poisoned locks, no `Drop` code writing a
+    false `Shutdown`); dev and test builds unwind. No `catch_unwind` per module for now. (c) The
+    panic hook runs BEFORE the abort, so a "last gasp" is possible there: see the system log's step 4
+    (in-memory ring of recent lines, dumped to a file by the hook; no allocation, no locks held
+    by others, bounded, never touch the reset log). design.md: "No allocation" bullet and Faults.
+
 ## WHERE WE LEFT OFF (2026-11-19)
 Everything builds, all tests pass, clippy (with the strict lints of item 29) is clean. Committed by
 the user: `a3c2ef6` (stricter lints, basic clock: items 28 and 29) and `92a65d3` (the suppressed
@@ -603,6 +670,16 @@ the command derives (`Command`, `CmdSet`) could use the same idea (opcode = enum
   "no trustworthy history" both give `previous: Unknown`, `consecutive_unclean: 0`.
 - Non-fatal problems found at startup (partial record, bad CRC) are returned in `start`'s result,
   not dropped. The caller turns them into events once the event service exists.
+
+- `Core<F: Files>` stays one parameter for now (agreed with the user, 2026-11-19). When a SECOND OSAL
+  service arrives (the watchdog for Health, or the file service's thread), bundle them in one trait
+  so `Core` keeps a single parameter: `trait Platform { type Files: Files; type Watchdog:
+  Watchdog; }` and `Core<P: Platform>`; the real platform and the test platform implement it once.
+  Do not add it before then. Other things `Core` will need: Health holds `ResetInfo` (a value, from
+  the start sequence); the file service needs `F` usable across threads (`Send + Sync`, a bound);
+  the Bus, Command Router and Tables depend on the deployment's types, so `exec!` must supply them
+  (as type parameters or by generating those pieces): decide when `exec!` is designed. `Core` needs
+  no clock type, because `tick(now)` takes the time.
 
 ## Open questions
 - Shutdown reasons beyond `Commanded` and `Signal`.
