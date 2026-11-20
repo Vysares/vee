@@ -72,6 +72,20 @@ pub enum CoreEvent {
     /// writes to the event log are reported to the system log.
     #[severity(Err)]
     EventLogUnavailable,
+
+    /// The supervisor could not be told that Vee is alive. The text
+    /// has the reason (`watchdog: supervisor queue is full`). Sent once when a streak of failures
+    /// starts, not for each failed attempt: the core tries again at the next tick, and the next
+    /// event comes only after an attempt has worked and failed again. If the supervisor stays out of
+    /// reach it will restart the process.
+    #[severity(Err)]
+    WatchdogUnavailable,
+
+    /// The system log's queue could not be started at the end of startup, so the system log stays
+    /// in direct mode: each `log::` call writes to stderr itself, and can block. The text has the
+    /// reason. The executive sends it, since the core does not own the system log.
+    #[severity(Err)]
+    SystemLogQueueUnavailable,
 }
 
 #[cfg(test)]
@@ -97,6 +111,8 @@ mod tests {
         assert_eq!(core_event::CoreEvent::EventsDropped.code(), 7);
         assert_eq!(core_event::CoreEvent::ResetLogUnavailable.code(), 8);
         assert_eq!(core_event::CoreEvent::EventLogUnavailable.code(), 9);
+        assert_eq!(core_event::CoreEvent::WatchdogUnavailable.code(), 10);
+        assert_eq!(core_event::CoreEvent::SystemLogQueueUnavailable.code(), 11);
     }
 
     #[test]
@@ -124,6 +140,8 @@ mod tests {
             core_event::CoreEvent::EventsDropped,
             core_event::CoreEvent::ResetLogUnavailable,
             core_event::CoreEvent::EventLogUnavailable,
+            core_event::CoreEvent::WatchdogUnavailable,
+            core_event::CoreEvent::SystemLogQueueUnavailable,
         ] {
             assert_eq!(ev.severity(), event::Severity::Err);
         }

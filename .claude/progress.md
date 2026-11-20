@@ -621,42 +621,345 @@ Size on 2026-11-17 (cloc, working tree, no target dir): 14 Rust files, 1729 line
     the worst startup; an uninterruptible blocked write is an OS limit; keep the hook thin and test its
     logic. Not written.
 
-## WHERE WE LEFT OFF (2026-11-19)
-Everything builds, all 261 tests pass, clippy (strict lints of item 29) and `cargo fmt --check` are
-clean. Committed by the user: up to `597d1ac "System Log"` (items 28 to 36: the clock, lints, the
-suppressed reporter, core services, the loop test, the system log, events into the system log, the 64
-byte text, `Core` with `tick`). NOT yet committed: items 37 to 40 (`Core::start`, `Core::stop`, the
-stop loop test, the allocation guard and panic decisions, the panic hook rules in design.md) and this
-file. The user commits.
-The user is learning Rust (comes from C++): explain syntax and generics as they come up, and follow
-CLAUDE.md (one thing at a time, simplicity, callbacks only when needed, "do we really need this?",
-and after any edit name each file touched and what was done in it).
+41. **Allocation guard** (`osal/src/std_alloc_guard.rs`, new; the first `unsafe` in the project) and the
+    system log's `QUEUE_DEPTH` raised from 256 to 1024 (same as the event queue; 256 KiB; design.md
+    updated). `GuardAlloc` implements `GlobalAlloc` by forwarding to `System`; it overrides only `alloc` and
+    `dealloc` (the provided `alloc_zeroed` and `realloc` call `alloc`, so they are counted and checked
+    too). Every `alloc` bumps a per THREAD counter (`thread_local!` with a `const` `Cell`, so it never
+    allocates), read with `allocations_on_this_thread()`; and if `arm()` has been called (a static
+    `AtomicBool`, never cleared) it writes a fixed message to stderr and `process::abort()`s. The unsafe
+    impl has `#[allow(unsafe_code, reason)]` and a `// SAFETY:` comment, as item 29 requires.
+    DEVIATION from item 39 and the earlier design text: NO Cargo feature. The type does nothing unless a
+    program declares it with `#[global_allocator]`, so the deployment's `main` is the switch; a feature
+    would be a second switch for the same thing. design.md changed to say so. Tests: 4 in `std_alloc_guard`
+    (counted, free and arithmetic not counted, `Vec` growth counted, each thread its own count); 3 in
+    `std_syslog` (`emit` queued, `emit` direct and `drain` into `io::sink()` allocate NOTHING; direct mode
+    needs one warm up write first); `osal/tests/alloc_guard_abort.rs` (new, 2 tests): the abort cannot be
+    tested in process, so the test runs its own test binary as a child (`current_exe`, `--exact`, an env
+    var marks the child), arms, allocates, and the parent checks SIGABRT and the message (unix only).
+    The osal's unit test program declares `GuardAlloc` in `lib.rs` under `#[cfg(test)]` (never armed).
+    NOT done: `Core::tick` is not asserted allocation free, because `FakeFiles::append` allocates (a
+    `Mutex<Vec>`) and the temporary blocking `append` goes away with the file service; assert it then.
+    `arm()` is called by nobody yet: the exec's one start function (step 4 of the start sequence) will.
+    Considered and rejected: an "already aborting" flag in the guard's abort path (recursion if the message
+    write allocates, or a hang on stderr's lock). The guard is not in flight builds, so it is not worth the
+    code. The same worry is real for the PANIC HOOK, which does run in flight: see item 40 (latch).
+    osal: 62 + 2.
 
-Where the code is: the core's Events and Health pieces are in. `Core<F: Files>` (`core/src/lib.rs`)
-has `start` (reset log, event log, startup events; never fails, reports `ResetLogUnavailable` and
-`EventLogUnavailable`), `tick(now)` (take events out, write to the event log with a TEMPORARY
-blocking `append`, then `report_dropped`), `stop(now, reason)` (clean shutdown record, two ticks),
-`reset()`. The system log is done up to step 3 (see item 34 and 35); its step 4 (the in-memory ring
-and the persisted last gasp file) is not started. The exec is still hand written in
-`core/tests/exec_loop.rs` (6 tests). Nothing calls `Core::stop` outside tests, and nothing sets
-`started`.
+42. **Double panic checked** (no code): a throwaway program showed that a panic inside the panic hook aborts the
+    process at once (exit 134, SIGABRT) in both `panic = "abort"` and unwinding builds, so the latch needs no
+    extra flag for the same thread re-panicking. Recorded in design.md (Faults, after the latch bullet).
+
+43. **The ring was written and then REMOVED, and the last gasp FILE dropped** (2026-11-19, the user's decisions).
+    `Ring<N>` in `osal/src/syslog.rs` was done and tested (6 tests), then deleted (`git checkout` of the file;
+    nothing else in it had changed). Then the last gasp file was dropped too: the journal is binary (only
+    `journalctl` or sd-journal can read it), but systemd can send stderr to a plain text file
+    (`StandardError=append:`, systemd 240+, NOT `file:`, which truncates at start) with a logrotate rule
+    (`copytruncate`) to cap it. So the panic hook is: the `PANICKING` flag (set first thing, a plain store;
+    NO latch, decided later the same day: see item 46), `is_panicking()` for the watchdog feed, and ONE stderr line `thread '<name>' at <file>:<line>:<col>:
+    <message>` built with `syslog::LineBuf::from_line` (same format and clock as the log, one write). No file, no
+    path, no next boot step. Boxing the hook allocates nothing if the closure captures nothing (a zero sized
+    type): use statics (`&'static str`, `OnceLock<StdClock>`, an `AtomicBool`) and assert zero allocations with
+    `std_alloc_guard` (expectation, not yet measured). The core does not read the stderr file: ground asks for
+    its tail with the file-dump command (not written). The sample deployment will carry the unit and logrotate
+    snippets (not written). System log step 4 is therefore: the hook, then E (the watchdog feed stops while
+    `PANICKING`, Health's piece). design.md updated (Faults, System Log).
+
+44. **Panic hook C1: the report line** (`osal/src/panic_report.rs`, new, interface file, `core` only). `Location
+    { file, line, column }` and `line(time_us, thread: Option<&str>, location: Option<&Location>, message:
+    Option<&str>) -> syslog::LineBuf`: `<time> ERROR panic: thread '<thread>' panicked at <file>:<line>:<col>:
+    <message>`, built with the existing `Line` and `LineBuf` (same format, clock, 254 byte cut with `~`). A
+    missing part shows a placeholder (`<unnamed>`, `<unknown location>`, `<message is not text>`), so the
+    line always has the same shape. A multi-line message (an `assert_eq!` failure) keeps its lines on
+    purpose: the hook writes the line in one write, so they stay together. 6 tests (osal: 68 + 2). Not
+    written yet: C2 the flag (see item 46), C3 the hook that gets the parts from `PanicHookInfo` and writes to stderr, C4
+    install, C5 the child process test. `osal/src/lib.rs` doc lists `panic_report` as an interface file.
+
+45. **OSAL layout: the std implementations moved to `osal/src/linux/`** (user's request). `linux/mod.rs` (new, with
+    a doc comment) declares `std_alloc_guard`, `std_clock`, `std_files`, `std_syslog`. File names unchanged
+    (the `std_` prefix stays, so `linux::std_clock` is not confused with the interface `clock`). Interfaces
+    (`clock`, `files`, `syslog`, `panic_report`) and the test doubles (`fake_clock`, `fake_files`) stay in
+    `osal/src/`. New paths: `vee_osal::linux::std_syslog` (and the others), used by
+    `core/tests/exec_loop.rs` and `osal/tests/alloc_guard_abort.rs`; inside osal, `crate::linux::std_clock`.
+    `linux` is NOT behind a `cfg(target_os = "linux")` (so it still builds on a dev machine that is not
+    Linux; `alloc_guard_abort.rs` is unix only already). Older items above use the old paths: they are
+    history. design.md's OSAL Requirements mention the directory. `git mv` staged the three renames
+    (nothing else is staged). Same tests pass (osal 68 + 2).
+
+46. **The latch is dropped** (2026-11-19, the user's question and decision; design.md Faults updated). The hook just
+    sets `PANICKING` (a plain `AtomicBool` store) first thing, for the watchdog feed (`is_panicking()`), then
+    builds the line (`panic_report::line`) and writes it to stderr in one write. Two simultaneous panics both run
+    the hook; each line is one write so they do not mix; whichever finishes first aborts, so the other's line
+    may be missing (acceptable). Parking the losers would also have stopped a second thread from aborting a
+    process whose first hook is stuck. No `Latch` type, no `claim`, no parking. Items 40 and 42 above mention
+    the latch: history. C2 is now just the flag and `is_panicking()`, in `osal/src/linux/std_panic.rs` with the
+    hook (C3).
+
+47. **The panic hook is written** (`osal/src/linux/std_panic.rs`, new; C2 to C4 of item 44, with item 46's change).
+    `install(clock: StdClock) -> Result<(), InstallError>` (`AlreadyInstalled` on a second call; the first hook
+    stays), `is_panicking()` (reads the static `PANICKING`), and the private `hook(&PanicHookInfo)`: sets
+    `PANICKING` (a plain store) first, reads the time from the static `CLOCK` (`OnceLock<StdClock>`, filled by
+    `install` BEFORE `set_hook`, so `map_or(0, ..)` is only for the impossible case), gets the thread name
+    (`thread::current().name()`), the location and `info.payload_as_str()`, builds the line with
+    `panic_report::line` and does one `write_all` to `io::stderr()`. The user chose option 1: the clock is
+    passed to `install`, as `init` does (a copy of the same one). `Box::new(hook)` allocates nothing: `hook` is
+    a function item (zero sized, no captured data). MEASURED, not just expected: the child process test asserts
+    `install_allocations=0`. Checked with throwaway programs: with edition 2024, `payload_as_str` gives the
+    FORMATTED text (`boom 7`, and an `assert_eq!` message), in `panic = "abort"` and unwinding builds; it
+    allocates nothing itself (std builds the `String` before it calls the hook, outside our control); a
+    `panic_any(42)` payload has no text and the report says `<message is not text>`. (A first experiment
+    with plain `rustc` used edition 2015, where `panic!("x {y}")` with one argument is NOT a format string
+    and showed the template: not a Vee problem, which is edition 2024.) The hook takes stderr's lock for its
+    write (std gives no `try_lock` on stderr; avoiding it would need `unsafe` on fd 2): design.md says so.
+    Test: `osal/tests/panic_hook.rs` (new, 1 test, its own program, child process like the guard abort test):
+    the child checks `panicking_before=false`, `install_ok`, `install_allocations=0`, second install is
+    `Err(AlreadyInstalled)`, a named thread `worker` panics with `boom 7`, `panicking_after=true`; the parent
+    checks exactly ONE line containing ` panic: `, `ERROR panic: thread 'worker' panicked at`, `panic_hook.rs:`
+    and `: boom 7`. The file needs `#![allow(clippy::panic, print_stdout, unwrap_used,
+    arithmetic_side_effects, reason)]` (its helper is not a `#[test]`). `linux/mod.rs` doc mentions
+    `std_panic`. Tests: osal 68 + 2 + 1. NOT done: call `install` (the exec's start function does), the
+    `panic = "abort"` release profile, the watchdog feed reading `is_panicking`, a test for two simultaneous
+    panics, `cfg(panic = "abort")` gating (the exec's `main` decides).
+
+48. **Watchdog scoped, shedding removed** (no code; decisions with the user 2026-11-19; design.md updated in
+    Faults and the `exec!` example). (a) Software watchdog feed: `Watchdog` trait in the OSAL with `ready()` and
+    `feed()` only (no `interval_us`); `Core::tick` calls `feed()` EVERY tick and the implementation rate limits
+    itself (at most once per half `WATCHDOG_USEC`), non-blocking socket, withholds while `is_panicking()`
+    (option A: the rule lives in the Linux impl, not the core), `WATCHDOG_PID` must match, no watchdog
+    configured is not an error. A feed or `READY=1` failure is one Err event per streak (`CoreEvent::
+    WatchdogUnavailable`, planned code 10). `Core<F>` becomes `Core<P: Platform>` (W3a, a refactor with no
+    behaviour change). Steps W1 interface and fake, W2 `linux/std_watchdog.rs` (parsing as pure functions, tests
+    with a real `UnixDatagram` in a temp dir, no `env::set_var`), W3a, W3b, W4 event, W5 docs and the sample unit
+    (`Type=notify`, `WatchdogSec`, `Restart=on-failure`, `StartLimitBurst`, `StartLimitAction=reboot-force`,
+    `StandardError=append:`). W6 (exec calls `ready()`) waits for the exec. NOT started. (b) The man page
+    shows the watchdog starts after startup completes, so design.md's "WatchdogSec longer than startup" line
+    was wrong and is fixed. (c) HARDWARE watchdog: NOT designed (user: a later mission problem). If wanted, likely a module over an
+    OSAL device handle that withholds while panicking. (d) SHEDDING REMOVED: no `shed`, `sheddable` or
+    `essential` in the `exec!` example; an overrun is detected and reported only. After an overrun the loop SKIPS to the
+    next boundary (user's decision) and the overrun event says how many ticks were skipped (not written). Open: tick period against
+    `WATCHDOG_USEC / 2` check at startup (the exec's start function).
+
+49. **Watchdog W1: the interface and the fake** (`osal/src/watchdog.rs` and `osal/src/fake_watchdog.rs`, new).
+    `trait Watchdog { fn ready(&self) -> Result<(), WatchdogError>; fn feed(&self) -> Result<(), WatchdogError>; }`
+    (both `&self`, neither may wait; `feed` is called every tick and the implementation decides when to send, and
+    returns `Ok` without sending when none is due or while panicking; no watchdog configured is `Ok` too).
+    `WatchdogError { NotFound, PermissionDenied, ConnectionRefused, QueueFull, Other }`: the first three are
+    std's kinds, `QueueFull` is std's `WouldBlock` said the way it applies (the Linux impl maps it), and each
+    `Display` text says what is wrong in watchdog terms (`supervisor queue is full`, `nothing is listening on
+    the supervisor socket`, ...) because it ends up in the event. A failed send must NOT advance the
+    rate limit's last-sent time, so the next tick retries (W2). With `Display` and `core::error::Error`. `FakeWatchdog` (atomics, no
+    lock): `new`, `set_failing(bool)` (both calls then fail with `Other`; failed calls are still counted),
+    `ready_calls()`, `feed_calls()`. 6 tests (osal: 74 + 2 + 1). Also this session: design.md and item 48
+    updated with the user's two decisions: the hardware watchdog is NOT designed (a later mission problem), and
+    after an overrun the loop SKIPS to the next boundary and says how many ticks it skipped (not written). Next:
+    W2 `osal/src/linux/std_watchdog.rs`.
+
+50. **Watchdog W2: the Linux implementation** (`osal/src/linux/std_watchdog.rs`, new). `StdWatchdog::from_env(clock)
+    -> Result<StdWatchdog, StartError>` reads `NOTIFY_SOCKET`, `WATCHDOG_USEC`, `WATCHDOG_PID`; the checking is the
+    pure `parse(notify_socket, watchdog_usec, watchdog_pid, own_pid) -> Result<Config, StartError>` (so tests do
+    not touch the environment; `env::set_var` is unsafe in edition 2024). `StartError { InvalidSocketName,
+    InvalidWatchdogUsec, InvalidWatchdogPid, Socket(io::Error) }`: a bad value is an error, not a guess (a socket
+    name must start with `/` or `@name`; `WATCHDOG_USEC` 0 means no watchdog; a `WATCHDOG_PID` that is not ours
+    means no watchdog for us but `ready` still goes out; nothing set means not run by systemd: both calls do
+    nothing and return `Ok`). The socket is a NON-BLOCKING `UnixDatagram` and the destination a `SocketAddr`
+    (`from_pathname` or `from_abstract_name`), both made once in `new`, so a send is one `send_to_addr` with no
+    allocation (a test asserts zero). `ready` sends `READY=1` (not rate limited). `feed` = `feed_at(now,
+    is_panicking())`; `feed_at` returns `Ok` without sending when there is no watchdog, when panicking, or when
+    `now < next_due_us`; else sends `WATCHDOG=1` and, ONLY if the send worked, sets `next_due_us = now +
+    interval/2` (`FEEDS_PER_INTERVAL` = 2, systemd's advice), so a failed feed is retried at the next call. An
+    allowed feed after a panicking one still goes out at once (the withheld one did not use the slot). `From<
+    io::Error> for WatchdogError` maps NotFound, PermissionDenied, ConnectionRefused, WouldBlock (to
+    `QueueFull`), the rest to `Other`. 17 tests (osal: 91 + 2 + 1): the parsing, a real `UnixDatagram` in a
+    temp dir (ready, first feed, rate limit, feeding every 10 ms tick sends twice per 10 s timeout, panicking
+    sends nothing, no watchdog for us, an abstract name, NotFound, ConnectionRefused, a queue filled until
+    `QueueFull` and then the feed goes out once the receiver has read, error mapping, zero allocation).
+    NOT tested against a real systemd. Next: W3a (`Core<P: Platform>`), W3b (the feed in `tick`).
+
+51. **Watchdog W3a: `Core<P: Platform>`** (a refactor, no behaviour change). New in the OSAL: `platform.rs`
+    (interface, `core` only): `trait Platform { type Files: Files; type Watchdog: Watchdog; }`, a type that only
+    NAMES the services (never made, used as a type argument); `fake_platform.rs`: `FakePlatform<F = FakeFiles>(
+    PhantomData<F>)` with the fake watchdog (`Core::<FakePlatform>` is the usual test core,
+    `Core::<FakePlatform<FailingFiles>>` a special one; `PhantomData` is how a struct says it is about `F`
+    without holding one); `linux::LinuxPlatform` in `linux/mod.rs` (`StdFiles` and `StdWatchdog`). In the
+    core: `Core<P: platform::Platform>` has `files: P::Files` and `watchdog: P::Watchdog` (stored, not used
+    yet), `start(files, watchdog, reset_log_path, event_log_path, now)` and the private `new` take the
+    watchdog, new accessor `watchdog()` (for tests, like `files()`). Callers now NAME the platform:
+    `Core::<LinuxPlatform>::start(..)`, because Rust cannot infer `P` from `P::Files`. core tests: new helper
+    `core_on(files)` (an unstarted core on any file system), `type Fake = FakePlatform`; `core/tests/
+    exec_loop.rs` uses `Core<FakePlatform>`. Same test counts pass (core 69 + 6, osal 91 + 2 + 1).
+    Next: W3b, the feed in `Core::tick`.
+
+52. **Watchdog W3b: the feed in `Core::tick`, with its error event** (W4 folded in, because a feed call whose
+    `Err` is ignored breaks the fail-loudly rule). `Core::tick` ends with `self.watchdog.feed()` (LAST, so a
+    tick that hangs part way is not fed) and `Core::ready(now)` (new, public: the exec calls it after the
+    module inits and before the first tick) calls `watchdog.ready()`; both pass the result to the private
+    `note_watchdog(now, result)`: `Ok` clears the `watchdog_failing` flag; an `Err` when the flag is clear sets it
+    and sends `CoreEvent::WatchdogUnavailable` (new, Err, code 10, text `watchdog: <WatchdogError text>`, at most
+    ~56 bytes); an `Err` when it is already set sends nothing. So a streak is one event, and a failed `ready`
+    followed by failing feeds is one event. The feed is retried every tick (the implementation does not
+    advance its due time on a failure). The event is queued at the end of the tick and written by the next one.
+    The user said NO recovery event. 4 new tests in `core/src/lib.rs` (feeds once per tick; `ready` once and no
+    event when it works; a failing watchdog reported once per streak, fed every tick, and a new streak reported
+    again; a failed `ready` plus failing feeds is one event) and the code 10 check in `core_event` (core 73 + 6,
+    core-types 32). design.md: start sequence gets step 5 `core.ready(now)` and the first tick becomes step 6;
+    the Core services table's Health row. NOT done: the `StdWatchdog::disabled` fallback for when
+    `from_env` fails at startup (the exec's start function needs it and reports the `StartError`), the exec's
+    start function itself (calls `from_env`, `ready`), the sample unit file, the tick period against
+    `WATCHDOG_USEC / 2` check, `Core<P>` with a real `LinuxPlatform` anywhere (nothing makes one yet).
+
+53. **`ready` / `READY=1` REMOVED** (user's question 2026-11-19: "is it sensible to notify the watchdog?"; the man page
+    confirms `Type=simple` counts as started at once, the watchdog timer starts with the process, and
+    `WatchdogSec=` makes `NotifyAccess=` default to `main`). Gone: `Watchdog::ready`, `FakeWatchdog::ready_calls`
+    and `ready`, `StdWatchdog::ready` and the `READY` constant, `Core::ready`, the start sequence's step 5 (the
+    first tick is step 5 again), the "failed ready" test and the `ready` test in core, and the `ready` uses in the
+    `StdWatchdog` tests (the full queue test now fills the queue with `feed_at` a half timeout apart; a
+    connection refused and an abstract socket use `feed_at`; a watchdog for another process now sends nothing at
+    all). `Watchdog` is one method, `feed`. The unit file is the default `Type=simple` with `WatchdogSec=` longer
+    than the worst startup (the watchdog's detection time is at least that); feeding between the module inits is
+    possible later at no cost. Items 48 to 52 above that mention `ready`, `READY=1` or `Type=notify` are history.
+    W6 is gone. Tests: core 71 + 6, osal 90 + 2 + 1, core-types 32, core-api 69 + 7 + 9 + 10 + 4.
+
+54. **Exec start and the watchdog fallback: decisions, and the fallback** (2026-11-19, with the user). Decided:
+    (1) If the watchdog cannot be set up, carry on (no refusing to start): `StdWatchdog::disabled(clock)` (new,
+    2 lines of state, `feed` always `Ok`), and the executive reports the `StartError` once (`log::error!` and a
+    `WatchdogUnavailable` event, sent through the public `core.ev` after `Core::start`, since the error exists
+    before the core does). (2) Hand-write the executive's start function in a `sample-deployment` binary, to
+    track it: NOT started, see below. (3) Log how long startup took (not written). (4) The supervisor watchdog
+    is optional and low level: the core is NOT built around it, so NO tick period check, no `interval` accessor,
+    nothing at startup. (5) NO signal handler: a SIGTERM from systemd ends the run `Unknown`; systemd's own log
+    records it; accepted ("let's not overbuild"). design.md updated (three bullets before "Startup does not
+    fail"). Written: `StdWatchdog::disabled` and one test (osal: 91 + 2 + 1).
+    PLAN for the sample deployment (one piece at a time): S2a the crate (`sample-deployment`, a workspace
+    member, `vee-sample-deployment`; inherits the workspace lints; the existing `.cargo/config.toml` with
+    the settings stays) and a `start` that does steps 1 to 5 of the start sequence with `LinuxPlatform`, no
+    modules; S2b a SAMPLE MODULE (the user: a real example, not a fake sensor; it should grow to show every normal
+    module operation, so name it for what it is, such as `example`, and start with init, step and an event); S2c the loop (an absolute tick deadline, so a late
+    tick SKIPS to the next boundary: `next = (t / period + 1) * period`, logged with `log::warn!`), and an optional
+    `VEE_SAMPLE_TICKS` so a run can end through `Core::stop` (Commanded); S2d a test that runs the built binary
+    twice in a temp directory and checks the second boot's reset report; S2e the release profile
+    (`panic = "abort"`, LTO), the guard declared under a feature, and the sample unit and logrotate files.
+
+55. **Sample deployment S2a: the start function** (`sample-deployment/`, new workspace member `vee-sample-deployment`,
+    `Cargo.toml` and `src/main.rs`; inherits the workspace lints, `#![forbid(unsafe_code)]`). `start(clock) ->
+    Result<Core<LinuxPlatform>, StartError>`: (1) `std_syslog::init(clock, LOG_LEVEL = Info)`; (2) `std_panic::
+    install(clock)` when `cfg!(panic = "abort")`; (3) `StdWatchdog::from_env(clock)`, or `disabled(clock)` plus the
+    error kept; (4) `Core::<LinuxPlatform>::start(StdFiles, watchdog, RESET_LOG, EVENT_LOG, now)`, then the
+    deferred watchdog error is reported (`log::error!` and `WatchdogUnavailable`, sent through `core.ev`); (5) module
+    inits (none yet, a marked spot); (6) `std_syslog::start_queue()` (a failure is `log::error!` and the new
+    `CoreEvent::SystemLogQueueUnavailable`, Err, code 11, and the logger stays direct) and `std_alloc_guard::
+    arm()`; then `log::info!("started in N us")`. `StartError { SystemLog(SetLoggerError), PanicHook(
+    InstallError) }` only for bugs in the start function (a logger or hook already installed); `main` returns
+    `Result<(), StartError>`, so Rust prints the error and exits non-zero without a print macro. `main` today:
+    `start`, ONE `tick`, `stop(Commanded)` (temporary, until the loop). Logs go to `reset.log` and `events.log` in
+    the current directory. Also: `std_syslog::StartError` got `Display`. Run by hand twice in a temp dir: the
+    second boot's reset report says `prev end commanded`; startup took 5 to 10 ms (file creation and syncs).
+    The event's own time (`t=214 us`) is the `now` that `Core::start` was given; the line's time is when it was
+    written (later, after the reset log I/O): both are right. Not tested yet (S2d). Not done: the loop (S2c).
+    Build-time settings only apply when cargo runs from `sample-deployment/` (the doc comment says so).
+
+56. **Sample deployment S2b: the example module** (done in three small steps). (1) New crate `modules/example`
+    (package `vee-example`, a workspace member; `#![no_std]`, `#![forbid(unsafe_code)]`; depends ONLY on
+    `vee-core-api`, as a module should): `Example` (state: `steps`), `ExampleEv { Started, Stepped }` (both Info,
+    `#[derive(event::Code)]`), `impl Module`: `init` sends `started, previous end: <ctx.reset.previous>`, `step`
+    counts and sends `step N at T us`. Written to be read: the doc comments explain what a module is, what the
+    derive generates and what `#[repr(u16)]` is for. It is meant to GROW, one small working use of each module
+    capability (commands, tables, bus, files) as they exist. 2 tests with a small harness that plays the
+    executive. (2) `Slot<M>` MOVED from `core/tests/exec_loop.rs` to `vee_core::slot` (`core/src/slot.rs`, now
+    `pub`; second user, so extracted; fields stay private, methods `new`, `init`, `report_suppressed`, `step`
+    are public); the loop test uses it, same 6 tests pass. (3) `sample-deployment/src/main.rs`: `Exec { clock,
+    core, tick, example: Slot<Example> }` (the part `exec!` will generate) with `tick()` (suppressed reports,
+    `core.tick`, module steps) and `stop()`; `start` now returns `Exec` and does the module init in its marked
+    spot (source `EXAMPLE_SOURCE` = 1, `EXAMPLE_PERIOD_TICKS` = 100, i.e. 1 Hz at 100 Hz). Run twice by hand: the
+    second boot's example `init` says `previous end: commanded` and its first step event follows. `main` is
+    still `start`, one `tick`, `stop`. Next: S2c the loop. design.md (Module Requirements) and the doc of
+    `vee_core` mention `modules/` and `Slot`. Tests: 12 test binaries pass, including `vee-example` 2.
+
+57. **The watchdog's rate limit REMOVED** (the user's call, after the measurement: a non-blocking `send_to` is about
+    2.5 us, 0.025% of a core at 100 Hz; the other reasons for a limit were PID 1 wakeups, noise if `NotifyAccess` is
+    misconfigured, and a higher tick rate, all weak). `StdWatchdog` is now `{ link: Option<Link> }` and nothing else:
+    no clock, no `next_due_us`, no half-interval constant. `from_env()` and `disabled()` take no arguments (the
+    sample's two calls lost their `clock`). The parsing is `keep_alive_address(notify_socket, watchdog_usec,
+    watchdog_pid, own_pid) -> Result<Option<Address>, StartError>`: it still checks all three variables (a bad one is
+    an error), and `WATCHDOG_USEC` is read only to tell whether a watchdog exists (0 or unset: none; a `WATCHDOG_PID`
+    that is not ours: none); no `NOTIFY_SOCKET` means nothing to send to. `feed_at(now, panicking)` became
+    `feed_unless(panicking)`, which sends on every call; a failed send is just retried by the next tick. Tests:
+    the rate limit ones are gone, and `every_feed_sends_a_keep_alive` is new (osal: 88 + 2 + 1). Docs: `Watchdog::feed`,
+    `Core::tick`, design.md. Items 48, 50 and 54 above mention the limit: history.
+
+58. **The software bus designed** (a long discussion with the user, 2026-11-19; design.md, "Software Bus" rewritten;
+    NOTHING WRITTEN). Decisions: a topic has a name, a type and an explicit APID (`u16`, unique, checked at compile
+    time; also the CCSDS APID on downlink); messages are `Copy` plain data up to about 3 kB with a
+    `#[derive(bus::Message)]` (wire encoding big endian in declaration order; a field's index is its position in
+    that layout, NO pinned field ids, by the user's call: it must agree with the packet layout); two kinds of topic:
+    STATE (latest value in a shared slot, with `seq` and `updated_at`; direct `ctx.out.<name>.publish(v)`; lossy
+    on purpose; no read flag, each reader keeps its own `last_seen_seq`) and QUEUED LINK (a queue per reader, as
+    before); NO sub-to-all: each module's config lists what it reads and writes, with compile time shorthands
+    (groups, `all` minus its own outputs), and the macro rejects reading and writing the same topic, so there is
+    no borrow conflict and every module can publish health (the outbox and commit idea was dropped again);
+    `Topic` is an object safe trait (`apid`, `name`, `seq`, `updated_at`, `encode`, and `field_count`,
+    `field_kind`, `field`) and a module reaches topics by APID through a sorted `(apid, &dyn Topic)` array the exec
+    makes for it (`ctx.topic(apid)`); NO generic `S` (the array does the same; the field part is outlined, to be
+    committed with table driven telemetry and FDIR); table rows are plain data by APID and field index with a
+    dictionary hash in the header and are validated once at load (open: the table service's validate hook);
+    `compare(Value, Op, Value) -> Result<bool, CompareError>` never panics (numbers exact via `i128`, NaN is an
+    error, a mismatch is an error); rule violations are events, not topics; the recorder is a module (last in order,
+    base rate, `all`, `seq` jumps reported); no mission wide types crate (a module that needs another's type
+    depends on its crate; generic modules use `Topic`); commands also live in the module's own crate. The
+    `exec!` example in design.md has `topics:` and an `fdir` module with `reads: all`. Open: field kinds
+    supported by the derive (arrays and element indices, nested structs, text), stable topic ids across a
+    config edit are now the user's APIDs, the table validate hook.
+
+59. **Sample deployment S2c: the loop** (`sample-deployment/src/main.rs`; and `Clock::sleep_until_us` in the OSAL).
+    `Clock` gained `fn sleep_until_us(&self, deadline_us)` (waits until the clock is at the deadline, returns at
+    once if it already is; the one call meant to block, only the executive's loop makes it): `StdClock`
+    sleeps for the remainder, `FakeClock` moves the time forward to the deadline (`fetch_max`, never back).
+    3 new clock tests. In the sample: `TICK_US` = 10 ms (100 Hz); ticks start at multiples of it, so a tick has
+    a number (`start_us / TICK_US`) and the `Exec` no longer keeps a counter (`tick(tick)` takes the number);
+    `Exec::run(tick_limit)`: sleep to the boundary, tick, then the next start is `next_boundary_after(now)`, so an
+    overrun SKIPS the boundaries it missed (nothing runs twice, a module due on a skipped tick does not step) and
+    `ticks_skipped` is logged with `log::warn!` (an event later, when overruns are designed);
+    `VEE_SAMPLE_TICKS` (invalid is `StartError::InvalidTickLimit`) ends the run through `Exec::stop`. 4 unit tests
+    for the two pure functions. Checked by hand: 250 ticks take 2.5 s, the example steps at 1.0 s and 2.0 s, the
+    second boot reports `prev end commanded`. The runs also showed `overrun` warnings: `Core::tick`'s blocking
+    event log `append` (a `sync_data` per event) takes more than 10 ms now and then on WSL. design.md has the
+    loop bullet in Executive Requirements. Tests now: 308 (core 71 + 6, core-api 69 + 7 + 9 + 10 + 4, core-types 32,
+    osal 91 + 2 + 1, example 2, sample 4). The "WHERE WE LEFT OFF" and "Next" sections below were rewritten.
+
+## WHERE WE LEFT OFF (2026-11-20)
+Everything builds, all 308 tests pass, clippy (strict lints of item 29) and `cargo fmt --check` are
+clean. Committed by the user: up to `9934bdb "update docs"` (items 1 to 40). NOT yet committed:
+items 41 to 59 and the docs. The user commits.
+The user is learning Rust (comes from C++): explain syntax and generics as they come up, and follow
+CLAUDE.md (one thing at a time, simplicity, callbacks only when needed, "do we really need this?", and
+after any edit name each file touched and what was done in it). `latest-chat.md` is updated only when the
+user says the session is ending.
+
+Where the code is: `Core<P: Platform>` (`core/src/lib.rs`) has `start`, `tick` (events to the event log with
+the TEMPORARY blocking `append`, the dropped report, then the watchdog feed), `stop`, `reset`, `files`,
+`watchdog`; `vee_core::slot::Slot<M>` is the per module bookkeeping. The OSAL has the interfaces (`clock`
+with `sleep_until_us`, `files`, `syslog`, `panic_report`, `watchdog`, `platform`), the fakes, and `linux/`
+(`std_clock`, `std_files`, `std_syslog`, `std_panic` the panic hook, `std_watchdog`, `std_alloc_guard`,
+`LinuxPlatform`). `modules/example` is the sample module. `sample-deployment` is the first executable: `start`
+(the whole start sequence), `Exec::run` (the loop: absolute boundaries, an overrun skips, logged),
+`VEE_SAMPLE_TICKS=N` to end through `Core::stop`. The software bus is DESIGNED (item 58) and not written.
+Observed in the first runs of the sample: `overrun ... skipped 1 or 2` warnings, from `Core::tick`'s blocking
+`append` (a `sync_data` per event on WSL can take more than the 10 ms period). That is exactly what the file
+service removes.
 
 ## Next
-UPDATE 2026-11-19 (latest). Open choices, in the order I would do them, all for the user to pick:
-1. The allocation guard (item 39): a feature gated `GuardAlloc` in the OSAL (first `unsafe` in the
-   project: needs `#[allow(unsafe_code, reason)]` and a `// SAFETY:` comment), `started` flag and
-   `arm()`, a per-thread counting mode so tests can assert zero allocations around `emit`, `drain` and
-   `Core::tick`. Closes the start sequence.
-2. The file service (thread, bounded request queues): removes the blocking `append` from
-   `Core::tick`. The biggest piece. Also needs the second OSAL service, so introduce the `Platform`
-   bundle trait then (see Decisions).
-3. System log step 4: the in-memory ring of recent lines, the last gasp file written by the panic hook
-   (rules in design.md, Faults), the next boot's event about it. Needs the `Watchdog` trait and
-   `PANICKING` flag work for the feed.
-4. Small open decision: raise the system log's `QUEUE_DEPTH` (256) to match the event queue (1024)?
-5. Then: Time, Health (overrun, the watchdog feed), commands (handled in the module's step, item 32),
-   `exec!` design (the deployment's types for the bus, router and tables), the exec's one start function
-   (syslog init, `Core::start`, module inits, `start_queue`, `started`, first tick) and its stop path.
+Open choices, in the order I would do them, all for the user to pick:
+1. Sample deployment S2d: a test that runs the built binary twice in a temp directory (with
+   `VEE_SAMPLE_TICKS`) and checks the logs and the second boot's reset report (`CARGO_BIN_EXE_...`).
+2. S2e: the release profile (`panic = "abort"`, LTO, `opt-level`, `codegen-units`), the guard declared
+   under a feature in the sample's `main`, and the sample systemd unit (default `Type=simple`,
+   `WatchdogSec` longer than the startup, `Restart=on-failure`, `StartLimitBurst`, `StartLimitAction`,
+   `StandardError=append:`) and logrotate (`copytruncate`) files.
+3. The file service (thread, bounded request queues): removes the blocking `append` from `Core::tick` and the
+   overruns above. The biggest piece: a new `Platform` associated type. After it, assert `Core::tick`
+   allocates nothing.
+4. The bus (item 58), state topics first, as the sample module's first real use.
+5. Time and Health (overrun detection as an event, the counters), commands (handled in the module's step,
+   item 32), the exec's stop path on SIGTERM (decided NOT to handle: item 54), the ground tool.
 Older plan, still relevant: STRETCH GOAL, only after everything else works (noted in the design doc,
 Executive Requirements): a threaded module type for slow work (image processing, say) that gets its
 own thread or core, talking through bounded queues like the file service.
@@ -703,5 +1006,6 @@ the command derives (`Command`, `CmdSet`) could use the same idea (opcode = enum
 - How a module waits for a command result without blocking (see item 19). Part of the command design.
 
 ## Not started
-command routing, software bus, tables, events, file service, `exec!`, modules,
-`module-types`, `ground-tool`.
+command routing, the software bus (designed, item 58), tables, the file service, `exec!` (the sample
+deployment is its hand written precursor), more modules, the `bus::Message` derive, the ground tool. (The
+`module-types` crate was dropped: no mission wide types crate, item 58.)

@@ -4,8 +4,8 @@
 //!
 //! What it shows about `exec!`:
 //! - Everything one module needs is the same for every module, so it is one generic type,
-//!   `Slot<M>`: the module, its throttle, its source id and its rate. `exec!` does not have to
-//!   generate that logic, only the list of slots and their order.
+//!   `vee_core::slot::Slot<M>`: the module, its throttle, its source id and its rate. `exec!` does
+//!   not have to generate that logic, only the list of slots and their order.
 //! - `Exec` is the part `exec!` generates: one field for each module, and a `tick` that does the
 //!   same three steps for every module, in order.
 //! - `core.tick(now)` is the core's step: it takes the events out of the queue and writes them to
@@ -23,9 +23,8 @@
 )]
 
 use std::sync;
-use vee_core::suppressed;
+use vee_core::slot::Slot;
 use vee_core_api::ctx;
-use vee_core_api::ev;
 use vee_core_api::event;
 use vee_core_api::event::Code as _;
 use vee_core_api::module;
@@ -33,12 +32,13 @@ use vee_core_api::reset;
 use vee_core_api::throttle;
 use vee_core_types::core_event;
 use vee_core_types::event_log as log_types;
-use vee_osal::clock;
 use vee_osal::clock::Clock as _;
 use vee_osal::fake_clock;
 use vee_osal::fake_files;
-use vee_osal::std_clock;
-use vee_osal::std_syslog;
+use vee_osal::fake_platform;
+use vee_osal::fake_watchdog;
+use vee_osal::linux::std_clock;
+use vee_osal::linux::std_syslog;
 
 const LIMIT: u8 = throttle::EV_MAX_PER_TICK;
 
@@ -145,64 +145,10 @@ impl module::Module for Noisy {
 
 // ---- The executive ----
 
-/// Everything the executive keeps for one module. The same for every module, so it is generic.
-struct Slot<M: module::Module> {
-    module: M,
-    throttle: throttle::Throttle,
-    /// The module's id. It goes into every event the module sends.
-    source: u8,
-    /// The module steps on every `period`th tick. 1 is every tick.
-    period: u64,
-}
-
-impl<M: module::Module> Slot<M> {
-    fn new(module: M, source: u8, period: u64) -> Self {
-        Slot {
-            module,
-            throttle: throttle::Throttle::new(),
-            source,
-            period,
-        }
-    }
-
-    /// Startup: reads the clock, builds the module's `Ctx` and calls `init`.
-    fn init(&mut self, ev: &mut ev::Ev, clock: &impl clock::Clock, reset: reset::ResetInfo) {
-        let time = clock.monotonic_us();
-        log::debug!("source {} init at {time} us", self.source);
-        let mut ctx = ctx::Ctx::<M>::new(ev, &mut self.throttle, self.source, time, reset);
-        self.module.init(&mut ctx);
-    }
-
-    /// Top of a tick: sends the core's report of what this module had suppressed in the tick
-    /// before, as events from the core at `now`. It also starts the module's new tick of counting.
-    fn report_suppressed(&mut self, ev: &mut ev::Ev, now: u64) {
-        suppressed::report::<M::Event, _>(&mut self.throttle, self.source, |code, text| {
-            ev.send(core_event::SOURCE, now, code, text);
-        });
-    }
-
-    /// Calls `step` if this tick is one of the module's. The clock is read just before the call.
-    fn step(
-        &mut self,
-        tick: u64,
-        ev: &mut ev::Ev,
-        clock: &impl clock::Clock,
-        reset: reset::ResetInfo,
-    ) {
-        if tick.checked_rem(self.period) != Some(0) {
-            return;
-        }
-        let time = clock.monotonic_us();
-        log::debug!("source {} steps at {time} us", self.source);
-        let mut ctx = ctx::Ctx::<M>::new(ev, &mut self.throttle, self.source, time, reset);
-        self.module.step(&mut ctx);
-    }
-}
-
 /// What `exec!` will generate: a field for each module, and the same steps for each, in order.
 struct Exec {
     clock: fake_clock::FakeClock,
-    core: vee_core::Core<fake_files::FakeFiles>,
+    core: vee_core::Core<fake_platform::FakePlatform>,
     /// How many ticks have run.
     tick: u64,
     heartbeat: Slot<Heartbeat>,
@@ -214,8 +160,9 @@ impl Exec {
     /// The core's startup (the reset log and the event log), before any module's `init`.
     fn new() -> Self {
         let clock = fake_clock::FakeClock::new();
-        let core = vee_core::Core::start(
+        let core = vee_core::Core::<fake_platform::FakePlatform>::start(
             fake_files::FakeFiles::new(),
+            fake_watchdog::FakeWatchdog::new(),
             RESET_LOG,
             EVENT_LOG,
             clock.monotonic_us(),
@@ -458,7 +405,13 @@ fn a_clean_stop_writes_the_last_ticks_events_and_the_next_start_sees_a_clean_end
     // The next boot, on a copy of what this run left in the reset log, sees a clean end.
     let files = fake_files::FakeFiles::new();
     files.put(RESET_LOG, &exec.core.files().get(RESET_LOG).unwrap());
-    let next = vee_core::Core::start(files, RESET_LOG, EVENT_LOG, 0);
+    let next = vee_core::Core::<fake_platform::FakePlatform>::start(
+        files,
+        fake_watchdog::FakeWatchdog::new(),
+        RESET_LOG,
+        EVENT_LOG,
+        0,
+    );
     assert_eq!(
         next.reset(),
         reset::ResetInfo {

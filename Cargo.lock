@@ -78,8 +78,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "vee-example"
+version = "0.1.0"
+dependencies = [
+ "vee-core-api",
+]
+
+[[package]]
 name = "vee-osal"
 version = "0.1.0"
 dependencies = [
  "log",
+]
+
+[[package]]
+name = "vee-sample-deployment"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "vee-core",
+ "vee-core-api",
+ "vee-core-types",
+ "vee-example",
+ "vee-osal",
 ]

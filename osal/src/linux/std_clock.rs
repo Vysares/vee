@@ -1,6 +1,7 @@
 //! The real `Clock`, on top of `std::time::Instant`.
 
 use crate::clock;
+use std::thread;
 use std::time;
 
 /// Counts from the moment it was created. Create it once at startup, before anything reads time.
@@ -30,6 +31,14 @@ impl clock::Clock for StdClock {
         // never goes backwards.
         u64::try_from(self.start.elapsed().as_micros()).unwrap_or(u64::MAX)
     }
+
+    fn sleep_until_us(&self, deadline_us: u64) {
+        let Some(remaining_us) = deadline_us.checked_sub(self.monotonic_us()) else {
+            return; // the deadline has passed
+        };
+        // `sleep` waits at least this long, so the clock is at the deadline or past it.
+        thread::sleep(time::Duration::from_micros(remaining_us));
+    }
 }
 
 #[cfg(test)]
@@ -58,6 +67,23 @@ mod tests {
         let after = clock.monotonic_us();
         // `sleep` waits at least this long, so at least 5000 us must have been counted.
         assert!(after - before >= 5000);
+    }
+
+    #[test]
+    fn sleep_until_returns_at_or_after_the_deadline() {
+        let clock = std_clock::StdClock::new();
+        let deadline = clock.monotonic_us() + 5_000;
+        clock.sleep_until_us(deadline);
+        assert!(clock.monotonic_us() >= deadline);
+    }
+
+    #[test]
+    fn sleep_until_a_deadline_in_the_past_returns_at_once() {
+        let clock = std_clock::StdClock::new();
+        thread::sleep(time::Duration::from_millis(2));
+        let started = time::Instant::now();
+        clock.sleep_until_us(0);
+        assert!(started.elapsed() < time::Duration::from_millis(500));
     }
 
     #[test]

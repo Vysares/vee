@@ -1,0 +1,15 @@
+[package]
+name = "vee-sample-deployment"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+vee-core = { path = "../core" }
+vee-core-api = { path = "../core-api" }
+vee-core-types = { path = "../core-types" }
+vee-osal = { path = "../osal" }
+vee-example = { path = "../modules/example" }
+log = { workspace = true }
+
+[lints]
+workspace = true

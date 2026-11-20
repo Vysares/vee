@@ -1,0 +1,12 @@
+[package]
+name = "vee-example"
+edition.workspace = true
+version.workspace = true
+
+# A module depends only on `vee-core-api`: the traits and types the core gives it. It never
+# depends on the core itself or on the OSAL, so it cannot reach anything but what `Ctx` hands it.
+[dependencies]
+vee-core-api = { path = "../../core-api" }
+
+[lints]
+workspace = true

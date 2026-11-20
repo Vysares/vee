@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["core-api", "core-derive", "core-types", "core", "osal"]
+members = ["core-api", "core-derive", "core-types", "core", "osal", "modules/example", "sample-deployment"]
 
 [workspace.package]
 edition = "2024"

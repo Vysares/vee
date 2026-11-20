@@ -31,6 +31,13 @@ impl clock::Clock for FakeClock {
     fn monotonic_us(&self) -> u64 {
         self.now_us.load(atomic::Ordering::Relaxed)
     }
+
+    /// Does not wait: it moves the time forward to the deadline, as the passing of that time would
+    /// have. A deadline in the past leaves the time alone (time never goes backwards).
+    fn sleep_until_us(&self, deadline_us: u64) {
+        self.now_us
+            .fetch_max(deadline_us, atomic::Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]
@@ -58,6 +65,15 @@ mod tests {
         fake.advance(10_000);
         fake.advance(10_000);
         assert_eq!(fake.monotonic_us(), 20_000);
+    }
+
+    #[test]
+    fn sleep_until_moves_the_time_forward_to_the_deadline_and_never_back() {
+        let fake = fake_clock::FakeClock::new();
+        fake.sleep_until_us(300);
+        assert_eq!(fake.monotonic_us(), 300);
+        fake.sleep_until_us(100);
+        assert_eq!(fake.monotonic_us(), 300);
     }
 
     #[test]

@@ -1,6 +1,8 @@
 //! The core: the services every module uses (events, and later the bus, command router, tables
 //! and files), and the one `tick` that runs them. See `docs/design.md`, "Core services".
 //!
+//! `slot::Slot` is what the executive keeps for each module (the same for all of them).
+//!
 //! `Core` is scheduled by the executive like a module, but it is not a `Module`: the executive
 //! calls `core.tick(now)` every tick, in the order the design gives. It does not know about
 //! modules or their rates. The modules are the executive's.
@@ -11,35 +13,54 @@ pub mod event_log;
 pub mod events;
 mod records;
 pub mod reset_log;
+pub mod slot;
 pub mod suppressed;
 
 use vee_core_api::ev;
 use vee_core_api::reset;
 use vee_core_types::core_event;
 use vee_osal::files;
+use vee_osal::platform;
+use vee_osal::watchdog;
+use vee_osal::watchdog::Watchdog as _;
 
-/// The core's state. So far: the event queue, the event log it is written to, and how the
-/// previous run ended.
+/// The core's state. So far: the event queue, the event log it is written to, how the previous
+/// run ended, and the watchdog.
 ///
-/// `F` is the OSAL's file system: the real one in flight, and a fake in tests.
-pub struct Core<F: files::Files> {
+/// `P` is the OSAL's platform (`platform::Platform`): the real services in flight
+/// (`Core::<LinuxPlatform>`), and fakes in tests (`Core::<FakePlatform>`). It is one type
+/// parameter however many services the core comes to use. Callers name it, because it cannot be
+/// worked out from the services handed to `start`.
+pub struct Core<P: platform::Platform> {
     /// The event queue. The executive lends it to every `Ctx` it builds (modules and the core's
     /// own reports send into it), and `tick` takes the events out.
     pub ev: ev::Ev,
-    files: F,
+    files: P::Files,
+    /// Fed by `tick`.
+    watchdog: P::Watchdog,
+    /// Whether the last call on the watchdog failed. It makes a streak of failures one event: only
+    /// the call that starts a streak reports.
+    watchdog_failing: bool,
     reset_log_path: &'static str,
     event_log_path: &'static str,
     /// How the previous run ended. Set by `start`.
     reset: reset::ResetInfo,
 }
 
-impl<F: files::Files> Core<F> {
+impl<P: platform::Platform> Core<P> {
     /// The core with nothing started: an empty queue and no history. `start` is the way to make
     /// one for real.
-    fn new(files: F, reset_log_path: &'static str, event_log_path: &'static str) -> Self {
+    fn new(
+        files: P::Files,
+        watchdog: P::Watchdog,
+        reset_log_path: &'static str,
+        event_log_path: &'static str,
+    ) -> Self {
         Core {
             ev: ev::Ev::new(),
             files,
+            watchdog,
+            watchdog_failing: false,
             reset_log_path,
             event_log_path,
             reset: reset::ResetInfo::first_boot(),
@@ -61,12 +82,13 @@ impl<F: files::Files> Core<F> {
     /// there is no alternative, and a broken disk is not a reason to stop a flight computer.
     /// With the reset log down, modules get `ResetInfo::first_boot()`.
     pub fn start(
-        files: F,
+        files: P::Files,
+        watchdog: P::Watchdog,
         reset_log_path: &'static str,
         event_log_path: &'static str,
         now: u64,
     ) -> Self {
-        let mut core = Core::new(files, reset_log_path, event_log_path);
+        let mut core = Core::new(files, watchdog, reset_log_path, event_log_path);
         core.reset = core.start_reset_log(now);
         core.start_event_log(now);
         core
@@ -97,8 +119,13 @@ impl<F: files::Files> Core<F> {
     }
 
     /// The file system, so a test can read back what the core wrote.
-    pub fn files(&self) -> &F {
+    pub fn files(&self) -> &P::Files {
         &self.files
+    }
+
+    /// The watchdog, so a test can read back what the core did with it.
+    pub fn watchdog(&self) -> &P::Watchdog {
+        &self.watchdog
     }
 
     /// Step 1 of `start`. Returns the reset info for this run.
@@ -154,9 +181,34 @@ impl<F: files::Files> Core<F> {
     /// 1. Events: takes every event out of the queue and writes it to the event log. Then, if
     ///    the queue dropped any events, sends the report (`events::report_dropped`). The report
     ///    comes after the queue has been emptied, so there is room for it.
+    /// 2. The watchdog: feeds it. This comes last, so a tick that hangs part way (a blocked
+    ///    write, say) is not fed, and the supervisor notices. The call is made every tick, and
+    ///    the watchdog sends on each one. If the supervisor cannot be reached, the
+    ///    first failure of a streak sends `WatchdogUnavailable`, and the call is tried again at
+    ///    the next tick. The event is written by the next tick, as the dropped report is.
     pub fn tick(&mut self, now: u64) {
         self.write_events();
         events::report_dropped(&mut self.ev, now);
+        let result = self.watchdog.feed();
+        self.note_watchdog(now, result);
+    }
+
+    /// Reports the result of a feed. A failure sends `WatchdogUnavailable` only if the feed before
+    /// it did not fail, so a streak is one event. A success ends the streak.
+    fn note_watchdog(&mut self, now: u64, result: Result<(), watchdog::WatchdogError>) {
+        match result {
+            Ok(()) => self.watchdog_failing = false,
+            Err(err) if !self.watchdog_failing => {
+                self.watchdog_failing = true;
+                self.ev.send(
+                    core_event::SOURCE,
+                    now,
+                    core_event::CoreEvent::WatchdogUnavailable,
+                    format_args!("watchdog: {err}"),
+                );
+            }
+            Err(_) => {}
+        }
     }
 
     /// Takes every event out of the queue and appends it to the event log.
@@ -193,16 +245,27 @@ mod tests {
     use vee_core_types::core_event;
     use vee_core_types::event_log as log_types;
     use vee_osal::fake_files;
+    use vee_osal::fake_platform;
+    use vee_osal::fake_watchdog;
     use vee_osal::files;
+    use vee_osal::platform;
 
     const PATH: &str = "events.log";
 
-    fn new_core() -> vee_core::Core<fake_files::FakeFiles> {
-        vee_core::Core::new(fake_files::FakeFiles::new(), RESET_LOG, PATH)
+    /// The usual test platform: a fake file system and a fake watchdog.
+    type Fake = fake_platform::FakePlatform;
+
+    /// A core that has not been started (no startup events), on the file system `files`.
+    fn core_on<F: files::Files>(files: F) -> vee_core::Core<fake_platform::FakePlatform<F>> {
+        vee_core::Core::new(files, fake_watchdog::FakeWatchdog::new(), RESET_LOG, PATH)
+    }
+
+    fn new_core() -> vee_core::Core<Fake> {
+        core_on(fake_files::FakeFiles::new())
     }
 
     /// Sends one event at `time`. Which event does not matter.
-    fn send<F: files::Files>(core: &mut vee_core::Core<F>, time: u64) {
+    fn send<P: platform::Platform>(core: &mut vee_core::Core<P>, time: u64) {
         core.ev.send(
             1,
             time,
@@ -212,13 +275,13 @@ mod tests {
     }
 
     /// How many records are in the event log.
-    fn record_count(core: &vee_core::Core<fake_files::FakeFiles>) -> usize {
+    fn record_count(core: &vee_core::Core<Fake>) -> usize {
         let bytes = core.files().get(PATH).map_or(0, |bytes| bytes.len());
         bytes / log_types::RECORD_LEN
     }
 
     /// The `index`th record in the event log, decoded.
-    fn record(core: &vee_core::Core<fake_files::FakeFiles>, index: usize) -> event::Event {
+    fn record(core: &vee_core::Core<Fake>, index: usize) -> event::Event {
         let bytes = core.files().get(PATH).unwrap();
         let record = bytes.chunks(log_types::RECORD_LEN).nth(index).unwrap();
         log_types::decode(record).unwrap()
@@ -251,12 +314,18 @@ mod tests {
     const RESET_LOG: &str = "reset.log";
 
     /// The core after `start` on `files`, with the startup events at time 5.
-    fn started<F: files::Files>(files: F) -> vee_core::Core<F> {
-        vee_core::Core::start(files, RESET_LOG, PATH, 5)
+    fn started<F: files::Files>(files: F) -> vee_core::Core<fake_platform::FakePlatform<F>> {
+        vee_core::Core::start(
+            files,
+            fake_watchdog::FakeWatchdog::new(),
+            RESET_LOG,
+            PATH,
+            5,
+        )
     }
 
     /// The next event in the queue, checked to be from the core at time 5.
-    fn next_core_event<F: files::Files>(core: &mut vee_core::Core<F>) -> event::Event {
+    fn next_core_event<P: platform::Platform>(core: &mut vee_core::Core<P>) -> event::Event {
         let event = core.ev.pop().unwrap();
         assert_eq!(event.source, core_event::SOURCE);
         assert_eq!(event.monotonic_us, 5);
@@ -327,8 +396,7 @@ mod tests {
 
     #[test]
     fn when_the_reset_log_cannot_be_written_stop_says_so_and_still_writes_the_events() {
-        let mut core =
-            vee_core::Core::new(ResetLogDown(fake_files::FakeFiles::new()), RESET_LOG, PATH);
+        let mut core = core_on(ResetLogDown(fake_files::FakeFiles::new()));
         send(&mut core, 1);
         core.stop(50, reset::ShutdownReason::Commanded);
 
@@ -472,11 +540,47 @@ mod tests {
 
     #[test]
     fn when_the_event_log_cannot_be_written_the_queue_is_still_emptied() {
-        let mut core = vee_core::Core::new(FailingFiles, RESET_LOG, PATH);
+        let mut core = core_on(FailingFiles);
         for time in [1, 2, 3] {
             send(&mut core, time);
         }
         core.tick(99);
         assert!(core.ev.is_empty());
+    }
+
+    #[test]
+    fn every_tick_feeds_the_watchdog_once() {
+        let mut core = new_core();
+        for time in [1, 2, 3] {
+            core.tick(time);
+        }
+        assert_eq!(core.watchdog().feed_calls(), 3);
+        assert!(core.ev.is_empty()); // a feed that works sends no event
+    }
+
+    #[test]
+    fn a_failing_watchdog_is_reported_once_per_streak_and_still_fed_every_tick() {
+        let mut core = new_core();
+        core.watchdog().set_failing(true);
+        for time in [1, 2, 3] {
+            core.tick(time);
+        }
+        assert_eq!(core.watchdog().feed_calls(), 3); // tried again each tick
+        assert_eq!(record_count(&core), 1); // sent by tick 1, written by tick 2
+        let event = record(&core, 0);
+        assert_eq!(event.source, core_event::SOURCE);
+        assert_eq!(event.code, 10);
+        assert_eq!(event.severity, event::Severity::Err);
+        assert_eq!(event.monotonic_us, 1);
+        assert_eq!(event.text.as_bytes(), b"watchdog: other error");
+
+        // A feed that works ends the streak, so the next failure is reported again.
+        core.watchdog().set_failing(false);
+        core.tick(4);
+        core.watchdog().set_failing(true);
+        core.tick(5);
+        core.tick(6);
+        assert_eq!(record_count(&core), 2);
+        assert_eq!(record(&core, 1).monotonic_us, 5);
     }
 }

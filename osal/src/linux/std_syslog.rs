@@ -23,8 +23,9 @@
 //! before `started`. If it fails, the logger stays in direct mode and the executive reports it.
 
 use crate::clock::Clock as _;
-use crate::std_clock;
+use crate::linux::std_clock;
 use crate::syslog;
+use std::fmt;
 use std::io;
 use std::io::Write as _;
 use std::sync;
@@ -36,7 +37,7 @@ use std::time;
 /// How many lines the queue holds before `emit` starts dropping new ones. It is also the most
 /// lines the writer takes in one pass, so it gets to report the dropped lines even when the
 /// producers keep the queue full.
-const QUEUE_DEPTH: usize = 256;
+const QUEUE_DEPTH: usize = 1024;
 /// How long the writer sleeps between passes.
 const POLL: time::Duration = time::Duration::from_millis(10);
 
@@ -50,6 +51,16 @@ pub enum StartError {
     /// The OS would not start the writer thread (a limit on threads or memory, say). The logger
     /// is still in direct mode.
     Thread(io::Error),
+}
+
+impl fmt::Display for StartError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StartError::NotInstalled => f.write_str("the system log is not installed"),
+            StartError::AlreadyStarted => f.write_str("the log queue was started already"),
+            StartError::Thread(error) => write!(f, "cannot start the log writer: {error}"),
+        }
+    }
 }
 
 /// The logger that `init` installs. `log` needs it to be `Sync`, because any thread may log.
@@ -216,10 +227,12 @@ pub fn start_queue() -> Result<(), StartError> {
 #[cfg(test)]
 mod tests {
     use super as std_syslog;
-    use crate::std_clock;
+    use crate::linux::std_alloc_guard;
+    use crate::linux::std_clock;
     use crate::syslog;
     use log::Log as _;
     use std::fmt;
+    use std::io;
     use std::sync::atomic;
     use std::sync::mpsc;
 
@@ -324,6 +337,39 @@ mod tests {
         let (open, text) = drained(&logger, &receiver);
         assert!(!open);
         assert_eq!(text, "");
+    }
+
+    #[test]
+    fn emit_in_queued_mode_does_not_allocate() {
+        let (logger, _receiver) = queued_logger(4);
+        let before = std_alloc_guard::allocations_on_this_thread();
+        emit(&logger, format_args!("hello {}", 7));
+        let after = std_alloc_guard::allocations_on_this_thread();
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn emit_in_direct_mode_does_not_allocate() {
+        let logger = std_syslog::Logger::new(std_clock::StdClock::new());
+        // The first write to stderr may set up the standard library's own state, so write once
+        // first and count the second.
+        emit(&logger, format_args!("warm up"));
+        let before = std_alloc_guard::allocations_on_this_thread();
+        emit(&logger, format_args!("hello {}", 7));
+        let after = std_alloc_guard::allocations_on_this_thread();
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn a_pass_does_not_allocate() {
+        let (logger, receiver) = queued_logger(1);
+        emit(&logger, format_args!("one"));
+        emit(&logger, format_args!("two")); // dropped, so the pass also writes the report
+        let mut out = io::sink(); // a `Vec` would allocate as it grows
+        let before = std_alloc_guard::allocations_on_this_thread();
+        assert!(logger.drain(&receiver, &mut out));
+        let after = std_alloc_guard::allocations_on_this_thread();
+        assert_eq!(after, before);
     }
 
     #[test]
