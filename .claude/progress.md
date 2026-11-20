@@ -997,6 +997,8 @@ the command derives (`Command`, `CmdSet`) could use the same idea (opcode = enum
   no clock type, because `tick(now)` takes the time.
 
 ## Open questions
+- Split `Clock` into a read trait and a sleep trait, so only the executive's loop can wait (modules already
+  cannot reach it; `Slot` and `Core` could, by convention only)? Asked 2026-11-20, no answer yet.
 - Shutdown reasons beyond `Commanded` and `Signal`.
 - Whether a lone `Shutdown` as the first record of a log shorter than the tail window should be
   an error. Today it is accepted, because the reader cannot tell a cut window from a short file.
