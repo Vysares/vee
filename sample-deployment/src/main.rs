@@ -24,6 +24,13 @@ use vee_osal::linux::std_panic;
 use vee_osal::linux::std_syslog;
 use vee_osal::linux::std_watchdog;
 
+/// The allocation guard, in builds that ask for it (`--features alloc-guard`): every allocation is
+/// counted, and once `start` has called `std_alloc_guard::arm()`, any allocation aborts. A program has
+/// one global allocator, so this is the one place it is chosen.
+#[cfg(feature = "alloc-guard")]
+#[global_allocator]
+static GUARD: std_alloc_guard::GuardAlloc = std_alloc_guard::GuardAlloc;
+
 /// Where the reset log and the event log are: the current directory, for a sample.
 const RESET_LOG: &str = "reset.log";
 const EVENT_LOG: &str = "events.log";

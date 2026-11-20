@@ -925,8 +925,54 @@ Size on 2026-11-17 (cloc, working tree, no target dir): 14 Rust files, 1729 line
     loop bullet in Executive Requirements. Tests now: 308 (core 71 + 6, core-api 69 + 7 + 9 + 10 + 4, core-types 32,
     osal 91 + 2 + 1, example 2, sample 4). The "WHERE WE LEFT OFF" and "Next" sections below were rewritten.
 
+60. **Sample deployment S2d: the program, tested as a program** (`sample-deployment/tests/sample_runs.rs`, new, 4
+    tests, about 1.3 s). Runs the real binary (`env!("CARGO_BIN_EXE_vee-sample-deployment")`) in a scratch
+    directory, with `NOTIFY_SOCKET` and the other systemd variables removed, and checks what a person sees and what
+    is left on disk: (1) two runs of `VEE_SAMPLE_TICKS=3`: the first says `reset 1: prev end unknown`, leaves
+    two reset log records (boot, shutdown), the second says `reset 2: prev end commanded` (four records), and the
+    event log (decoded with `vee_core_types::event_log`) has both runs' reset reports and the example module's two
+    `started, previous end: ...` events; (2) 120 ticks: the example steps exactly once (`step 1 at ...`); (3) a run
+    with no limit, killed (SIGKILL) once its boot record is on disk (polled, 10 s timeout): the reset log has just
+    the boot, and the next boot says `prev end unknown, 1 unclean in a row`; (4) `VEE_SAMPLE_TICKS=soon`: non-zero
+    exit, `InvalidTickLimit` on stderr, no files written. Mutation checked: making the sample stop with `Signal`
+    fails test (1) only (reverted). The file has the usual `#![allow(clippy::unwrap_used, panic, indexing_slicing,
+    arithmetic_side_effects, reason)]` and its own `TempDir`. Tests: 312 (sample 4 + 4). SLOC at this point (code
+    lines, no blanks or comments, tests split off by `tests/` dirs and the first `#[cfg(test)]` of each file; the
+    `fake_*` OSAL doubles count as non-test): 2291 non-test, 4208 test, 1215 comment lines in non-test code, 51 Rust
+    files, 1490 Markdown lines (core 453, core-api 504, core-derive 129, core-types 209, example 39, osal 802, sample
+    155; item 27 had 1140 non-test lines on 2026-11-18).
+
+61. **Sample deployment S2e: the flight build, the guard, the unit files** (and a bug the guard found).
+    (1) Root `Cargo.toml` `[profile.release]`: `panic = "abort"`, `lto = true`, `codegen-units = 1` (the sample's
+    `cfg!(panic = "abort")` now installs the panic hook in this build). Measured on the sample: 579 KB without,
+    468 KB with (376 KB stripped); `opt-level` s or z would save only 6% more, so it stays default; symbols kept.
+    (2) `sample-deployment` feature `alloc-guard` (off by default): `main.rs` declares `GuardAlloc` as the
+    `#[global_allocator]` under it; `start` already calls `arm()` unconditionally (a no-op without the guard).
+    Run `cargo test -p vee-sample-deployment --features alloc-guard` (and `--all-features` clippy) in CI.
+    THE GUARD FOUND A REAL RACE: the sample aborted after `arm()` because the system log's writer thread
+    allocates in its OWN startup (std copies the thread name for the stack overflow handler), which happens
+    after `spawn` returns, so after `arm()`. FIRST fix, REVERTED at the user's request ("a debug feature
+    should be invisible to the running code"): a handshake in `std_syslog::start_queue`. FINAL fix, in the guard
+    only: `std_alloc_guard::arm()` first sleeps `SETTLE` (100 ms) so threads started during startup have
+    finished their own startup. A time based heuristic, accepted for a debug-only path: if it were ever too
+    short it would fail loudly (an abort) in a guard build, never in flight. Checked: with a settle of 0, 8 of 8
+    runs abort (exit 134); with 100 ms, runs and all 4 program tests pass with the guard armed (no allocation
+    after startup in the loop, the module, the event log writes, the log writer and the shutdown). I found it
+    with a temporary backtrace patch of the guard (reverted). `osal/src/linux/std_syslog.rs` is unchanged
+    from the commit.
+    (3) `sample-deployment/deploy/vee-sample.service` (default `Type=simple`, `StateDirectory`,
+    `WorkingDirectory`, `LogsDirectory`, `StandardError=append:/var/log/vee/system.log`, `StandardOutput=null`,
+    `WatchdogSec=5`, `Restart=on-failure`, start limit with `StartLimitAction=reboot-force` commented out) and
+    `vee-sample.logrotate` (`size 10M`, `rotate 3`, `copytruncate`, `missingok`, `notifempty`). Validated with
+    `systemd-analyze verify` and `logrotate -d`. (4) TESTED AGAINST A REAL SYSTEMD (this machine runs one; used
+    `systemd-run --user`): a control that never sends `WATCHDOG=1` is killed after 1.1 s (result `watchdog`,
+    SIGABRT); the release sample ran 4.0 s under `WatchdogSec=1` and finished `success`; the sample frozen with
+    SIGSTOP at about 1 s was killed at 2.3 s (`watchdog`). So the keep-alives reach systemd, the implicit
+    `NotifyAccess=main` lets them in, and a hung Vee is caught. NOT tested: the panic hook in the abort build
+    (the hook's own test runs unwound), `Restart=` and `StartLimitAction` (config only). Tests: 312.
+
 ## WHERE WE LEFT OFF (2026-11-20)
-Everything builds, all 308 tests pass, clippy (strict lints of item 29) and `cargo fmt --check` are
+Everything builds, all 312 tests pass, clippy (strict lints of item 29) and `cargo fmt --check` are
 clean. Committed by the user: up to `9934bdb "update docs"` (items 1 to 40). NOT yet committed:
 items 41 to 59 and the docs. The user commits.
 The user is learning Rust (comes from C++): explain syntax and generics as they come up, and follow
@@ -939,7 +985,7 @@ the TEMPORARY blocking `append`, the dropped report, then the watchdog feed), `s
 `watchdog`; `vee_core::slot::Slot<M>` is the per module bookkeeping. The OSAL has the interfaces (`clock`
 with `sleep_until_us`, `files`, `syslog`, `panic_report`, `watchdog`, `platform`), the fakes, and `linux/`
 (`std_clock`, `std_files`, `std_syslog`, `std_panic` the panic hook, `std_watchdog`, `std_alloc_guard`,
-`LinuxPlatform`). `modules/example` is the sample module. `sample-deployment` is the first executable: `start`
+`LinuxPlatform`). `modules/example` is the sample module. `sample-deployment` (S2a to S2e done) is the first executable: `start`
 (the whole start sequence), `Exec::run` (the loop: absolute boundaries, an overrun skips, logged),
 `VEE_SAMPLE_TICKS=N` to end through `Core::stop`. The software bus is DESIGNED (item 58) and not written.
 Observed in the first runs of the sample: `overrun ... skipped 1 or 2` warnings, from `Core::tick`'s blocking
@@ -948,17 +994,11 @@ service removes.
 
 ## Next
 Open choices, in the order I would do them, all for the user to pick:
-1. Sample deployment S2d: a test that runs the built binary twice in a temp directory (with
-   `VEE_SAMPLE_TICKS`) and checks the logs and the second boot's reset report (`CARGO_BIN_EXE_...`).
-2. S2e: the release profile (`panic = "abort"`, LTO, `opt-level`, `codegen-units`), the guard declared
-   under a feature in the sample's `main`, and the sample systemd unit (default `Type=simple`,
-   `WatchdogSec` longer than the startup, `Restart=on-failure`, `StartLimitBurst`, `StartLimitAction`,
-   `StandardError=append:`) and logrotate (`copytruncate`) files.
-3. The file service (thread, bounded request queues): removes the blocking `append` from `Core::tick` and the
+1. The file service (thread, bounded request queues): removes the blocking `append` from `Core::tick` and the
    overruns above. The biggest piece: a new `Platform` associated type. After it, assert `Core::tick`
    allocates nothing.
-4. The bus (item 58), state topics first, as the sample module's first real use.
-5. Time and Health (overrun detection as an event, the counters), commands (handled in the module's step,
+2. The bus (item 58), state topics first, as the sample module's first real use.
+3. Time and Health (overrun detection as an event, the counters), commands (handled in the module's step,
    item 32), the exec's stop path on SIGTERM (decided NOT to handle: item 54), the ground tool.
 Older plan, still relevant: STRETCH GOAL, only after everything else works (noted in the design doc,
 Executive Requirements): a threaded module type for slow work (image processing, say) that gets its
@@ -967,6 +1007,12 @@ Possible follow-ups: `trybuild` for the derive's compile-fail cases (adds a dev 
 the command derives (`Command`, `CmdSet`) could use the same idea (opcode = enum value).
 
 ## Decisions to remember
+- Debug and test only features (the allocation guard, fakes, the test hooks) must be invisible to the code they
+  check: no production code is added or bent to suit them (user, 2026-11-20). Put the accommodation in the debug
+  code itself.
+- `Clock` stays ONE trait, with `sleep_until_us` on it (user, after the session of item 59): modules already cannot
+  reach it (they depend only on `vee-core-api`, which does not depend on the OSAL), and the core is not meant to be
+  edited by developers, so there is no need to forbid waiting there by the type system.
 - Only boots are counted. A `Boot` with no `Shutdown` after it means the run ended `Unknown`.
 - The log is append-only and independent of systemd. A panic leaves `Unknown`.
 - Missing log: count starts at 0. Partial last record: ignored, reported as an event. Bad CRC or
@@ -997,8 +1043,6 @@ the command derives (`Command`, `CmdSet`) could use the same idea (opcode = enum
   no clock type, because `tick(now)` takes the time.
 
 ## Open questions
-- Split `Clock` into a read trait and a sleep trait, so only the executive's loop can wait (modules already
-  cannot reach it; `Slot` and `Core` could, by convention only)? Asked 2026-11-20, no answer yet.
 - Shutdown reasons beyond `Commanded` and `Signal`.
 - Whether a lone `Shutdown` as the first record of a log shorter than the tail window should be
   an error. Today it is accepted, because the reader cannot tell a cut window from a short file.

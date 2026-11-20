@@ -1,0 +1,47 @@
+# A systemd unit for the sample deployment. Install it as /etc/systemd/system/vee-sample.service,
+# with the release build (`cargo build --release`) at the ExecStart path, and the logrotate rule next to
+# it (vee-sample.logrotate). See "Faults" and "Executive Requirements" in docs/design.md for why each
+# line is here.
+
+[Unit]
+Description=Vee sample deployment
+
+# More than five starts within five minutes counts as a failed start loop, and systemd stops
+# restarting the service. On a flight computer, uncomment the action to reboot the machine then (not on
+# a development machine!). systemd's count does not survive the reboot, so a fault that persists loops:
+# the reset log's `consecutive_unclean` is how a module breaks that loop.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+#StartLimitAction=reboot-force
+
+[Service]
+# The default type, `simple`: systemd counts the service as started as soon as the program runs, and
+# its watchdog timer starts then. There is no READY=1.
+Type=simple
+ExecStart=/opt/vee/vee-sample-deployment
+
+# The sample writes its reset log and event log in its working directory. systemd makes the
+# directories and gives them to the service's user.
+StateDirectory=vee
+WorkingDirectory=/var/lib/vee
+LogsDirectory=vee
+
+# The system log (and the panic hook's last line) is stderr. Send it to a plain text file, which
+# ground tools can read and the file dump command can send down. The journal is a binary format that
+# only journalctl can read. Needs systemd 240 or newer. `append:` and not `file:`, which truncates
+# the file at every start and would erase the last run's end. The rule in vee-sample.logrotate keeps it
+# from growing for ever. Vee prints nothing on stdout.
+StandardError=append:/var/log/vee/system.log
+StandardOutput=null
+
+# Vee sends a keep-alive (WATCHDOG=1) on every tick. The timer starts with the process, so this must be
+# longer than the worst case startup (about 20 ms for the sample); it is also the time to notice a hang.
+# Setting it makes NotifyAccess default to `main`, which is what lets Vee's messages in.
+WatchdogSec=5
+
+# Restart after a crash (abort on a panic), a kill and a watchdog timeout, not after a clean exit.
+Restart=on-failure
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target

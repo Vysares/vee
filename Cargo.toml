@@ -47,3 +47,15 @@ arithmetic_side_effects = "deny" # `a + b` panics in debug and wraps in release:
 cast_possible_truncation = "deny" # `x as u8` silently drops the high bits
 cast_sign_loss = "deny"
 cast_possible_wrap = "deny"
+
+# The flight build (`cargo build --release`). A panic aborts the process: no unwinding and no recovery,
+# so a panic in any thread stops the whole process and the supervisor restarts it (see "Faults" in the
+# design). The panic hook (`std_panic`) is installed only in a build like this one, by the executive's
+# `main`, which asks `cfg!(panic = "abort")`. LTO and one codegen unit let the compiler see the whole
+# program. Measured on the sample deployment: 579 KB without these, 468 KB with them (376 KB stripped);
+# the optimization level (`s`, `z`) would save only 6% more, so it stays at the default. Symbols are kept,
+# so an address in a report can be looked up. Tests always unwind, whatever this says.
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1

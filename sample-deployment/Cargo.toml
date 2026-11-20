@@ -11,5 +11,12 @@ vee-osal = { path = "../osal" }
 vee-example = { path = "../modules/example" }
 log = { workspace = true }
 
+# `alloc-guard` makes any allocation after startup abort the process, with a fixed message. It is a
+# check for development, SIL and CI builds (`cargo test --features alloc-guard`), and a flight build
+# leaves it off: an allocation that works is a bug to find before flight, and aborting on it in
+# flight would turn that bug into an outage. See `std_alloc_guard`.
+[features]
+alloc-guard = []
+
 [lints]
 workspace = true

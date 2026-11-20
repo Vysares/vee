@@ -1,0 +1,16 @@
+# Install as /etc/logrotate.d/vee-sample. Keeps the system log that systemd writes for the sample
+# (see vee-sample.service) from growing for ever.
+#
+# `copytruncate` copies the file to system.log.1 and then empties the original in place, because
+# systemd keeps the file open: renaming it would leave systemd writing to the renamed file. A few
+# lines written between the copy and the empty are lost, which is fine for a log.
+#
+# `size` is only checked when logrotate runs, which is once a day by default. Run it from an hourly
+# timer if the log can grow past the size in less than a day.
+/var/log/vee/system.log {
+    size 10M
+    rotate 3
+    copytruncate
+    missingok
+    notifempty
+}

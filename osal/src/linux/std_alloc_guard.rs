@@ -22,10 +22,21 @@ use std::io;
 use std::io::Write as _;
 use std::process;
 use std::sync::atomic;
+use std::thread;
+use std::time;
 
 /// What is written to stderr before aborting. A fixed text: building a message could allocate,
 /// and this is the one place that must not.
 const ABORT_MESSAGE: &[u8] = b"vee: allocation after startup, aborting\n";
+
+/// How long `arm` waits for other threads to finish starting, before it arms. A new thread
+/// allocates in its own startup (std copies its name for the stack overflow handler), and that
+/// happens after `spawn` has returned to the thread that made it. So arming straight after
+/// starting a thread can catch the thread's own startup, which is not a bug in Vee. A few
+/// milliseconds is far longer than any thread needs, and only a build with the guard pays it. This
+/// is why the fix is here and not in the code that starts threads: the guard is a development check,
+/// and the code it checks should not change to suit it.
+const SETTLE: time::Duration = time::Duration::from_millis(100);
 
 /// Whether startup is over. Set once by `arm`, never cleared.
 static ARMED: atomic::AtomicBool = atomic::AtomicBool::new(false);
@@ -38,8 +49,10 @@ thread_local! {
     static ALLOCATIONS: cell::Cell<usize> = const { cell::Cell::new(0) };
 }
 
-/// Marks startup as over. After this, any allocation by any thread aborts the process.
+/// Marks startup as over. After this, any allocation by any thread aborts the process. It first
+/// waits `SETTLE`, so threads started during startup have finished their own startup.
 pub fn arm() {
+    thread::sleep(SETTLE);
     ARMED.store(true, atomic::Ordering::Release);
 }
 
