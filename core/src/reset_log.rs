@@ -781,7 +781,7 @@ mod tests {
             queue.send(core_event::SOURCE, 5, code, text);
         });
 
-        let report = queue.pop().unwrap();
+        let report = queue.log.pop().unwrap();
         assert_eq!(report.source, core_event::SOURCE);
         assert_eq!(report.code, 0);
         assert_eq!(report.severity, event::Severity::Info);
@@ -789,9 +789,9 @@ mod tests {
             report.text.as_bytes(),
             b"reset 4: prev end unknown, 1 unclean in a row"
         );
-        let partial = queue.pop().unwrap();
+        let partial = queue.log.pop().unwrap();
         assert_eq!(partial.code, 1);
         assert_eq!(partial.severity, event::Severity::Warn);
-        assert_eq!(queue.pop(), None);
+        assert_eq!(queue.log.pop(), None);
     }
 }

@@ -17,7 +17,7 @@ enum SampleEv {
 }
 
 const SOURCE: u8 = 3;
-const DEPTH: usize = ev::EV_QUEUE_DEPTH;
+const DEPTH: usize = ev::EV_LOG_QUEUE_DEPTH;
 
 fn send(queue: &mut ev::Ev, time: u64, text: fmt::Arguments<'_>) {
     queue.send(SOURCE, time, SampleEv::Started, text);
@@ -25,23 +25,23 @@ fn send(queue: &mut ev::Ev, time: u64, text: fmt::Arguments<'_>) {
 
 #[test]
 fn the_default_depth_is_1024() {
-    assert_eq!(ev::EV_QUEUE_DEPTH, 1024);
+    assert_eq!(ev::EV_LOG_QUEUE_DEPTH, 1024);
 }
 
 #[test]
 fn a_new_queue_is_empty() {
     let mut queue = ev::Ev::new();
-    assert!(queue.is_empty());
-    assert_eq!(queue.len(), 0);
-    assert_eq!(queue.pop(), None);
-    assert_eq!(queue.take_dropped(), 0);
+    assert!(queue.log.is_empty());
+    assert_eq!(queue.log.len(), 0);
+    assert_eq!(queue.log.pop(), None);
+    assert_eq!(queue.log.take_refused(), 0);
 }
 
 #[test]
 fn a_sent_event_has_the_source_time_code_severity_and_text() {
     let mut queue = ev::Ev::new();
     queue.send(SOURCE, 1_500, SampleEv::Slow, format_args!("hello"));
-    let event = queue.pop().unwrap();
+    let event = queue.log.pop().unwrap();
     assert_eq!(event.source, SOURCE);
     assert_eq!(event.monotonic_us, 1_500);
     assert_eq!(event.code, 1);
@@ -54,7 +54,10 @@ fn values_in_the_text_are_formatted_in() {
     let mut queue = ev::Ev::new();
     let (name, err) = ("log", 7);
     send(&mut queue, 0, format_args!("open {name} failed ({err})"));
-    assert_eq!(queue.pop().unwrap().text.as_bytes(), b"open log failed (7)");
+    assert_eq!(
+        queue.log.pop().unwrap().text.as_bytes(),
+        b"open log failed (7)"
+    );
 }
 
 #[test]
@@ -63,7 +66,7 @@ fn text_that_is_too_long_is_cut_off_and_marked_but_the_event_is_still_sent() {
     let long = [b'x'; event::EV_TEXT_MAX_BYTES + 10];
     let long = core::str::from_utf8(&long).unwrap();
     send(&mut queue, 0, format_args!("{long}"));
-    let event = queue.pop().unwrap();
+    let event = queue.log.pop().unwrap();
     assert_eq!(event.text.as_bytes().len(), event::EV_TEXT_MAX_BYTES);
     assert_eq!(
         event.text.as_bytes().last(),
@@ -85,7 +88,7 @@ impl fmt::Display for Fails {
 fn a_value_that_fails_to_print_still_gives_an_event_with_the_text_so_far() {
     let mut queue = ev::Ev::new();
     send(&mut queue, 0, format_args!("got {}", Fails));
-    assert_eq!(queue.pop().unwrap().text.as_bytes(), b"got ab");
+    assert_eq!(queue.log.pop().unwrap().text.as_bytes(), b"got ab");
 }
 
 #[test]
@@ -94,11 +97,11 @@ fn events_come_out_oldest_first() {
     for time in [10, 20, 30] {
         send(&mut queue, time, format_args!("e"));
     }
-    assert_eq!(queue.len(), 3);
+    assert_eq!(queue.log.len(), 3);
     for time in [10, 20, 30] {
-        assert_eq!(queue.pop().unwrap().monotonic_us, time);
+        assert_eq!(queue.log.pop().unwrap().monotonic_us, time);
     }
-    assert_eq!(queue.pop(), None);
+    assert_eq!(queue.log.pop(), None);
 }
 
 #[test]
@@ -108,12 +111,12 @@ fn a_full_queue_drops_the_new_event_keeps_the_old_ones_and_counts() {
     for time in 0..DEPTH as u64 + 2 {
         send(&mut queue, time, format_args!("e"));
     }
-    assert_eq!(queue.len(), DEPTH);
+    assert_eq!(queue.log.len(), DEPTH);
     for time in 0..DEPTH as u64 {
-        assert_eq!(queue.pop().unwrap().monotonic_us, time);
+        assert_eq!(queue.log.pop().unwrap().monotonic_us, time);
     }
-    assert_eq!(queue.pop(), None);
-    assert_eq!(queue.take_dropped(), 2);
+    assert_eq!(queue.log.pop(), None);
+    assert_eq!(queue.log.take_refused(), 2);
 }
 
 #[test]
@@ -122,8 +125,8 @@ fn taking_the_dropped_count_starts_it_again_from_zero() {
     for time in 0..DEPTH as u64 + 3 {
         send(&mut queue, time, format_args!("e"));
     }
-    assert_eq!(queue.take_dropped(), 3);
-    assert_eq!(queue.take_dropped(), 0);
+    assert_eq!(queue.log.take_refused(), 3);
+    assert_eq!(queue.log.take_refused(), 0);
 }
 
 #[test]
@@ -132,8 +135,19 @@ fn a_slot_freed_by_pop_can_be_used_again() {
     for time in 0..DEPTH as u64 {
         send(&mut queue, time, format_args!("e"));
     }
-    queue.pop().unwrap();
+    queue.log.pop().unwrap();
     send(&mut queue, 100, format_args!("e"));
-    assert_eq!(queue.take_dropped(), 0);
-    assert_eq!(queue.len(), DEPTH);
+    assert_eq!(queue.log.take_refused(), 0);
+    assert_eq!(queue.log.len(), DEPTH);
+}
+
+#[test]
+fn peek_shows_the_next_event_for_the_log_without_taking_it() {
+    let mut queue = ev::Ev::new();
+    send(&mut queue, 7, format_args!("first"));
+    send(&mut queue, 8, format_args!("second"));
+    assert_eq!(queue.log.peek().unwrap().monotonic_us, 7);
+    assert_eq!(queue.log.len(), 2);
+    assert_eq!(queue.log.pop().unwrap().monotonic_us, 7);
+    assert_eq!(queue.log.peek().unwrap().monotonic_us, 8);
 }

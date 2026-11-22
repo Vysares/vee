@@ -22,16 +22,16 @@
 //! the same function, so it cannot be forgotten. Starting the thread allocates, so it must come
 //! before `started`. If it fails, the logger stays in direct mode and the executive reports it.
 
+use crate::channel;
 use crate::clock::Clock as _;
 use crate::linux::std_clock;
 use crate::syslog;
+use crate::thread;
 use std::fmt;
 use std::io;
 use std::io::Write as _;
 use std::sync;
 use std::sync::atomic;
-use std::sync::mpsc;
-use std::thread;
 use std::time;
 
 /// How many lines the queue holds before `emit` starts dropping new ones. It is also the most
@@ -50,7 +50,7 @@ pub enum StartError {
     AlreadyStarted,
     /// The OS would not start the writer thread (a limit on threads or memory, say). The logger
     /// is still in direct mode.
-    Thread(io::Error),
+    Thread(thread::SpawnError),
 }
 
 impl fmt::Display for StartError {
@@ -58,7 +58,7 @@ impl fmt::Display for StartError {
         match self {
             StartError::NotInstalled => f.write_str("the system log is not installed"),
             StartError::AlreadyStarted => f.write_str("the log queue was started already"),
-            StartError::Thread(error) => write!(f, "cannot start the log writer: {error}"),
+            StartError::Thread(error) => write!(f, "log writer: {error}"),
         }
     }
 }
@@ -68,7 +68,7 @@ struct Logger {
     clock: std_clock::StdClock,
     /// The queue's sending end. Empty means direct mode: `emit` writes to stderr itself. Once
     /// `start_queue` has filled it, `emit` pushes into it instead.
-    queue: sync::OnceLock<mpsc::SyncSender<syslog::LineBuf>>,
+    queue: sync::OnceLock<channel::Sender<syslog::LineBuf>>,
     /// How many lines `emit` has dropped because the queue was full, not yet reported. It wraps
     /// after 4 billion, which is not a concern.
     dropped: atomic::AtomicU32,
@@ -87,47 +87,42 @@ impl Logger {
     /// `emit` use the queue, so a line is never queued without a writer. On an error the logger
     /// stays as it was.
     ///
-    /// The writer thread is not joined: it runs for the rest of the process.
+    /// The writer thread is not joined and never ends: it runs for the rest of the process,
+    /// because the logger, which holds the queue's sending end, lives that long too. So the queue
+    /// is never closed, and the writer does not look for it. It is called once, at startup, from
+    /// one thread: a second call is refused before anything is made.
     fn start_queue(&'static self) -> Result<(), StartError> {
-        let (sender, receiver) = mpsc::sync_channel(QUEUE_DEPTH);
-        thread::Builder::new()
-            .name("vee-syslog".into())
-            .spawn(move || {
-                let mut out = io::stderr();
-                while self.drain(&receiver, &mut out) {
-                    thread::sleep(POLL);
-                }
-            })
-            .map_err(StartError::Thread)?;
-        // If another call got here first, `sender` comes back in the error and is dropped here.
-        // The thread just started then sees a closed queue and ends.
+        if self.queue.get().is_some() {
+            return Err(StartError::AlreadyStarted);
+        }
+        let (sender, receiver) = channel::channel(QUEUE_DEPTH);
+        thread::spawn("vee-syslog", move || {
+            let mut out = io::stderr();
+            loop {
+                self.drain(&receiver, &mut out);
+                std::thread::sleep(POLL);
+            }
+        })
+        .map_err(StartError::Thread)?;
         self.queue
             .set(sender)
             .map_err(|_| StartError::AlreadyStarted)
     }
 
     /// One pass of the writer: writes the lines that are queued (at most `QUEUE_DEPTH`) to
-    /// `out`, then reports how many lines `emit` dropped since the last pass. Returns `false`
-    /// once the queue is closed, which means the writer should stop.
+    /// `out`, then reports how many lines `emit` dropped since the last pass.
     ///
     /// The report is written straight to `out`, not through the queue, which may be full.
     #[allow(
         clippy::let_underscore_must_use,
         reason = "if the output cannot be written to there is nowhere else to report it"
     )]
-    fn drain(&self, receiver: &mpsc::Receiver<syslog::LineBuf>, out: &mut impl io::Write) -> bool {
-        let mut open = true;
+    fn drain(&self, receiver: &channel::Receiver<syslog::LineBuf>, out: &mut impl io::Write) {
         for _ in 0..QUEUE_DEPTH {
-            match receiver.try_recv() {
-                Ok(line) => {
-                    let _ = out.write_all(line.as_bytes());
-                }
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    open = false;
-                    break;
-                }
-            }
+            let Some(line) = receiver.try_recv() else {
+                break;
+            };
+            let _ = out.write_all(line.as_bytes());
         }
         let dropped = self.dropped.swap(0, atomic::Ordering::Relaxed);
         if dropped > 0 {
@@ -139,7 +134,6 @@ impl Logger {
             });
             let _ = out.write_all(report.as_bytes());
         }
-        open
     }
 
     /// Writes one record out, in the current mode. This is `log` without the level check.
@@ -165,8 +159,8 @@ impl Logger {
             None => {
                 let _ = io::stderr().lock().write_all(buf.as_bytes());
             }
-            // Queued mode: `try_send` never waits. If the queue is full (or the writer is gone)
-            // it hands the line back, and the line is dropped and counted. The oldest lines
+            // Queued mode: `try_send` never waits. If the queue is full it hands the line back, and
+            // the line is dropped and counted. The oldest lines
             // stay, as with events: the first lines of a problem are the most useful.
             Some(queue) => {
                 if queue.try_send(buf).is_err() {
@@ -227,6 +221,7 @@ pub fn start_queue() -> Result<(), StartError> {
 #[cfg(test)]
 mod tests {
     use super as std_syslog;
+    use crate::channel;
     use crate::linux::std_alloc_guard;
     use crate::linux::std_clock;
     use crate::syslog;
@@ -234,12 +229,11 @@ mod tests {
     use std::fmt;
     use std::io;
     use std::sync::atomic;
-    use std::sync::mpsc;
 
     /// A logger in queued mode with a queue of `depth` lines, and the receiving end. It is not the
     /// global logger, and tests call `emit` on it, which skips the global level check.
-    fn queued_logger(depth: usize) -> (std_syslog::Logger, mpsc::Receiver<syslog::LineBuf>) {
-        let (sender, receiver) = mpsc::sync_channel(depth);
+    fn queued_logger(depth: usize) -> (std_syslog::Logger, channel::Receiver<syslog::LineBuf>) {
+        let (sender, receiver) = channel::channel(depth);
         let logger = std_syslog::Logger::new(std_clock::StdClock::new());
         assert!(logger.queue.set(sender).is_ok());
         (logger, receiver)
@@ -273,17 +267,17 @@ mod tests {
         // The oldest line is the one kept.
         let buf = receiver.try_recv().unwrap();
         assert!(buf.as_bytes().ends_with(b"t: one\n"));
-        assert!(receiver.try_recv().is_err());
+        assert!(receiver.try_recv().is_none());
     }
 
-    /// One writer pass into a buffer: whether the queue is still open, and what was written.
+    /// One writer pass into a buffer, and what was written.
     fn drained(
         logger: &std_syslog::Logger,
-        receiver: &mpsc::Receiver<syslog::LineBuf>,
-    ) -> (bool, String) {
+        receiver: &channel::Receiver<syslog::LineBuf>,
+    ) -> String {
         let mut out = Vec::new();
-        let open = logger.drain(receiver, &mut out);
-        (open, String::from_utf8(out).unwrap())
+        logger.drain(receiver, &mut out);
+        String::from_utf8(out).unwrap()
     }
 
     #[test]
@@ -291,8 +285,7 @@ mod tests {
         let (logger, receiver) = queued_logger(4);
         emit(&logger, format_args!("a"));
         emit(&logger, format_args!("b"));
-        let (open, text) = drained(&logger, &receiver);
-        assert!(open);
+        let text = drained(&logger, &receiver);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2);
         assert!(lines[0].ends_with("t: a"));
@@ -305,7 +298,7 @@ mod tests {
         for message in ["one", "two", "three"] {
             emit(&logger, format_args!("{message}"));
         }
-        let (_, text) = drained(&logger, &receiver);
+        let text = drained(&logger, &receiver);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2);
         assert!(lines[0].ends_with("t: one"));
@@ -313,7 +306,7 @@ mod tests {
         assert!(lines[1].contains(" WARN "));
         // The count was taken, so the next pass has nothing to report.
         assert_eq!(logger.dropped.load(atomic::Ordering::Relaxed), 0);
-        let (_, text) = drained(&logger, &receiver);
+        let text = drained(&logger, &receiver);
         assert_eq!(text, "");
     }
 
@@ -324,19 +317,13 @@ mod tests {
         for _ in 0..std_syslog::QUEUE_DEPTH + extra {
             emit(&logger, format_args!("x"));
         }
-        let (_, text) = drained(&logger, &receiver);
+        let text = drained(&logger, &receiver);
         assert_eq!(text.lines().count(), std_syslog::QUEUE_DEPTH);
-        assert_eq!(receiver.try_iter().count(), extra); // left for the next pass
-    }
-
-    #[test]
-    fn a_pass_says_to_stop_when_the_queue_is_closed() {
-        let logger = std_syslog::Logger::new(std_clock::StdClock::new());
-        let (sender, receiver) = mpsc::sync_channel::<syslog::LineBuf>(1);
-        drop(sender);
-        let (open, text) = drained(&logger, &receiver);
-        assert!(!open);
-        assert_eq!(text, "");
+        let mut left = 0;
+        while receiver.try_recv().is_some() {
+            left += 1;
+        }
+        assert_eq!(left, extra); // left for the next pass
     }
 
     #[test]
@@ -367,7 +354,7 @@ mod tests {
         emit(&logger, format_args!("two")); // dropped, so the pass also writes the report
         let mut out = io::sink(); // a `Vec` would allocate as it grows
         let before = std_alloc_guard::allocations_on_this_thread();
-        assert!(logger.drain(&receiver, &mut out));
+        logger.drain(&receiver, &mut out);
         let after = std_alloc_guard::allocations_on_this_thread();
         assert_eq!(after, before);
     }

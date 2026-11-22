@@ -7,6 +7,7 @@ pub mod crc;
 pub mod ctx;
 pub mod ev;
 pub mod event;
+pub mod file;
 pub mod fixed_str;
 pub mod module;
 pub mod queue;

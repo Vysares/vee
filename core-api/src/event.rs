@@ -17,7 +17,9 @@ pub use vee_core_derive::Code;
 
 /// How important an event is. Each event code has one severity, fixed where the code is defined,
 /// so the caller of `ctx.ev.send` never picks it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The order is the severity: `Info` is the least and `Err` the most, so a filter can say "this and
+/// worse" with `>=`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Severity {
     Info,
     Warn,

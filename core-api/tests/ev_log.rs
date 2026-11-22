@@ -107,13 +107,13 @@ fn text_that_was_cut_off_is_written_as_it_was_cut() {
 fn an_event_the_full_queue_drops_is_still_written() {
     install();
     let mut queue = ev::Ev::new();
-    for _ in 0..ev::EV_QUEUE_DEPTH {
+    for _ in 0..ev::EV_LOG_QUEUE_DEPTH {
         queue.send(1, 0, SampleEv::Started, format_args!("fill"));
     }
-    assert_eq!(queue.take_dropped(), 0);
+    assert_eq!(queue.log.take_refused(), 0);
 
     queue.send(1, 0, SampleEv::Started, format_args!("marker-overflow"));
 
-    assert_eq!(queue.take_dropped(), 1); // the queue did not take it
+    assert_eq!(queue.log.take_refused(), 1); // the queue did not take it
     assert_eq!(lines_with("marker-overflow").len(), 1); // but the log has it
 }

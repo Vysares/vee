@@ -83,6 +83,13 @@ impl<const N: usize> FixedStr<N> {
     pub fn as_bytes(&self) -> &[u8] {
         &self.0[..text_len(&self.0)]
     }
+
+    /// Just the text, without the padding, as a `&str`. The text is ASCII (every way to make a
+    /// `FixedStr` checks that), which is always valid UTF-8, so this cannot fail. If it somehow did,
+    /// the result is the empty string, which any caller treats as having no text.
+    pub fn as_str(&self) -> &str {
+        core::str::from_utf8(self.as_bytes()).unwrap_or_default()
+    }
 }
 
 /// The index of the first zero byte, or the whole length if there is none.
@@ -161,6 +168,13 @@ mod tests {
         };
         write!(out, "{text}").unwrap();
         (out.bytes, out.len)
+    }
+
+    #[test]
+    fn as_str_is_the_text_without_the_padding() {
+        let text = fixed_str::FixedStr::<8>::truncated("abc").unwrap();
+        assert_eq!(text.as_str(), "abc");
+        assert_eq!(fixed_str::FixedStr::<8>::EMPTY.as_str(), "");
     }
 
     #[test]

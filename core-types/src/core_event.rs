@@ -53,9 +53,9 @@ pub enum CoreEvent {
     #[severity(Err)]
     EventsSuppressed,
 
-    /// The event queue was full, so events were dropped. The text has how many. The events
-    /// themselves are not kept, only this count: the newest events of the burst are the lost
-    /// ones (the queue keeps the oldest). They were still written to the system log, which has
+    /// An event queue was full, so events were dropped. The text has how many and which queue
+    /// (`log` or `telemetry`). The events themselves are not kept, only this count: the newest
+    /// events of the burst are the lost ones (the queue keeps the oldest). They were still written to the system log, which has
     /// every event as it was sent. See `EventsSuppressed` for the limit on each source, which
     /// is meant to make this rare.
     #[severity(Err)]

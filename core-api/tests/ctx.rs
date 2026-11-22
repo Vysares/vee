@@ -107,14 +107,14 @@ fn run_step<M: module::Module>(
 fn a_module_sees_how_the_last_run_ended_through_ctx() {
     let (mut ev, mut throttle) = (ev::Ev::new(), throttle::Throttle::new());
     run_init(&mut Counter { steps: 0 }, &mut ev, &mut throttle, 7, 100);
-    assert_eq!(ev.pop().unwrap().text.as_bytes(), b"started, boot 3");
+    assert_eq!(ev.log.pop().unwrap().text.as_bytes(), b"started, boot 3");
 }
 
 #[test]
 fn an_event_has_the_modules_source_the_time_of_the_call_and_the_codes_severity() {
     let (mut ev, mut throttle) = (ev::Ev::new(), throttle::Throttle::new());
     run_step(&mut Counter { steps: 0 }, &mut ev, &mut throttle, 7, 2_500);
-    let event = ev.pop().unwrap();
+    let event = ev.log.pop().unwrap();
     assert_eq!(event.source, 7);
     assert_eq!(event.monotonic_us, 2_500);
     assert_eq!(event.code, 1);
@@ -128,16 +128,16 @@ fn the_module_cannot_choose_its_source_the_executive_does() {
     let (mut ev, mut throttle) = (ev::Ev::new(), throttle::Throttle::new());
     run_init(&mut Counter { steps: 0 }, &mut ev, &mut throttle, 4, 0);
     run_init(&mut Counter { steps: 0 }, &mut ev, &mut throttle, 9, 0);
-    assert_eq!(ev.pop().unwrap().source, 4);
-    assert_eq!(ev.pop().unwrap().source, 9);
+    assert_eq!(ev.log.pop().unwrap().source, 4);
+    assert_eq!(ev.log.pop().unwrap().source, 9);
 }
 
 #[test]
 fn every_event_in_one_call_has_the_same_time() {
     let (mut ev, mut throttle) = (ev::Ev::new(), throttle::Throttle::new());
     run_step(&mut Noisy, &mut ev, &mut throttle, 1, 42);
-    assert!(ev.len() > 1);
-    while let Some(event) = ev.pop() {
+    assert!(ev.log.len() > 1);
+    while let Some(event) = ev.log.pop() {
         assert_eq!(event.monotonic_us, 42);
     }
 }
@@ -156,8 +156,8 @@ fn a_module_keeps_its_own_state_between_calls_and_each_call_has_its_own_time() {
     let mut module = Counter { steps: 0 };
     run_step(&mut module, &mut ev, &mut throttle, 1, 10_000);
     run_step(&mut module, &mut ev, &mut throttle, 1, 20_000);
-    assert_eq!(ev.pop().unwrap().text.as_bytes(), b"step 1 at 10000");
-    assert_eq!(ev.pop().unwrap().text.as_bytes(), b"step 2 at 20000");
+    assert_eq!(ev.log.pop().unwrap().text.as_bytes(), b"step 1 at 10000");
+    assert_eq!(ev.log.pop().unwrap().text.as_bytes(), b"step 2 at 20000");
 }
 
 #[test]
@@ -168,7 +168,7 @@ fn an_event_sent_too_often_in_a_tick_is_not_queued_and_is_counted() {
     // `LIMIT` spam events and the one quiet event got through.
     let mut spam = 0;
     let mut quiet = 0;
-    while let Some(event) = ev.pop() {
+    while let Some(event) = ev.log.pop() {
         match event.code {
             0 => spam += 1,
             1 => quiet += 1,
@@ -193,9 +193,9 @@ fn the_limit_is_available_again_in_the_next_tick() {
     let (mut ev, mut throttle) = (ev::Ev::new(), throttle::Throttle::new());
     run_step(&mut Noisy, &mut ev, &mut throttle, 1, 0);
     throttle.new_tick(|_: NoisyEv, _| {});
-    while ev.pop().is_some() {}
+    while ev.log.pop().is_some() {}
     run_step(&mut Noisy, &mut ev, &mut throttle, 1, 10_000);
-    assert_eq!(ev.len(), usize::from(LIMIT) + 1);
+    assert_eq!(ev.log.len(), usize::from(LIMIT) + 1);
 }
 
 #[test]
@@ -213,7 +213,7 @@ fn a_noisy_module_does_not_throttle_another_modules_events() {
         0,
     );
     let mut from_counter = 0;
-    while let Some(event) = ev.pop() {
+    while let Some(event) = ev.log.pop() {
         if event.source == 2 {
             from_counter += 1;
         }

@@ -8,8 +8,9 @@
 //!   not have to generate that logic, only the list of slots and their order.
 //! - `Exec` is the part `exec!` generates: one field for each module, and a `tick` that does the
 //!   same three steps for every module, in order.
-//! - `core.tick(now)` is the core's step: it takes the events out of the queue and writes them to
-//!   the event log (for now with a blocking write, until the file service exists).
+//! - `core.tick(now)` is the core's step: it sends the queued events to the event log's writer,
+//!   which appends them on its own thread, so the test waits for the write (`flush_event_log`)
+//!   before it reads the log.
 //! - `Exec::new` is the core's startup, `vee_core::Core::start` (the reset log and the event log),
 //!   so the first event of the run is the core's reset report.
 //! - Not here yet: commands, the bus, the other core services, and the end of the real startup
@@ -241,6 +242,7 @@ impl Exec {
     fn logged(&mut self) -> Vec<event::Event> {
         let now = self.tick.saturating_add(1).saturating_mul(TICK_US);
         self.core.tick(now);
+        self.core.flush_event_log(now); // the write is on the worker's thread: wait for it
         self.event_log()
     }
 }
@@ -388,19 +390,17 @@ fn each_tick_has_the_core_report_first_then_the_modules_in_order() {
 #[test]
 fn a_clean_stop_writes_the_last_ticks_events_and_the_next_start_sees_a_clean_end() {
     let mut exec = run(2);
-    let before = exec.event_log();
+    // The last tick's module events are still queued (the core has not ticked since).
+    assert!(!exec.core.ev.log.is_empty());
 
     exec.stop();
 
-    // The last tick's module events were still queued. Now they are all in the log, and the
-    // queue is empty.
+    // Now they are all in the log, and the queue is empty.
     let after = exec.event_log();
-    assert!(exec.core.ev.is_empty());
-    assert!(after.len() > before.len());
+    assert!(exec.core.ev.log.is_empty());
     let last = after.last().unwrap();
     assert_eq!((last.source, text(last)), (NOISY, "quiet"));
     assert_eq!(last.monotonic_us, 2 * TICK_US + 2 * MODULE_COST_US); // tick 1, the third call
-    assert!(before.last().unwrap().monotonic_us < last.monotonic_us);
 
     // The next boot, on a copy of what this run left in the reset log, sees a clean end.
     let files = fake_files::FakeFiles::new();

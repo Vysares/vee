@@ -15,7 +15,7 @@ use core::marker::PhantomData;
 /// struct says it is about `F` without holding one, which Rust requires for an unused parameter.
 pub struct FakePlatform<F = fake_files::FakeFiles>(PhantomData<F>);
 
-impl<F: files::Files> platform::Platform for FakePlatform<F> {
+impl<F: files::Files + Clone + Send + 'static> platform::Platform for FakePlatform<F> {
     type Files = F;
     type Watchdog = fake_watchdog::FakeWatchdog;
 }

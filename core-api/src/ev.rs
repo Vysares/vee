@@ -8,8 +8,11 @@
 //! `Ev::send`, so a module cannot claim another module's id. The core's own code (such as
 //! `reset_log::report`) calls `send` with `core_event::SOURCE`.
 //!
-//! Who calls what: a sender calls `send`. The event log and the downlink call `pop` to take the
-//! oldest event, and the log calls `take_dropped` to find out how many events did not fit.
+//! Who calls what: a sender calls `send`, which puts the event in the log queue. The event log's
+//! writer takes the events out of it (looking at the next one with `peek` and taking it with
+//! `pop` once it has room for it), and the core sends what the queue refused (`take_refused`) on
+//! as events. Other consumers of events (the downlink, FDIR) are subscribers on the bus, which the
+//! executive feeds from the events a module sent, right after that module's step.
 
 use crate::config;
 use crate::event;
@@ -18,33 +21,33 @@ use core::fmt;
 use core::fmt::Write as _;
 
 config::setting! {
-    /// How many events the event queue holds. Events wait in it until the event log and the
-    /// downlink take them, so it has to cover a burst between two turns of the loop. It is the
-    /// same for the whole system, because there is only one queue. Each slot is 80 bytes with the
-    /// default `EV_TEXT_MAX_BYTES` of 64 (the 12 byte envelope and the text, rounded up to a
-    /// multiple of 8), so the default of 1024 is 80 KiB. There is no per source cap, so the worst
-    /// case in one tick is
-    /// every source sending every one of its events `EV_MAX_PER_TICK` times; size for that.
-    pub EV_QUEUE_DEPTH: usize = 1024, 1..=65535;
+    /// How many events the LOG queue holds. Every event goes into it, and the event log's writer
+    /// takes them out when its file service is free, so it is where a burst waits, and where a
+    /// stalled disk is ridden out until it is full. Each slot is 80 bytes with the default
+    /// `EV_TEXT_MAX_BYTES` of 64 (the 12 byte envelope and the text, rounded up to a multiple of
+    /// 8), so the default of 1024 is 80 KiB. There is no per source cap, so the worst case in one
+    /// tick is every source sending every one of its events `EV_MAX_PER_TICK` times.
+    pub EV_LOG_QUEUE_DEPTH: usize = 1024, 1..=65535;
 }
 
-/// A first-in first-out queue of up to `EV_QUEUE_DEPTH` events, and a count of the events that
-/// did not fit. Nothing is allocated.
+/// The event service: the log queue. Nothing is allocated.
 ///
 /// This is the core's, not a module's. It is `pub` and lives in this crate only because `Ctx`
 /// (which modules see) holds the handle `ctx.ev`, and that handle holds a `&mut Ev`. A module
 /// reaches it only through `ctx.ev.send`.
+///
+/// The queue is `pub` so that its consumer (the log writer) uses it directly: `ev.log.peek()`,
+/// `ev.log.pop()`, `ev.log.take_refused()`. A full queue refuses the new event (the oldest are
+/// kept, because the first events of a problem are the most useful), and counts it.
 pub struct Ev {
-    queue: queue::Queue<event::Event, EV_QUEUE_DEPTH>,
-    /// Events that were sent while the queue was full, since `take_dropped` was last called.
-    dropped: u32,
+    /// Every event: the log is the on board record.
+    pub log: queue::Queue<event::Event, EV_LOG_QUEUE_DEPTH>,
 }
 
 impl Ev {
     pub const fn new() -> Self {
         Ev {
-            queue: queue::Queue::new(),
-            dropped: 0,
+            log: queue::Queue::new(),
         }
     }
 
@@ -59,8 +62,8 @@ impl Ev {
     /// - Text that is too long is cut off and ends in `~`. The event is still sent.
     /// - If a value in the text fails to print, the text up to that point is kept. The event is
     ///   still sent.
-    /// - If the queue is full, the new event is dropped (the oldest are kept, because the first
-    ///   events of a problem are the most useful) and counted in `dropped`.
+    /// - If the queue is full, the new event is not put in it, and the queue counts it
+    ///   (`take_refused`).
     pub fn send<C: event::Code>(
         &mut self,
         source: u8,
@@ -96,31 +99,13 @@ impl Ev {
             event.monotonic_us,
             event.text
         );
-        // `push` gives the event back if the queue is full. Here it is dropped and counted.
-        if self.queue.push(event).is_err() {
-            self.dropped = self.dropped.saturating_add(1);
-        }
-    }
-
-    /// Takes the oldest event out of the queue, or `None` if it is empty.
-    pub fn pop(&mut self) -> Option<event::Event> {
-        self.queue.pop()
-    }
-
-    /// How many events are waiting.
-    pub fn len(&self) -> usize {
-        self.queue.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.queue.is_empty()
-    }
-
-    /// How many events were dropped because the queue was full, since this was last called. The
-    /// count starts again from 0. The event log sends it on as an event, so a loss is never
-    /// silent.
-    pub fn take_dropped(&mut self) -> u32 {
-        core::mem::take(&mut self.dropped)
+        // `push` gives the event back if the queue is full, and counts the refusal. Here the
+        // event is dropped, so the count is all that is left of it.
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "a refused event is dropped on purpose, and the queue has counted it"
+        )]
+        let _ = self.log.push(event);
     }
 }
 

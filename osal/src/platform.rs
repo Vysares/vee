@@ -12,8 +12,10 @@ use crate::files;
 use crate::watchdog;
 
 pub trait Platform {
-    /// The file system: the logs, tables and the like.
-    type Files: files::Files;
+    /// The file system: the logs, tables and the like. The core keeps one handle and gives each file
+    /// service's worker thread its own (a `clone`, which is another handle to the same files), so it
+    /// can be sent to a thread.
+    type Files: files::Files + Clone + Send + 'static;
     /// How the supervisor is told that Vee is alive.
     type Watchdog: watchdog::Watchdog;
 }

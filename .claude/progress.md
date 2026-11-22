@@ -971,8 +971,226 @@ Size on 2026-11-17 (cloc, working tree, no target dir): 14 Rust files, 1729 line
     `NotifyAccess=main` lets them in, and a hung Vee is caught. NOT tested: the panic hook in the abort build
     (the hook's own test runs unwound), `Restart=` and `StartLimitAction` (config only). Tests: 312.
 
+62. **File service F1: the shared vocabulary** (`core-api/src/file.rs`, new; `FixedStr::as_str` added). Decided with the
+    user after a design discussion (the OSAL keeps ONLY OS implementations and the wrappers over them; the file
+    service is the core's and owns its own error type, which is a superset of the OS's: `Busy`, `TimedOut`;
+    modules see only core-api types; the dependency table in design.md does not change, osal still depends on
+    nothing). `file::Error { NotFound, PermissionDenied, StorageFull, TooLarge, InvalidPath, Busy, TimedOut, Other }`
+    (with `Display`, `core::error::Error`), `Tag { source: u8, number: u32 }` (the client's id, same space as an
+    event's source, 0 is the core, and the client's own number), `Data` (inline `[u8; FILE_DATA_MAX_BYTES]` and a
+    `len`, private fields so the bytes after `len` are zero and the derived `==` is right; `EMPTY`, `new`, `add_bytes`
+    (all or nothing; named by the user over `push`, which read like `Queue::push`, `extend_from_slice` and `append`,
+    which clashes with `Op::Append`: it builds ONE request's payload), `as_slice`, `len`, `is_empty`, `Default`; NOT `Copy`; `Debug` shows the length), `Path`
+    (`FixedStr<FILE_PATH_MAX_BYTES>`) and `file::path(&str)` (strict: empty or non ASCII is `InvalidPath`, too long
+    is `TooLarge`, NEVER cut: a cut path names another file), `Op { Append, WriteFile, ReadFile }` (the three
+    things `Files` can do; `Delete` waits until `Files` can), `Request { tag, op }`, `Response { tag, result:
+    Result<Data, Error> }` (`Ok` holds the bytes for a read, empty otherwise). Settings: `file::FILE_DATA_MAX_BYTES`
+    (`VEE_FILE_DATA_MAX_BYTES`, 4096, 1..=65536) and `file::FILE_PATH_MAX_BYTES` (`VEE_FILE_PATH_MAX_BYTES`, 128,
+    1..=1024); both in the sample's `.cargo/config.toml`. A request is about 4.2 KiB, so a queue of 8 is about 33 KiB
+    (arithmetic, plus a test that a request is at most the data plus the path plus 64 bytes). QUEUE DEPTH (decided in the F1 discussion): depth = the sum of every client's max in flight requests, each
+    enforced by a per client `Pending` table (a client at its cap gets `Busy` without touching the shared queue), so
+    the queue cannot overflow by construction; caps today: event log 1, tables 2, modules as configured; the setting
+    defaults to 8; `exec!` will compute and check the sum later. The `Service` trait
+    (submit and poll) is NOT here yet: it comes with the code that needs it (F3/F5). 9 new tests in `file` and 1 in
+    `fixed_str`; core-api: 79 + 7 + 9 + 10 + 4. The file service plan: F1 types (done), F2 OSAL channel and
+    thread primitives, F3 the service in the core (a pure `handle(files, request)` and the worker thread), F4 the
+    event log writer (removes the blocking `append` and the overruns), F5 `ctx.file`, routing, timeouts.
+
+63. **File service F2: the OSAL's thread primitives** (`osal/src/channel.rs` and `osal/src/thread.rs`, new, TOP LEVEL
+    concrete wrappers over std, file agnostic). Placement decided with the user: they were first written in
+    `linux/` (as `std_channel`, `std_thread`) and MOVED to top level because they use only std (not Linux), nothing
+    implements them twice, tests use real threads, and a trait would need generic associated types for the message
+    type; a bare metal port would change these two files and could introduce a trait then. `lib.rs` documents them as
+    the exception to "interface files use only `core`"; design.md (OSAL Requirements) says so too.
+    `channel::channel::<T>(depth) -> (Sender<T>, Receiver<T>)` wraps `mpsc::sync_channel` (a depth of 0 becomes 1:
+    for `mpsc` 0 means a rendezvous): `Sender::try_send(item) -> Result<(), T>` (full OR the receiver gone gives the
+    item back, like `Queue::push`; not told apart), `Receiver::try_recv() -> Option<T>` (returns at once),
+    `Receiver::recv() -> Option<T>` (WAITS; `None` once the sender is gone and the queue empty, which is how a worker
+    learns to stop). One sender, not `Clone`. Items move by value: a test sends and receives a `[u8; 4096]` with ZERO
+    allocations; `channel` allocates once. `thread::spawn(name, work) -> Result<(), SpawnError>` (`SpawnError` wraps
+    the `io::Error`, with `Display` and `source`; the thread is not joined; never panics on a refused thread). No
+    `recv_timeout` yet: it comes with the shutdown flush that needs it. 9 tests (7 channel, 2 thread; osal: 100 + 2
+    + 1). Next: F3, the service in the core (using `vee_osal::channel` and `vee_osal::thread` directly).
+
+64. **File service F3: the service in the core** (`core/src/file_service.rs`, new; `FakeFiles` made cloneable). `FileService::
+    start(files: F: Files + Send + 'static) -> Result<FileService, thread::SpawnError>` makes the two queues
+    (`FILE_QUEUE_DEPTH`, a core setting, `VEE_FILE_QUEUE_DEPTH`, default 8, 1..=256, in the sample config) and the
+    worker thread `vee-file` (via `vee_osal::channel` and `thread`, used directly); `submit(request) ->
+    Result<(), Request>` (full or worker gone: the request comes back; `#[allow(clippy::result_large_err)]` with a
+    reason) and `poll() -> Option<Response>`, both non blocking. The worker: `recv` (waits), `handle`, `try_send` the
+    response; a response that cannot be queued is dropped with `log::error!` (it cannot happen if clients keep to
+    their limits); it ends when the service is dropped (the request queue closes). `pub fn handle(files, request) ->
+    Response` is the pure part (Append, WriteFile, ReadFile through `Files`; a read uses a 4 KiB stack buffer;
+    `error_from(FileError) -> file::Error`, a function and not a `From` impl because neither type is the core's
+    own, orphan rule). QUEUE DEPTH RULE (module docs): depth >= sum over clients of each client's limit on
+    outstanding requests; each client enforces its own (the `Pending` table, NOT written yet, F4/F5), so the
+    queues cannot overflow; the request queue can physically hold one more (the worker holds one) but the response
+    queue cannot, which a test of the full queue found (it overfilled the responses and the worker dropped one: the
+    fix was a permit gate so the test takes each response before the next). `FakeFiles` is now `Clone` (an `Arc`
+    inside: a clone is another handle to the SAME files) with `handles()` for tests (a first version of the
+    worker-ends test was vacuous: it counted a fresh Arc; mutation checked: leaking the service now fails it).
+    Tests: 8 unit (handle, the error mapping) and 6 in `core/tests/file_service.rs` (a request and its tag, an
+    error and carrying on, order, a full queue hands the request back whole and nothing is lost, the worker ends on
+    drop, submit and poll allocate nothing, with the guard as the test program's allocator); stable over 6 runs.
+    design.md now has a "File Service" section (the seventh service had a table row but no section). A 7th thread test covers the worker's own `log::error!` (a response that does not fit): it submits two requests more
+    than the response queue holds without polling, installs a capturing `log::Log` (one per test program; it looks only
+    for its own tag `source: 9`), and checks that the drops are logged by tag, that every request was still DONE (the file
+    has all the bytes), and that exactly the first `FILE_QUEUE_DEPTH` responses are there in order; mutation checked
+    (changing the message fails it). Totals: 348 tests. Not used by anything yet. Next: F3b `Pending<N>` (the per client limit and timeouts), then
+    F4 (the event log writer through the service; removes the blocking `append` and the sample's overruns).
+
+65. **The system log uses the shared OSAL `channel` and `thread`** (`osal/src/linux/std_syslog.rs`; no duplicate queue
+    and thread code any more). The user asked why the queue should ever close: in flight it never does (the global
+    logger holds the sender for the whole process, and the writer thread runs for the same time), so the
+    "is it closed" distinction was vestigial: it was used only by the `AlreadyStarted` race path (the stray writer
+    ended on a closed queue) and one test. Changes: `Logger::queue` is `OnceLock<channel::Sender<LineBuf>>`;
+    `start_queue` REFUSES a second start BEFORE it makes anything (`AlreadyStarted`), then `channel::channel` and
+    `thread::spawn("vee-syslog", ..)` with a loop that never ends; `StartError::Thread` holds a `thread::SpawnError`;
+    `drain` returns nothing (`while let` over `try_recv()`, which stays an `Option`: NO change to `channel`); the
+    test of a closed queue is deleted. 347 tests. The user's larger idea (move the logger's POLICY to core, leaving
+    the OS bits in the OSAL) is NOT done: obstacles found, to decide later: the global needs a set-once cell and
+    `core` is no_std; the panic hook (in the OSAL) needs the `Line` and `LineBuf` format, so those stay in the OSAL;
+    the direct mode fallback must survive; a generic logger cannot be a `static` until the concrete types are chosen
+    (the deployment would own it).
+
+66. **File service F3b: `Pending<N>`, a client's table of outstanding requests** (`core/src/file_client.rs`, new, 11 tests;
+    358 tests in all). One per client (the event log writer, tables, each module's `ctx.file` handle), owned by the
+    client, main thread only, no locks. It does three jobs: (1) MAKES THE TAGS (`begin(now_us, timeout_us) ->
+    Result<Tag, Error>`: the client's `source` and a counting `number` that wraps; the request is recorded as
+    outstanding with a deadline `now + timeout`, saturating), (2) HOLDS THE CLIENT TO ITS LIMIT `N` (`begin` is
+    `Busy` when `N` are outstanding, and then the client must not submit; this is what makes the service's queue
+    depth rule true; `N` of 0 allows none), (3) FINDS TIMEOUTS (`take_expired(now_us) -> Option<Tag>`, one overdue
+    request per call, removed, overdue AT its deadline). `finish(tag) -> bool` takes a tag out: true if it was an
+    outstanding request of this client (a response came, or the submit was refused and the slot is given back),
+    false if not (late after a timeout, or another client's), and then the response is dropped. The usage, each
+    tick: send = `begin` then `service.submit(..)` (refused: `finish`); collect = for each response, `if finish(tag)`
+    use it else drop it; time out = `while let Some(tag) = take_expired(now)` answer `Error::TimedOut`. The timeout
+    value is the client's (a setting comes with F4). Mutation checked (overdue one tick late fails 3 tests).
+    Next: F4, the event log writer through the service (limit 1), which removes the blocking `append`.
+
+67. **File service: ONE SERVICE PER CLIENT** (the user's decision, 2026-11-20: "one i/o is one file device"). `FileService::
+    start(files, depth)` now takes its depth (the client's limit on outstanding requests = the `N` of its `Pending<N>`);
+    the shared `FILE_QUEUE_DEPTH` setting and its sample config line are GONE, and so are the sum rule and the plan to
+    route responses by `tag.source` (the field stays, for logs and tests). Costs, written in design.md: a thread per
+    client (each blocked in `recv`), and no order between clients, so a file has ONE writing client. design.md's File
+    Service section, the `Pending` docs and the `file_service` docs were rewritten; the tests pass a `DEPTH` of 8.
+    Possible later: a `FileDevice<N>` that bundles a `FileService` and a `Pending<N>` (`request(now, timeout, op)` and
+    `poll(now)`, which also synthesizes the `TimedOut` responses), which is what every client would otherwise write by
+    hand; the case study of the FILE module below shows what a client needs from it.
+
+68. **The FILE and CFDP modules, and a command rule** (design discussion, no code; design.md File Service section and
+    Event Logger). FILE = the operator's handle on the filesystem only (list, mkdir, delete, rename or move, copy, size
+    and checksum; results go out as a typed topic through the link module; path allow and deny lists from the
+    deployment, with the core's reset log and event log on the deny list); CFDP = whole file transfer to and from
+    ground in chunks; table upload is CFDP + (FILE) + the core's table command. Both are MODULES (touch no core state,
+    mission policy, removable attack surface, cFS precedent: its File Manager is an app). The user's rule for a
+    command module when its device is full: NAK `Busy` immediately, do NOT park the command (no waiting queue), so
+    executed commands run in arrival order; the earlier idea of a waiting queue and of "pop only when there is
+    room" were dropped for a module with mixed commands (a slow disk must not hold up its other commands).
+    `FileDevice<N>` therefore needs `request` (`Busy` is the normal "full" answer, handled per client: the event log
+    writer keeps its batch and retries, FILE NAKs) and `poll`, and NO `has_room`. NOT written: the new ops
+    (`Delete`, `Rename`, `Copy`, `List`, `Mkdir`, `Crc`, `ReadAt`, `WriteAt` or an offset append) and the OSAL `Files`
+    methods behind them.
+
+69. **File service F3c: `FileDevice<N>`, and a bug it found** (`core/src/file_device.rs`, new; `core/tests/file_device.rs`,
+    7 tests; shared test helpers moved to `core/tests/common/mod.rs`: `Gate` and `GatedFiles`). `FileDevice<N>` =
+    `FileService` (depth `N`) + `Pending<N>`: `start(files, source)`, `request(now_us, timeout_us, op) ->
+    Result<Tag, Error>` (`begin`, then `submit`; a refused submit gives the slot back and answers `Busy`),
+    `poll(now_us) -> Option<Response>` (a real response first, so an answer in the same step as the deadline wins; a
+    response whose tag is no longer pending is DROPPED with a `log::debug!`; then `TimedOut` for one overdue),
+    `outstanding()`. No `has_room`. THE BUG: with the response queue the same depth as the request queue (`N`), a
+    stale request (timed out, still in the worker) and a fresh one could both finish before the client's next poll,
+    and the second response was dropped, so the client reported TimedOut for an operation that worked. FIX: the
+    response queue has `depth + 1` slots (the worker holds one request while the queue holds `depth`); mutation
+    checked (without it 3 tests fail). A test of the full capacity was added to `file_service.rs`, and the "does not
+    fit" test now overflows `DEPTH + 1`. design.md: the queue depth bullet rewritten, and the decisions recorded:
+    chunked reads are client driven with `ReadAt { path, offset, len }` (NOT written; a short or empty chunk is the
+    end), a file being transferred is not written, most clients use `N` of 1. 366 tests. Next: F4, the event log
+    writer on a `FileDevice<1>`.
+
+70. **The event system and the worker, designed (no code)** (user discussions 2026-11-20; design.md Events, Event Logger and File
+    Service updated). (1) Events have TWO consumers, each with its own queue: `Ev` stays a STAGING buffer emptied every
+    tick, in order, by the core, which feeds (a) the TELEMETRY queue (a queued bus link, writer the core, reader the link
+    module; the severity filter applied BEFORE the push) and (b) the event LOG worker's channel (everything). Each sink has its
+    own depth and drop count; the per sink "dropped" event is not written. (2) The event log has a DEDICATED worker with an
+    `Event` typed channel (about 80 bytes a slot), NOT the generic file service (a 4.2 KiB slot per 78 byte event, and one
+    request in flight would be one event per tick); it appends each event with `event_log::append`, one sync per record
+    (kept per record, NO group commit for now: about 2 ms a record measured, so 400 to 500 a second); the main side
+    `try_send`s and counts and reports a failed send as an event; the worker logs failed writes. (3) A generic
+    `Worker<Req, Resp>` in the core (message TYPES, not byte sizes; a handler closure; `submit`, `poll`, `finish(timeout_us)`)
+    underlies both the file service and the log writer, and can serve any blocking I/O. `finish` is the shutdown signal with a
+    timeout, which needs `channel::Receiver::recv_timeout` in the OSAL (only the platform can wait with a timeout; the core
+    has no clock to sleep with). (4) The earlier plan of F4 on a `FileDevice<1>` is RETRACTED. (5) Also decided: the strict
+    one-in-flight model (a timed out request keeps its slot until the worker really finishes; the response queue back to
+    `N` slots, dropping the `+1`) is the user's preference; NOT yet applied to the code (it still has the `depth + 1`
+    response queue and frees a slot at the timeout). NOT written: `recv_timeout`, the `Worker`, the log writer, the
+    telemetry queue, the per sink drop events.
+
+71. **The event system: design G chosen, item 70 SUPERSEDED** (user decision, 2026-11-20, after a review of the alternatives:
+    staging with tick fan-out and a dedicated log worker (A), a shared ring with cursors (B, needs unsafe), the log as a bus
+    module (C, later, needs the bus and a module stop hook), a main thread write with no sync (D, a `write()` can block
+    under writeback throttling), an mmap'd ring (E, unsafe), and dropping the binary log in favour of the system log
+    file (F, loses typed records, CRC and independence from stderr redirection)). DECIDED: (G) `Ev` holds TWO plain main
+    thread queues filled at send time, the LOG queue (everything, the burst absorber) and the TELEMETRY queue (the
+    downlink severity filter applied first), each with its own depth and drop count (a full queue drops the new event
+    and counts it). The event log writer is a client of the existing file service (`FileDevice<1>`, strict one in flight):
+    when its service is idle it builds ONE batch by peeking at the log queue, encoding the record and `Data::add_bytes`
+    (the first record that does not fit ends the batch, so NO fixed 52: the size is `FILE_DATA_MAX_BYTES`), pops an event
+    only after `add_bytes` took it, submits one `Append`, and collects the response on a later tick. One sync per batch
+    (group commit by tick: at low rates one event per batch; the durability given up is about one tick). NEEDED, not
+    written: `Queue::peek` (core-api), `Ev` with two queues and drop counts, a compile time check that the record fits an
+    empty `Data`, the strict one in flight change (a timed out request keeps its slot until the worker finishes; the
+    response queue back to `N`, dropping the `+1`), `Receiver::recv_timeout` in the OSAL and a flush for `Core::stop`,
+    the writer in `Core::tick` replacing the blocking `append`, the per queue drop events, a log timeout setting. The generic
+    `Worker<Req, Resp>` is DEFERRED until a second blocking use exists. design.md Events, Event Logger and File Service
+    updated.
+
+72. **`N` and tags DROPPED, designed only (the code still has them)** (user decisions, 2026-11-20; design.md File Service updated).
+    EVERY file service is strictly ONE request in flight: one slot in each queue, no depth parameter, no `Pending<N>`
+    (the 11 tests of `file_client.rs` go with it), no `Tag` (a response is always the answer to the one outstanding
+    request), a `FileDevice` with a three state value (idle, waiting with a deadline, timed out and still waiting for the
+    worker), `request(now, timeout, op) -> Result<(), Busy>`, `poll(now) -> Option<Result<Data, Error>>`. A timed out
+    request is reported `TimedOut` but the device stays BUSY until the worker finishes; a late response is dropped.
+    More streams = more devices. CFDP: ONE device to start (a serial transaction does one chunk at a time in either
+    direction; a second device only for concurrent transactions or read-ahead; a faster link would first want a larger
+    `FILE_DATA_MAX_BYTES`). My earlier example of one device for reads and one for writes was wrong. NOT yet applied to
+    the code (`FileService::start(files, depth)` with `depth + 1` responses, `Pending<N>`, `Tag`, `FileDevice<N>` still
+    exist), to be done in the step after the two queue `Ev`.
+
+73. **`Queue::peek` and `Queue::take_refused`, and the two queue `Ev`** (design G, first code step; 383 tests, was 366).
+    `core-api/src/queue.rs`: `peek(&self) -> Option<&T>` (the oldest item without taking it, for a consumer that must see
+    an item before it knows it fits) and a REFUSAL COUNT inside `Queue` itself (`push` counts every refusal, whatever the
+    caller then does; `take_refused()` returns and resets it): so no event specific wrapper type was needed (the user
+    asked to justify an `EventQueue<N>` and it had no event specific method, only the depth `N`), and the bus's queued
+    links can reuse it. `core-api/src/ev.rs`: `Ev` has PUBLIC fields `log: Queue<Event, EV_LOG_QUEUE_DEPTH>` (1024, was
+    `EV_QUEUE_DEPTH`, renamed everywhere incl. the sample config) and `telemetry: Queue<Event, EV_TELEMETRY_QUEUE_DEPTH>`
+    (256, new), a private `telemetry_min: Option<Severity>` and `set_telemetry_filter(Option<Severity>)` (OFF by default,
+    so the queue cannot fill with nobody to read it); `send` pushes to `log` always and to `telemetry` when the severity
+    is at least the filter; the old `pop`, `len`, `is_empty`, `take_dropped` are gone (callers say `ev.log.pop()`,
+    `ev.log.take_refused()` and so on). `Severity` now derives `PartialOrd, Ord` (Info < Warn < Err). `events::
+    report_dropped` sends one `EventsDropped` per queue that refused events: `N log events dropped: the queue was full`
+    or `N telemetry events dropped: ...` (at most 55 bytes). New tests: 3 for `peek`, 3 for the refusal count, 9 for the
+    two queues in `core-api/tests/ev.rs` (off by default, the filter, `Info` sends all, `Err` only the worst, the filter
+    turned off, a full telemetry queue leaves the log alone and the other way round, `peek`), 2 in `events.rs`. `Core::tick`
+    still writes the log queue with the BLOCKING `append` (so the sample still shows overruns); the telemetry queue has no
+    consumer yet. Next: apply the dropped `N`/tags change (item 72), `recv_timeout` and the flush, then the log writer.
+
+74. **The telemetry queue removed, the file service made strictly one-in-flight, and the event log writer written** (user
+    decisions 2026-11-20 and 2026-11-21; design.md Events and File Service updated). Item 73's telemetry parts are SUPERSEDED: `Ev` has
+    only `log`; `EV_TELEMETRY_QUEUE_DEPTH`, `telemetry_min` and `set_telemetry_filter` are gone; telemetry is future bus work.
+    Item 72 is now APPLIED to the code: no `N`, no `Tag`, no `Request`, `file_client.rs` deleted; `file::Response =
+    Result<Data, Error>`; `FileService` (one slot each way: `start`, `submit`, `poll`, `wait`, `handle`); `FileDevice` (state Idle /
+    Waiting{deadline} / TimedOut: `request`, `poll`, `wait`, `busy`; mutation checked: freeing the device at the timeout fails the
+    "stays busy" test); OSAL `Receiver::recv_timeout`; `Platform::Files: Clone + Send + 'static`. New `core/src/log_writer.rs`
+    (`LogWriter::start/step/flush`, setting `EVENT_LOG_TIMEOUT_US`, compile-time check that a record fits `FILE_DATA_MAX_BYTES`);
+    `event_log::batch(&mut Ev) -> file::Data` replaces `event_log::append`; `Core` has `log_writer: Option<..>` started in
+    `Core::start` (`EventLogUnavailable` if it cannot start), `tick` calls `writer.step`, `stop` flushes, then reports dropped, then
+    flushes again, and `Core::flush_event_log` is public for tests that read the log. The blocking write is gone from `tick`.
+    Sample run (8 s, release): 2 overruns where it had one per event; the cause of those two is not yet found. 369 tests; clippy
+    and fmt clean. Not done: the `Core::tick` allocation-free assertion, `write_file` still uses `format!` (allocates on the worker).
+
 ## WHERE WE LEFT OFF (2026-11-20)
-Everything builds, all 312 tests pass, clippy (strict lints of item 29) and `cargo fmt --check` are
+Everything builds, all 369 tests pass, clippy (strict lints of item 29) and `cargo fmt --check` are
 clean. Committed by the user: up to `9934bdb "update docs"` (items 1 to 40). NOT yet committed:
 items 41 to 59 and the docs. The user commits.
 The user is learning Rust (comes from C++): explain syntax and generics as they come up, and follow
@@ -980,17 +1198,15 @@ CLAUDE.md (one thing at a time, simplicity, callbacks only when needed, "do we r
 after any edit name each file touched and what was done in it). `latest-chat.md` is updated only when the
 user says the session is ending.
 
-Where the code is: `Core<P: Platform>` (`core/src/lib.rs`) has `start`, `tick` (events to the event log with
-the TEMPORARY blocking `append`, the dropped report, then the watchdog feed), `stop`, `reset`, `files`,
+Where the code is: `Core<P: Platform>` (`core/src/lib.rs`) has `start`, `tick` (the log writer's step, the dropped report, then the
+watchdog feed), `stop`, `reset`, `files`,
 `watchdog`; `vee_core::slot::Slot<M>` is the per module bookkeeping. The OSAL has the interfaces (`clock`
 with `sleep_until_us`, `files`, `syslog`, `panic_report`, `watchdog`, `platform`), the fakes, and `linux/`
 (`std_clock`, `std_files`, `std_syslog`, `std_panic` the panic hook, `std_watchdog`, `std_alloc_guard`,
 `LinuxPlatform`). `modules/example` is the sample module. `sample-deployment` (S2a to S2e done) is the first executable: `start`
 (the whole start sequence), `Exec::run` (the loop: absolute boundaries, an overrun skips, logged),
 `VEE_SAMPLE_TICKS=N` to end through `Core::stop`. The software bus is DESIGNED (item 58) and not written.
-Observed in the first runs of the sample: `overrun ... skipped 1 or 2` warnings, from `Core::tick`'s blocking
-`append` (a `sync_data` per event on WSL can take more than the 10 ms period). That is exactly what the file
-service removes.
+The blocking event log write is gone (item 74); two sample overruns in 8 s remain, cause unknown.
 
 ## Next
 Open choices, in the order I would do them, all for the user to pick:

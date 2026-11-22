@@ -6,7 +6,8 @@
 //! threads (to the file service, say) are the OSAL's.
 //!
 //! What to do when the queue is full is the caller's choice, because it differs per queue (see
-//! `push`).
+//! `push`). The queue only counts how often it was full (`take_refused`), so that whatever the
+//! caller does about it, the loss is never silent.
 
 /// A ring buffer: the oldest item is at `head`, and `len` items follow it, wrapping round to the
 /// start of the array when they pass the end.
@@ -16,6 +17,9 @@ pub struct Queue<T, const N: usize> {
     slots: [Option<T>; N],
     head: usize,
     len: usize,
+    /// How many pushes found the queue full (or could not be placed), since `take_refused` was
+    /// last called.
+    refused: u32,
 }
 
 impl<T, const N: usize> Queue<T, N> {
@@ -26,6 +30,7 @@ impl<T, const N: usize> Queue<T, N> {
             slots: [const { None }; N],
             head: 0,
             len: 0,
+            refused: 0,
         }
     }
 
@@ -34,7 +39,26 @@ impl<T, const N: usize> Queue<T, N> {
     /// - drop it (the newest is lost, the oldest are kept): ignore the `Err`
     /// - drop the oldest instead: `pop` one, then `push` again
     /// - report a failure, such as a nak for a busy command queue
+    ///
+    /// Each refusal is also counted, whatever the caller then does: see `take_refused`.
     pub fn push(&mut self, item: T) -> Result<(), T> {
+        let result = self.place(item);
+        if result.is_err() {
+            self.refused = self.refused.saturating_add(1);
+        }
+        result
+    }
+
+    /// How many pushes were refused since this was last called, and the count starts again from
+    /// 0. A caller that drops the refused item (the event queues) sends this on as an event, so a
+    /// loss is never silent. One that naks the sender, or tries the item again later, can use it
+    /// to see how often that happens.
+    pub fn take_refused(&mut self) -> u32 {
+        core::mem::take(&mut self.refused)
+    }
+
+    /// Puts the item after the last one, or gives it back. `push` counts the refusals.
+    fn place(&mut self, item: T) -> Result<(), T> {
         if self.len >= N {
             return Err(item);
         }
@@ -67,6 +91,17 @@ impl<T, const N: usize> Queue<T, N> {
         item
     }
 
+    /// The oldest item, without taking it out, or `None` if the queue is empty. This is for a
+    /// consumer that must see an item before it knows whether it can use it (a batch that is full
+    /// has no room for the next one): it takes the item out with `pop` only once it has.
+    pub fn peek(&self) -> Option<&T> {
+        if self.len == 0 {
+            return None;
+        }
+        // `len > 0`, so `N` is not 0 and `head` is a valid index.
+        self.slots.get(self.head)?.as_ref()
+    }
+
     /// How many items are waiting.
     pub fn len(&self) -> usize {
         self.len
@@ -90,6 +125,68 @@ mod tests {
     /// Not `Copy` or `Clone`, to show that a queue does not need that of its items.
     #[derive(Debug, PartialEq, Eq)]
     struct Token(u32);
+
+    #[test]
+    fn a_refused_push_is_counted_and_a_taken_count_starts_again_from_zero() {
+        let mut queue = queue::Queue::<Token, 2>::new();
+        queue.push(Token(1)).unwrap();
+        queue.push(Token(2)).unwrap();
+        assert_eq!(queue.take_refused(), 0); // nothing was refused yet
+        assert_eq!(queue.push(Token(3)), Err(Token(3)));
+        assert_eq!(queue.push(Token(4)), Err(Token(4)));
+        assert_eq!(queue.take_refused(), 2);
+        assert_eq!(queue.take_refused(), 0);
+        // What was accepted is still there, in order.
+        assert_eq!(queue.pop(), Some(Token(1)));
+        assert_eq!(queue.pop(), Some(Token(2)));
+    }
+
+    #[test]
+    fn a_push_that_worked_is_not_counted() {
+        let mut queue = queue::Queue::<Token, 2>::new();
+        queue.push(Token(1)).unwrap();
+        queue.pop();
+        queue.push(Token(2)).unwrap();
+        assert_eq!(queue.take_refused(), 0);
+    }
+
+    #[test]
+    fn a_queue_of_nothing_refuses_and_counts_every_push() {
+        let mut queue = queue::Queue::<Token, 0>::new();
+        assert_eq!(queue.push(Token(1)), Err(Token(1)));
+        assert_eq!(queue.push(Token(2)), Err(Token(2)));
+        assert_eq!(queue.take_refused(), 2);
+    }
+
+    #[test]
+    fn peek_shows_the_oldest_item_and_leaves_it_in_the_queue() {
+        let mut queue = queue::Queue::<Token, 3>::new();
+        assert_eq!(queue.peek(), None);
+        queue.push(Token(1)).unwrap();
+        queue.push(Token(2)).unwrap();
+        assert_eq!(queue.peek(), Some(&Token(1)));
+        assert_eq!(queue.peek(), Some(&Token(1))); // still there
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue.pop(), Some(Token(1)));
+        assert_eq!(queue.peek(), Some(&Token(2))); // the next one now
+    }
+
+    #[test]
+    fn peek_follows_the_queue_round_the_end_of_the_array() {
+        let mut queue = queue::Queue::<Token, 2>::new();
+        for round in 0..5 {
+            queue.push(Token(round)).unwrap();
+            assert_eq!(queue.peek(), Some(&Token(round)));
+            assert_eq!(queue.pop(), Some(Token(round)));
+            assert_eq!(queue.peek(), None);
+        }
+    }
+
+    #[test]
+    fn a_queue_of_nothing_has_nothing_to_peek_at() {
+        let queue = queue::Queue::<Token, 0>::new();
+        assert_eq!(queue.peek(), None);
+    }
 
     #[test]
     fn a_new_queue_is_empty() {

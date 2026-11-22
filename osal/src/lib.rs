@@ -6,10 +6,16 @@
 //! all in `linux/`) or for a test double (`fake_clock`, `fake_files`, `fake_watchdog`,
 //! `fake_platform`). The rest of Vee uses the interface. A new platform adds a directory like
 //! `linux/` and changes nothing else.
+//!
+//! Two files are neither: `channel` (a bounded queue between threads) and `thread` (starting one)
+//! are concrete wrappers over `std`, shared by every platform that has std, which is the OSAL's
+//! contract. They are not Linux specific, and nothing implements them twice, so they have no trait.
+//! A port to a target without std would change those two files.
 // Unsafe is denied here too (the workspace already says so). A block that needs it must carry
 // `#[allow(unsafe_code, reason = "...")]` and a `// SAFETY:` comment.
 #![deny(unsafe_code)]
 
+pub mod channel;
 pub mod clock;
 pub mod fake_clock;
 pub mod fake_files;
@@ -20,6 +26,7 @@ pub mod linux;
 pub mod panic_report;
 pub mod platform;
 pub mod syslog;
+pub mod thread;
 pub mod watchdog;
 
 // The osal's own tests count allocations (see `linux::std_alloc_guard`), so the test program uses the

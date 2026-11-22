@@ -9,9 +9,13 @@ use std::sync;
 ///
 /// `Files` methods take `&self`, but this fake has state to change, so the map sits in a
 /// `Mutex`. (The real implementation needs no lock: the file system is its state.)
-#[derive(Debug, Default)]
+///
+/// `clone` makes another handle to the SAME files, not a copy of them, as two `StdFiles` are two
+/// handles to the same disk. That is how a test gives one handle to a worker thread, and keeps
+/// another to look at what the worker wrote.
+#[derive(Debug, Default, Clone)]
 pub struct FakeFiles {
-    files: sync::Mutex<collections::HashMap<String, Vec<u8>>>,
+    files: sync::Arc<sync::Mutex<collections::HashMap<String, Vec<u8>>>>,
 }
 
 impl FakeFiles {
@@ -30,6 +34,12 @@ impl FakeFiles {
     /// Test setup: creates or replaces a file with exactly these bytes.
     pub fn put(&self, path: &str, bytes: &[u8]) {
         self.lock().insert(path.to_string(), bytes.to_vec());
+    }
+
+    /// Test inspection: how many handles there are to these files, this one included. A handle
+    /// is gone when it is dropped, so a test can tell that a thread that held one has ended.
+    pub fn handles(&self) -> usize {
+        sync::Arc::strong_count(&self.files)
     }
 
     /// Test inspection: a copy of the file's bytes, or `None` if it does not exist.
@@ -95,6 +105,26 @@ mod tests {
     use super as fake_files;
     use crate::files;
     use crate::files::Files as _;
+
+    #[test]
+    fn a_clone_is_another_handle_to_the_same_files() {
+        let fake = fake_files::FakeFiles::new();
+        let other = fake.clone();
+        other.append("log", b"ab").unwrap();
+        fake.append("log", b"cd").unwrap();
+        assert_eq!(fake.get("log"), Some(b"abcd".to_vec()));
+        assert_eq!(other.get("log"), Some(b"abcd".to_vec()));
+    }
+
+    #[test]
+    fn handles_counts_the_clones_that_are_still_alive() {
+        let fake = fake_files::FakeFiles::new();
+        assert_eq!(fake.handles(), 1);
+        let other = fake.clone();
+        assert_eq!(fake.handles(), 2);
+        drop(other);
+        assert_eq!(fake.handles(), 1);
+    }
 
     #[test]
     fn missing_file_has_no_length() {

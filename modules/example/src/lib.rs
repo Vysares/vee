@@ -140,13 +140,13 @@ mod tests {
         });
         harness.init(100);
 
-        let event = harness.ev.pop().unwrap();
+        let event = harness.ev.log.pop().unwrap();
         assert_eq!(event.source, SOURCE);
         assert_eq!(event.monotonic_us, 100);
         assert_eq!(event.severity, event::Severity::Info);
         assert_eq!(event.code, event::Code::code(&example::ExampleEv::Started));
         assert_eq!(event.text.as_bytes(), b"started, previous end: commanded");
-        assert!(harness.ev.is_empty());
+        assert!(harness.ev.log.is_empty());
     }
 
     #[test]
@@ -155,12 +155,12 @@ mod tests {
         harness.step(1_000);
         harness.step(2_000);
 
-        let first = harness.ev.pop().unwrap();
+        let first = harness.ev.log.pop().unwrap();
         assert_eq!(first.text.as_bytes(), b"step 1 at 1000 us");
-        let second = harness.ev.pop().unwrap();
+        let second = harness.ev.log.pop().unwrap();
         assert_eq!(second.text.as_bytes(), b"step 2 at 2000 us");
         assert_eq!(second.monotonic_us, 2_000);
         assert_eq!(second.code, event::Code::code(&example::ExampleEv::Stepped));
-        assert!(harness.ev.is_empty());
+        assert!(harness.ev.log.is_empty());
     }
 }

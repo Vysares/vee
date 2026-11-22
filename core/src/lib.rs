@@ -11,6 +11,9 @@
 
 pub mod event_log;
 pub mod events;
+pub mod file_device;
+pub mod file_service;
+pub mod log_writer;
 mod records;
 pub mod reset_log;
 pub mod slot;
@@ -33,7 +36,7 @@ use vee_osal::watchdog::Watchdog as _;
 /// worked out from the services handed to `start`.
 pub struct Core<P: platform::Platform> {
     /// The event queue. The executive lends it to every `Ctx` it builds (modules and the core's
-    /// own reports send into it), and `tick` takes the events out.
+    /// own reports send into it), and the log writer takes the events out.
     pub ev: ev::Ev,
     files: P::Files,
     /// Fed by `tick`.
@@ -43,6 +46,9 @@ pub struct Core<P: platform::Platform> {
     watchdog_failing: bool,
     reset_log_path: &'static str,
     event_log_path: &'static str,
+    /// Appends the events to the event log through its own file service. `None` if it could not
+    /// start (then the events wait in the queue, and are dropped and counted when it is full).
+    log_writer: Option<log_writer::LogWriter>,
     /// How the previous run ended. Set by `start`.
     reset: reset::ResetInfo,
 }
@@ -63,6 +69,7 @@ impl<P: platform::Platform> Core<P> {
             watchdog_failing: false,
             reset_log_path,
             event_log_path,
+            log_writer: None,
             reset: reset::ResetInfo::first_boot(),
         }
     }
@@ -76,6 +83,8 @@ impl<P: platform::Platform> Core<P> {
     /// 2. The event log (`event_log::start`): rotates it if it is full or ends in a partial
     ///    record, and sends an event if it was partial. This is done before the first `tick`
     ///    writes anything to it.
+    /// 3. The event log's writer, with its own file service and worker thread (it allocates, so
+    ///    startup is where it is made).
     ///
     /// Startup does not fail. If a log cannot be opened, the core carries on without it and sends
     /// an event that says so (`ResetLogUnavailable`, `EventLogUnavailable`). Vee panics only when
@@ -91,6 +100,7 @@ impl<P: platform::Platform> Core<P> {
         let mut core = Core::new(files, watchdog, reset_log_path, event_log_path);
         core.reset = core.start_reset_log(now);
         core.start_event_log(now);
+        core.start_log_writer(now);
         core
     }
 
@@ -100,17 +110,28 @@ impl<P: platform::Platform> Core<P> {
     /// 1. Records a clean shutdown in the reset log (`reset_log::stop`), so the next boot sees
     ///    that this run ended cleanly, and why. Without it, the next boot sees `Unknown`. If the
     ///    reset log cannot be written, sends `ResetLogUnavailable`, as `start` does.
-    /// 2. Writes every queued event to the event log. This is two ticks: the first writes the
-    ///    queue and, if events were dropped, queues the report of that, and the second writes
-    ///    the report.
+    /// 2. Writes every queued event to the event log, waiting for the disk (`flush_event_log`).
+    ///    Then, if the queue refused events, sends the report of that, which the first write has
+    ///    made room for, and writes it too. This is the one place the core blocks, and it gives up
+    ///    on a write that takes longer than `log_writer::EVENT_LOG_TIMEOUT_US`.
     ///
     /// Like `start`, it does not fail.
     pub fn stop(&mut self, now: u64, reason: reset::ShutdownReason) {
         if let Err(err) = reset_log::stop(&self.files, self.reset_log_path, reason) {
             self.send_reset_log_unavailable(now, err);
         }
-        self.tick(now);
-        self.tick(now);
+        self.flush_event_log(now);
+        events::report_dropped(&mut self.ev, now);
+        self.flush_event_log(now);
+    }
+
+    /// Writes every queued event to the event log and waits until it is on the disk. It blocks
+    /// (up to `log_writer::EVENT_LOG_TIMEOUT_US` for a write), so it is for the shutdown, and for a
+    /// test that needs the log to be complete.
+    pub fn flush_event_log(&mut self, now: u64) {
+        if let Some(writer) = self.log_writer.as_mut() {
+            writer.flush(&mut self.ev, now);
+        }
     }
 
     /// How the previous run ended. What modules see as `ctx.reset`.
@@ -174,20 +195,35 @@ impl<P: platform::Platform> Core<P> {
         }
     }
 
+    /// Step 3 of `start`: the event log's writer.
+    fn start_log_writer(&mut self, now: u64) {
+        match log_writer::LogWriter::start(self.files.clone(), self.event_log_path) {
+            Ok(writer) => self.log_writer = Some(writer),
+            Err(err) => self.ev.send(
+                core_event::SOURCE,
+                now,
+                core_event::CoreEvent::EventLogUnavailable,
+                format_args!("event log unavailable: {err}"),
+            ),
+        }
+    }
+
     /// The core's step of a tick, at time `now`. The executive calls it after the modules'
-    /// suppressed-event reports and before the modules' `step`s, so this tick's reports are
-    /// written in the same tick, and the modules' events in the next.
+    /// suppressed-event reports and before the modules' `step`s.
     ///
-    /// 1. Events: takes every event out of the queue and writes it to the event log. Then, if
-    ///    the queue dropped any events, sends the report (`events::report_dropped`). The report
-    ///    comes after the queue has been emptied, so there is room for it.
+    /// 1. Events: the log writer collects what happened to the write in flight, and, if the file
+    ///    service is free, sends the next batch of queued events (one write for as many as fit).
+    ///    It never waits. Then, if the queue refused any events, sends the report
+    ///    (`events::report_dropped`).
     /// 2. The watchdog: feeds it. This comes last, so a tick that hangs part way (a blocked
     ///    write, say) is not fed, and the supervisor notices. The call is made every tick, and
     ///    the watchdog sends on each one. If the supervisor cannot be reached, the
     ///    first failure of a streak sends `WatchdogUnavailable`, and the call is tried again at
     ///    the next tick. The event is written by the next tick, as the dropped report is.
     pub fn tick(&mut self, now: u64) {
-        self.write_events();
+        if let Some(writer) = self.log_writer.as_mut() {
+            writer.step(&mut self.ev, now);
+        }
         events::report_dropped(&mut self.ev, now);
         let result = self.watchdog.feed();
         self.note_watchdog(now, result);
@@ -208,30 +244,6 @@ impl<P: platform::Platform> Core<P> {
                 );
             }
             Err(_) => {}
-        }
-    }
-
-    /// Takes every event out of the queue and appends it to the event log.
-    ///
-    /// TEMPORARY. `append` blocks until the record is on the disk, and nothing may block in the
-    /// tick loop. It is here so the events have somewhere to go before the file service exists.
-    /// The file service will replace the `append` call with a request to its thread, and this
-    /// loop stays the same.
-    ///
-    /// If an `append` fails, the event is lost (there is nothing else to do with it) and the
-    /// queue is still emptied: a queue that stopped draining would drop every later event too.
-    /// The failures are counted and reported once, to the system log, with the first error.
-    fn write_events(&mut self) {
-        let mut failed: u32 = 0;
-        let mut first_error = None;
-        while let Some(event) = self.ev.pop() {
-            if let Err(err) = event_log::append(&self.files, self.event_log_path, &event) {
-                failed = failed.saturating_add(1);
-                first_error.get_or_insert(err);
-            }
-        }
-        if let Some(err) = first_error {
-            log::error!("event log: {failed} events not written, the first error was: {err}");
         }
     }
 }
@@ -256,8 +268,14 @@ mod tests {
     type Fake = fake_platform::FakePlatform;
 
     /// A core that has not been started (no startup events), on the file system `files`.
-    fn core_on<F: files::Files>(files: F) -> vee_core::Core<fake_platform::FakePlatform<F>> {
-        vee_core::Core::new(files, fake_watchdog::FakeWatchdog::new(), RESET_LOG, PATH)
+    /// It has its event log writer, which `start` makes: without it nothing would write the events.
+    fn core_on<F: files::Files + Clone + Send + 'static>(
+        files: F,
+    ) -> vee_core::Core<fake_platform::FakePlatform<F>> {
+        let mut core =
+            vee_core::Core::new(files, fake_watchdog::FakeWatchdog::new(), RESET_LOG, PATH);
+        core.start_log_writer(0);
+        core
     }
 
     fn new_core() -> vee_core::Core<Fake> {
@@ -288,6 +306,7 @@ mod tests {
     }
 
     /// A file system where every call fails.
+    #[derive(Clone)]
     struct FailingFiles;
 
     impl files::Files for FailingFiles {
@@ -314,7 +333,9 @@ mod tests {
     const RESET_LOG: &str = "reset.log";
 
     /// The core after `start` on `files`, with the startup events at time 5.
-    fn started<F: files::Files>(files: F) -> vee_core::Core<fake_platform::FakePlatform<F>> {
+    fn started<F: files::Files + Clone + Send + 'static>(
+        files: F,
+    ) -> vee_core::Core<fake_platform::FakePlatform<F>> {
         vee_core::Core::start(
             files,
             fake_watchdog::FakeWatchdog::new(),
@@ -326,7 +347,7 @@ mod tests {
 
     /// The next event in the queue, checked to be from the core at time 5.
     fn next_core_event<P: platform::Platform>(core: &mut vee_core::Core<P>) -> event::Event {
-        let event = core.ev.pop().unwrap();
+        let event = core.ev.log.pop().unwrap();
         assert_eq!(event.source, core_event::SOURCE);
         assert_eq!(event.monotonic_us, 5);
         event
@@ -334,6 +355,7 @@ mod tests {
 
     /// A fake file system where only the reset log fails, so an event about it can be written to
     /// the event log and read back.
+    #[derive(Clone)]
     struct ResetLogDown(fake_files::FakeFiles);
 
     impl files::Files for ResetLogDown {
@@ -382,14 +404,17 @@ mod tests {
     #[test]
     fn stop_writes_every_queued_event_including_the_report_of_dropped_ones() {
         let mut core = new_core();
-        for _ in 0..ev::EV_QUEUE_DEPTH.saturating_add(3) {
+        for _ in 0..ev::EV_LOG_QUEUE_DEPTH.saturating_add(3) {
             send(&mut core, 0);
         }
         core.stop(77, reset::ShutdownReason::Signal);
 
-        assert!(core.ev.is_empty());
-        assert_eq!(record_count(&core), ev::EV_QUEUE_DEPTH.saturating_add(1));
-        let report = record(&core, ev::EV_QUEUE_DEPTH);
+        assert!(core.ev.log.is_empty());
+        assert_eq!(
+            record_count(&core),
+            ev::EV_LOG_QUEUE_DEPTH.saturating_add(1)
+        );
+        let report = record(&core, ev::EV_LOG_QUEUE_DEPTH);
         assert_eq!(report.code, 7);
         assert_eq!(report.monotonic_us, 77);
     }
@@ -400,7 +425,7 @@ mod tests {
         send(&mut core, 1);
         core.stop(50, reset::ShutdownReason::Commanded);
 
-        assert!(core.ev.is_empty());
+        assert!(core.ev.log.is_empty());
         let bytes = core.files().0.get(PATH).unwrap();
         let mut records = bytes.chunks(log_types::RECORD_LEN);
         assert_eq!(log_types::decode(records.next().unwrap()).unwrap().code, 0); // the event sent before
@@ -425,7 +450,7 @@ mod tests {
             report.text.as_bytes(),
             b"reset 1: prev end unknown, 0 unclean in a row"
         );
-        assert!(core.ev.is_empty());
+        assert!(core.ev.log.is_empty());
         assert!(core.files().get(RESET_LOG).is_some());
     }
 
@@ -457,7 +482,7 @@ mod tests {
             partial.text.as_bytes(),
             b"event log ends in a partial record"
         );
-        assert!(core.ev.is_empty());
+        assert!(core.ev.log.is_empty());
         assert!(core.files().get("events.log.1").is_some()); // rotated
     }
 
@@ -479,14 +504,15 @@ mod tests {
             event_log.text.as_bytes(),
             b"event log unavailable: no storage space"
         );
-        assert!(core.ev.is_empty());
+        assert!(core.ev.log.is_empty());
     }
 
     #[test]
     fn the_startup_events_are_written_to_the_event_log_by_the_first_tick() {
         let mut core = started(fake_files::FakeFiles::new());
         core.tick(10);
-        assert!(core.ev.is_empty());
+        core.flush_event_log(10); // the write is on the worker's thread: wait for it
+        assert!(core.ev.log.is_empty());
         assert_eq!(record_count(&core), 1);
         assert_eq!(record(&core, 0).code, 0);
     }
@@ -498,7 +524,8 @@ mod tests {
             send(&mut core, time);
         }
         core.tick(99);
-        assert!(core.ev.is_empty());
+        core.flush_event_log(99);
+        assert!(core.ev.log.is_empty());
         assert_eq!(record_count(&core), 3);
         for (index, time) in [10, 20, 30].into_iter().enumerate() {
             assert_eq!(record(&core, index).monotonic_us, time);
@@ -509,33 +536,51 @@ mod tests {
     fn tick_with_nothing_queued_writes_nothing() {
         let mut core = new_core();
         core.tick(1);
+        core.flush_event_log(1);
         assert_eq!(record_count(&core), 0);
-        assert!(core.ev.is_empty());
+        assert!(core.ev.log.is_empty());
     }
 
     #[test]
-    fn dropped_events_are_reported_after_the_queue_is_emptied() {
+    fn dropped_events_are_reported_once_the_writer_has_made_room_and_the_report_is_written() {
         let mut core = new_core();
-        for _ in 0..ev::EV_QUEUE_DEPTH.saturating_add(3) {
+        for _ in 0..ev::EV_LOG_QUEUE_DEPTH.saturating_add(3) {
             send(&mut core, 0);
         }
 
-        // The queue's events are written, and then the report is sent: it is queued, not written.
+        // The first tick takes a batch out of the full queue, which makes room for the report.
         core.tick(500);
-        assert_eq!(record_count(&core), ev::EV_QUEUE_DEPTH);
-        assert_eq!(core.ev.len(), 1);
-
-        // The next tick writes it.
-        core.tick(600);
-        assert_eq!(record_count(&core), ev::EV_QUEUE_DEPTH.saturating_add(1));
-        let report = record(&core, ev::EV_QUEUE_DEPTH);
+        core.flush_event_log(500);
+        assert!(core.ev.log.is_empty());
+        assert_eq!(
+            record_count(&core),
+            ev::EV_LOG_QUEUE_DEPTH.saturating_add(1)
+        );
+        let report = record(&core, ev::EV_LOG_QUEUE_DEPTH);
         assert_eq!(report.source, core_event::SOURCE);
         assert_eq!(report.code, 7);
         assert_eq!(report.monotonic_us, 500);
         assert_eq!(
             report.text.as_bytes(),
-            b"3 events dropped: the queue was full"
+            b"3 log events dropped: the queue was full"
         );
+    }
+
+    #[test]
+    fn a_report_that_does_not_fit_in_a_full_queue_is_counted_and_made_the_next_time() {
+        // No writer (it did not start), so nothing makes room: the queue stays full.
+        let mut core = vee_core::Core::<Fake>::new(
+            fake_files::FakeFiles::new(),
+            fake_watchdog::FakeWatchdog::new(),
+            RESET_LOG,
+            PATH,
+        );
+        for _ in 0..ev::EV_LOG_QUEUE_DEPTH.saturating_add(3) {
+            send(&mut core, 0);
+        }
+        core.tick(1); // reports 3, which the full queue refuses: one more is counted
+        assert_eq!(core.ev.log.len(), ev::EV_LOG_QUEUE_DEPTH);
+        assert_eq!(core.ev.log.take_refused(), 1);
     }
 
     #[test]
@@ -545,7 +590,8 @@ mod tests {
             send(&mut core, time);
         }
         core.tick(99);
-        assert!(core.ev.is_empty());
+        core.flush_event_log(99);
+        assert!(core.ev.log.is_empty());
     }
 
     #[test]
@@ -555,7 +601,7 @@ mod tests {
             core.tick(time);
         }
         assert_eq!(core.watchdog().feed_calls(), 3);
-        assert!(core.ev.is_empty()); // a feed that works sends no event
+        assert!(core.ev.log.is_empty()); // a feed that works sends no event
     }
 
     #[test]
@@ -566,7 +612,8 @@ mod tests {
             core.tick(time);
         }
         assert_eq!(core.watchdog().feed_calls(), 3); // tried again each tick
-        assert_eq!(record_count(&core), 1); // sent by tick 1, written by tick 2
+        core.flush_event_log(3);
+        assert_eq!(record_count(&core), 1); // sent by tick 1, written after it
         let event = record(&core, 0);
         assert_eq!(event.source, core_event::SOURCE);
         assert_eq!(event.code, 10);
@@ -580,6 +627,7 @@ mod tests {
         core.watchdog().set_failing(true);
         core.tick(5);
         core.tick(6);
+        core.flush_event_log(6);
         assert_eq!(record_count(&core), 2);
         assert_eq!(record(&core, 1).monotonic_us, 5);
     }

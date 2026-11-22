@@ -20,8 +20,17 @@ VEE_EVENT_LOG_MAX_RECORDS = "10000"
 # Default 5, 1..=255.
 VEE_EV_MAX_PER_TICK = "5"
 
-# How many events the event queue holds, 80 bytes each at the default text size. Default 1024, 1..=65535.
-VEE_EV_QUEUE_DEPTH = "1024"
+# How many events the LOG queue holds, 80 bytes each at the default text size. Every event goes into it, and
+# the event log's writer takes them out, so it is where a burst or a stalled disk is absorbed. Default 1024,
+# 1..=65535.
+VEE_EV_LOG_QUEUE_DEPTH = "1024"
 
 # The most events one module (or the core) can define. Default 256, 1..=65535.
 VEE_EV_MAX_CODES = "256"
+
+# The most bytes of file data in one file request or response. Every request is this size plus a little,
+# so it sets how much memory the file service's queues take. A table must fit in it. Default 4096, 1..=65536.
+VEE_FILE_DATA_MAX_BYTES = "4096"
+
+# The most bytes in a file path. A longer path is refused, never cut. Default 128, 1..=1024.
+VEE_FILE_PATH_MAX_BYTES = "128"
