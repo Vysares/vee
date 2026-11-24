@@ -37,6 +37,8 @@ const EXAMPLE_SOURCE: u8 = 1;
 const RESET_REPORT: u16 = 0;
 const EXAMPLE_STARTED: u16 = 0;
 const EXAMPLE_STEPPED: u16 = 1;
+const WATCHER_SOURCE: u8 = 2;
+const WATCHER_SAW: u16 = 0;
 
 /// How long to wait for a started program to show that it has started, and how often to look.
 const START_TIMEOUT: time::Duration = time::Duration::from_secs(10);
@@ -174,6 +176,34 @@ fn the_example_module_steps_once_a_second() {
             .count(),
         1
     );
+}
+
+#[test]
+fn the_watcher_reads_the_example_modules_topic_and_misses_every_other_value() {
+    let dir = TempDir::new("the_watcher_reads_the_topic");
+    // 450 ticks: the example publishes on every 100th tick and the watcher looks on every 200th,
+    // just after the example. So the topic has been published twice since its last look, and the
+    // watcher sees only the second value: one missed. (Which ticks these are depends on how long
+    // startup took, because tick numbers count from the clock, so the checks do not name them.)
+    run(&dir, 450);
+    let events = events(&dir);
+    let saw: Vec<String> = events
+        .iter()
+        .filter(|event| event.source == WATCHER_SOURCE && event.code == WATCHER_SAW)
+        .map(|event| String::from_utf8_lossy(event.text.as_bytes()).into_owned())
+        .collect();
+    assert!(!saw.is_empty(), "the watcher saw nothing");
+
+    // "example at step N, seq S, M missed, A us old": `step` and `seq` are both the number of
+    // publishes so far, and after the first look the watcher misses exactly one value each time.
+    for (index, text) in saw.iter().enumerate() {
+        let fields: Vec<&str> = text.split([' ', ',']).filter(|f| !f.is_empty()).collect();
+        let (step, seq, missed) = (fields[3], fields[5], fields[6]);
+        assert_eq!(step, seq, "{text}");
+        if index > 0 {
+            assert_eq!(missed, "1", "{text}");
+        }
+    }
 }
 
 #[test]

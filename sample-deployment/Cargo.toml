@@ -9,6 +9,7 @@ vee-core-api = { path = "../core-api" }
 vee-core-types = { path = "../core-types" }
 vee-osal = { path = "../osal" }
 vee-example = { path = "../modules/example" }
+vee-watcher = { path = "../modules/watcher" }
 log = { workspace = true }
 
 # `alloc-guard` makes any allocation after startup abort the process, with a fixed message. It is a

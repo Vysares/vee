@@ -76,6 +76,8 @@ struct Heartbeat {
 
 impl module::Module for Heartbeat {
     type Event = HeartbeatEv;
+    type In<'a> = ();
+    type Out<'a> = ();
 
     fn init(&mut self, ctx: &mut ctx::Ctx<'_, Self>) {
         ctx.ev.send(HeartbeatEv::Started, format_args!("started"));
@@ -103,6 +105,8 @@ struct Slow;
 
 impl module::Module for Slow {
     type Event = SlowEv;
+    type In<'a> = ();
+    type Out<'a> = ();
 
     fn init(&mut self, ctx: &mut ctx::Ctx<'_, Self>) {
         ctx.ev.send(SlowEv::Started, format_args!("started"));
@@ -131,6 +135,8 @@ struct Noisy;
 
 impl module::Module for Noisy {
     type Event = NoisyEv;
+    type In<'a> = ();
+    type Out<'a> = ();
 
     fn init(&mut self, ctx: &mut ctx::Ctx<'_, Self>) {
         ctx.ev.send(NoisyEv::Started, format_args!("started"));
@@ -181,11 +187,14 @@ impl Exec {
     /// Startup: `init` for each module once, in order. Each call takes `MODULE_COST_US`.
     fn init(&mut self) {
         let reset = self.core.reset();
-        self.heartbeat.init(&mut self.core.ev, &self.clock, reset);
+        self.heartbeat
+            .init(&mut self.core.ev, self.clock.monotonic_us(), reset, (), ());
         self.clock.advance(MODULE_COST_US);
-        self.slow.init(&mut self.core.ev, &self.clock, reset);
+        self.slow
+            .init(&mut self.core.ev, self.clock.monotonic_us(), reset, (), ());
         self.clock.advance(MODULE_COST_US);
-        self.noisy.init(&mut self.core.ev, &self.clock, reset);
+        self.noisy
+            .init(&mut self.core.ev, self.clock.monotonic_us(), reset, (), ());
         self.clock.advance(MODULE_COST_US);
     }
 
@@ -208,14 +217,32 @@ impl Exec {
 
         // 3. Each module that is due steps, in order. Each call takes `MODULE_COST_US`, due or not,
         //    so a module always sees the same time within its tick.
-        self.heartbeat
-            .step(self.tick, &mut self.core.ev, &self.clock, reset);
+        self.heartbeat.step(
+            self.tick,
+            &mut self.core.ev,
+            self.clock.monotonic_us(),
+            reset,
+            (),
+            (),
+        );
         self.clock.advance(MODULE_COST_US);
-        self.slow
-            .step(self.tick, &mut self.core.ev, &self.clock, reset);
+        self.slow.step(
+            self.tick,
+            &mut self.core.ev,
+            self.clock.monotonic_us(),
+            reset,
+            (),
+            (),
+        );
         self.clock.advance(MODULE_COST_US);
-        self.noisy
-            .step(self.tick, &mut self.core.ev, &self.clock, reset);
+        self.noisy.step(
+            self.tick,
+            &mut self.core.ev,
+            self.clock.monotonic_us(),
+            reset,
+            (),
+            (),
+        );
         self.clock.advance(MODULE_COST_US);
 
         self.tick = self.tick.saturating_add(1);

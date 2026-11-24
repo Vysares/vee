@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 #![no_std]
 
+pub mod bus;
 pub mod config;
 pub mod crc;
 pub mod ctx;

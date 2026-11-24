@@ -1,0 +1,13 @@
+[package]
+name = "vee-watcher"
+edition.workspace = true
+version.workspace = true
+
+# A module depends on `vee-core-api`, and on the crate of any module whose topic it reads: the
+# topic's type (`vee_example::Progress`) is declared there. It never depends on the core or the OSAL.
+[dependencies]
+vee-core-api = { path = "../../core-api" }
+vee-example = { path = "../example" }
+
+[lints]
+workspace = true

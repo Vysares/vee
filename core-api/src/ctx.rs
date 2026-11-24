@@ -7,8 +7,8 @@
 //! added as they are written, and later the executive's config will decide which of them each
 //! module's `Ctx` gets.
 //!
-//! `Ctx` is generic over the module `M`: what is inside comes from what `M` declares (today, its
-//! event enum, `M::Event`).
+//! `Ctx` is generic over the module `M`: what is inside comes from what `M` declares: its event
+//! enum (`M::Event`) and the bus handles it reads and writes (`M::In` and `M::Out`).
 
 use crate::ev;
 use crate::event;
@@ -25,6 +25,10 @@ pub struct Ctx<'a, M: module::Module> {
     /// How the previous run ended, and how many runs have been unclean in a row. The same for
     /// every module, and it does not change during a run.
     pub reset: reset::ResetInfo,
+    /// The bus topics the module reads: what it declared as `M::In`.
+    pub inputs: M::In<'a>,
+    /// The bus topics the module writes: what it declared as `M::Out`.
+    pub out: M::Out<'a>,
     monotonic_us: u64,
 }
 
@@ -35,12 +39,17 @@ impl<'a, M: module::Module> Ctx<'a, M> {
     /// - `monotonic_us`: the time, read from the clock once, before this call. It stays the same
     ///   for the whole call.
     /// - `reset`: from the reset log, read at startup.
+    /// - `inputs` and `out`: the module's bus handles, made by the executive from the topics it
+    ///   owns. They have the same lifetime `'a` as the other borrows, because all of them last
+    ///   for this one call.
     pub fn new(
         ev: &'a mut ev::Ev,
         throttle: &'a mut throttle::Throttle,
         source: u8,
         monotonic_us: u64,
         reset: reset::ResetInfo,
+        inputs: M::In<'a>,
+        out: M::Out<'a>,
     ) -> Self {
         Ctx {
             ev: EvHandle {
@@ -51,6 +60,8 @@ impl<'a, M: module::Module> Ctx<'a, M> {
                 code: PhantomData,
             },
             reset,
+            inputs,
+            out,
             monotonic_us,
         }
     }

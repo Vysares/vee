@@ -4,7 +4,8 @@
 //! Run it from this directory, so that `.cargo/config.toml` (the build-time settings) applies:
 //! `cd sample-deployment && cargo run`. It writes its logs to the current directory.
 //!
-//! It starts Vee (see `start`) and its one module (`vee-example`), and then runs the loop (see
+//! It starts Vee (see `start`) and its two modules (`vee-example`, which publishes a bus topic,
+//! and `vee-watcher`, which reads it), and then runs the loop (see
 //! `Exec::run`) at 100 Hz until it is killed. Set `VEE_SAMPLE_TICKS=250` (any number) to run that
 //! many ticks and then stop cleanly, which is how to see a clean shutdown (and the next boot
 //! report it).
@@ -12,6 +13,7 @@
 
 use vee_core::Core;
 use vee_core::slot;
+use vee_core_api::bus;
 use vee_core_api::reset;
 use vee_core_types::core_event;
 use vee_example as example;
@@ -23,6 +25,7 @@ use vee_osal::linux::std_files;
 use vee_osal::linux::std_panic;
 use vee_osal::linux::std_syslog;
 use vee_osal::linux::std_watchdog;
+use vee_watcher as watcher;
 
 /// The allocation guard, in builds that ask for it (`--features alloc-guard`): every allocation is
 /// counted, and once `start` has called `std_alloc_guard::arm()`, any allocation aborts. A program has
@@ -37,6 +40,7 @@ const EVENT_LOG: &str = "events.log";
 
 /// The modules' ids, which go into every event they send. 0 is the core's.
 const EXAMPLE_SOURCE: u8 = 1;
+const WATCHER_SOURCE: u8 = 2;
 
 /// The time between the start of one tick and the start of the next: a tick rate of 100 Hz. Ticks
 /// start at multiples of this on the clock, so a tick has a number: its start time divided by this.
@@ -45,6 +49,10 @@ const TICK_US: u64 = 10_000;
 /// The example module steps on every this many ticks. With a tick rate of 100 Hz that is once a
 /// second.
 const EXAMPLE_PERIOD_TICKS: u64 = 100;
+
+/// The watcher steps on every this many ticks: once every two seconds, half as often as the
+/// example publishes, so it misses every other value (a state topic keeps only the latest).
+const WATCHER_PERIOD_TICKS: u64 = 200;
 
 /// The system log keeps messages at this level and more severe.
 const LOG_LEVEL: log::LevelFilter = log::LevelFilter::Info;
@@ -94,28 +102,59 @@ fn ticks_skipped(start_us: u64, next_start_us: u64) -> u64 {
         .unwrap_or(0)
 }
 
-/// The executive: the core, the clock and one `Slot` for each module. This is the part `exec!`
-/// will generate (a field for each module and the calls in order). `Slot` does the work that is
-/// the same for every module (see `vee_core::slot`).
+/// The executive: the core, the clock, the bus topics and one `Slot` for each module. This is
+/// the part `exec!` will generate (a field for each topic and module, and the calls in order).
+/// `Slot` does the work that is the same for every module (see `vee_core::slot`).
+///
+/// The executive OWNS the topics. For each call into a module it makes the handles the module
+/// declared (`Module::In` and `Module::Out`) from them, and the module gets them in its `Ctx`.
 struct Exec {
     clock: std_clock::StdClock,
     core: Core<linux::LinuxPlatform>,
+    /// `Example`'s progress: written by `example`, read by `watcher`.
+    progress: bus::StateTopic<example::Progress>,
     example: slot::Slot<example::Example>,
+    watcher: slot::Slot<watcher::Watcher>,
 }
 
 impl Exec {
     /// Tick number `tick`, in the order the design gives (see "Executive Requirements"):
     /// 1. Each module's suppressed events from the tick before, and a new count for each.
     /// 2. The core's tick: the event queue is written to the event log, and the watchdog is fed.
-    /// 3. Each module that is due steps, in order.
+    /// 3. Each module that is due steps, in order: `example` (which writes `progress`) and then
+    ///    `watcher` (which reads it), so the watcher sees the value from this tick.
     fn tick(&mut self, tick: u64) {
         let now = self.clock.monotonic_us();
-        let reset = self.core.reset();
 
         self.example.report_suppressed(&mut self.core.ev, now);
+        self.watcher.report_suppressed(&mut self.core.ev, now);
         self.core.tick(now);
+        self.step_example(tick);
+        self.step_watcher(tick);
+    }
+
+    /// One call into `example`, with a writer for `progress`. The clock is read once, and that
+    /// time is the call's: the writer stamps the value with it and `example` sees it as
+    /// `ctx.monotonic()`.
+    fn step_example(&mut self, tick: u64) {
+        let reset = self.core.reset();
+        let now = self.clock.monotonic_us();
+        let out = example::ExampleOut {
+            progress: self.progress.writer(now),
+        };
         self.example
-            .step(tick, &mut self.core.ev, &self.clock, reset);
+            .step(tick, &mut self.core.ev, now, reset, (), out);
+    }
+
+    /// One call into `watcher`, with a reader for `progress`.
+    fn step_watcher(&mut self, tick: u64) {
+        let reset = self.core.reset();
+        let now = self.clock.monotonic_us();
+        let inputs = watcher::WatcherIn {
+            progress: self.progress.reader(),
+        };
+        self.watcher
+            .step(tick, &mut self.core.ev, now, reset, inputs, ());
     }
 
     /// The loop: runs a tick at the start of each period, for `tick_limit` ticks, or for ever if
@@ -125,22 +164,32 @@ impl Exec {
     /// first boundary after this one is done. A tick that takes longer than its period (an
     /// overrun) is not made up for: the boundaries it missed are skipped, nothing runs twice to
     /// catch up, and a module that was due on a skipped tick does not step. The skipped ticks are
-    /// logged. (They will become an event when the executive's overrun events are designed.)
+    /// logged, with how late the loop woke and how long the tick's work took, because a late
+    /// wake-up (seen on WSL) looks the same as a slow tick otherwise. (They will become an event
+    /// when the executive's overrun events are designed.)
     fn run(&mut self, tick_limit: Option<u64>) {
         let mut start_us = next_boundary_after(self.clock.monotonic_us());
         let mut ticks_run: u64 = 0;
         loop {
             self.clock.sleep_until_us(start_us);
+            let woke_us = self.clock.monotonic_us();
             self.tick(start_us.checked_div(TICK_US).unwrap_or(0));
             ticks_run = ticks_run.saturating_add(1);
             if tick_limit.is_some_and(|limit| ticks_run >= limit) {
                 return;
             }
 
-            let next_start_us = next_boundary_after(self.clock.monotonic_us());
+            let done_us = self.clock.monotonic_us();
+            let next_start_us = next_boundary_after(done_us);
             let skipped = ticks_skipped(start_us, next_start_us);
             if skipped > 0 {
-                log::warn!("overrun: the tick at {start_us} us took too long, skipped {skipped}");
+                // Two possible causes: the operating system woke the loop late (`late_us`), or
+                // the tick's own work was long (`work_us`). The log says which.
+                let late_us = woke_us.saturating_sub(start_us);
+                let work_us = done_us.saturating_sub(woke_us);
+                log::warn!(
+                    "overrun: the tick at {start_us} us woke {late_us} us late and its work took {work_us} us, skipped {skipped}"
+                );
             }
             start_us = next_start_us;
         }
@@ -161,7 +210,7 @@ impl Exec {
 /// 3. The watchdog, from the environment. If that fails, a watchdog that does nothing takes its
 ///    place and the error is reported once the core exists, because startup does not fail.
 /// 4. The core (`Core::start`): the reset log and the event log.
-/// 5. Each module's `init`, in order.
+/// 5. Each module's `init`, in order, with the bus handles it declared.
 /// 6. The system log's queue, and then the allocation guard (`arm`). The queue's thread
 ///    allocates, so it comes before `arm`.
 fn start(clock: std_clock::StdClock) -> Result<Exec, StartError> {
@@ -199,8 +248,24 @@ fn start(clock: std_clock::StdClock) -> Result<Exec, StartError> {
         EXAMPLE_SOURCE,
         EXAMPLE_PERIOD_TICKS,
     );
+    let mut watcher = slot::Slot::new(
+        watcher::Watcher::new(),
+        WATCHER_SOURCE,
+        WATCHER_PERIOD_TICKS,
+    );
+    // The bus topic, which `Exec` takes over. Each `init` is given the handle its module declared.
+    let mut progress = bus::StateTopic::new();
     let reset = core.reset();
-    example.init(&mut core.ev, &clock, reset);
+    let now = clock.monotonic_us();
+    let out = example::ExampleOut {
+        progress: progress.writer(now),
+    };
+    example.init(&mut core.ev, now, reset, (), out);
+    let now = clock.monotonic_us();
+    let inputs = watcher::WatcherIn {
+        progress: progress.reader(),
+    };
+    watcher.init(&mut core.ev, now, reset, inputs, ());
 
     if let Err(error) = std_syslog::start_queue() {
         log::error!("the system log stays in direct mode: {error}");
@@ -218,7 +283,9 @@ fn start(clock: std_clock::StdClock) -> Result<Exec, StartError> {
     Ok(Exec {
         clock,
         core,
+        progress,
         example,
+        watcher,
     })
 }
 

@@ -12,7 +12,6 @@ use vee_core_api::module;
 use vee_core_api::reset;
 use vee_core_api::throttle;
 use vee_core_types::core_event;
-use vee_osal::clock;
 
 pub struct Slot<M: module::Module> {
     module: M,
@@ -34,11 +33,34 @@ impl<M: module::Module> Slot<M> {
         }
     }
 
-    /// Startup: reads the clock, builds the module's `Ctx` and calls `init`.
-    pub fn init(&mut self, ev: &mut ev::Ev, clock: &impl clock::Clock, reset: reset::ResetInfo) {
-        let time = clock.monotonic_us();
+    /// Startup: builds the module's `Ctx` and calls `init`. `time` is the monotonic time, which
+    /// the executive read once just before this call: it is the time the module sees in
+    /// `ctx.monotonic()`, and the executive uses the same time for the bus handles it makes
+    /// (`StateTopic::writer(time)`), so a sample's `updated_at` and the module's clock agree.
+    /// `inputs` and `out` are the module's bus handles, which the executive makes from the topics
+    /// it owns.
+    ///
+    /// All the borrows share the one lifetime `'a`, the length of this call. (`M::In<'a>` and
+    /// `M::Out<'a>` cannot be shortened by the compiler, because it does not know how a module's
+    /// own type uses `'a`, so the other borrows are made to match them instead.)
+    pub fn init<'a>(
+        &'a mut self,
+        ev: &'a mut ev::Ev,
+        time: u64,
+        reset: reset::ResetInfo,
+        inputs: M::In<'a>,
+        out: M::Out<'a>,
+    ) {
         log::debug!("source {} init at {time} us", self.source);
-        let mut ctx = ctx::Ctx::<M>::new(ev, &mut self.throttle, self.source, time, reset);
+        let mut ctx = ctx::Ctx::<M>::new(
+            ev,
+            &mut self.throttle,
+            self.source,
+            time,
+            reset,
+            inputs,
+            out,
+        );
         self.module.init(&mut ctx);
     }
 
@@ -50,20 +72,30 @@ impl<M: module::Module> Slot<M> {
         });
     }
 
-    /// Calls `step` if this tick is one of the module's. The clock is read just before the call.
-    pub fn step(
-        &mut self,
+    /// Calls `step` if this tick is one of the module's. `time` is the monotonic time the
+    /// executive read just before this call (see `init`).
+    pub fn step<'a>(
+        &'a mut self,
         tick: u64,
-        ev: &mut ev::Ev,
-        clock: &impl clock::Clock,
+        ev: &'a mut ev::Ev,
+        time: u64,
         reset: reset::ResetInfo,
+        inputs: M::In<'a>,
+        out: M::Out<'a>,
     ) {
         if tick.checked_rem(self.period) != Some(0) {
             return;
         }
-        let time = clock.monotonic_us();
         log::debug!("source {} steps at {time} us", self.source);
-        let mut ctx = ctx::Ctx::<M>::new(ev, &mut self.throttle, self.source, time, reset);
+        let mut ctx = ctx::Ctx::<M>::new(
+            ev,
+            &mut self.throttle,
+            self.source,
+            time,
+            reset,
+            inputs,
+            out,
+        );
         self.module.step(&mut ctx);
     }
 }

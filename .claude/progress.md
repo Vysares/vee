@@ -1189,6 +1189,111 @@ Size on 2026-11-17 (cloc, working tree, no target dir): 14 Rust files, 1729 line
     Sample run (8 s, release): 2 overruns where it had one per event; the cause of those two is not yet found. 369 tests; clippy
     and fmt clean. Not done: the `Core::tick` allocation-free assertion, `write_file` still uses `format!` (allocates on the worker).
 
+75. **The sample's overruns explained** (2026-11-23; `sample-deployment/src/main.rs`). The 2 overruns left after
+    item 74 are NOT Vee's work: a probe in `Exec::run` showed the loop woke 12.8 ms late (work took 2 us). A plain
+    `thread::sleep` loop with no Vee code on WSL2 also wakes 2 to 11 ms late about once per 10 s. The user ran the
+    sample on native Linux: no overruns. The cause is WSL2's scheduler and timer, not the code. `Exec::run` now
+    reads the clock right after the sleep and the overrun `log::warn!` says `woke N us late and its work took M us`,
+    so a late wake-up and a slow tick can be told apart. The skip rule is unchanged (it is about clock time, whatever
+    the cause). Decided with the user: do this now, without waiting for the overrun event; the Health domain will
+    take the same two numbers when overrun detection is designed (a late wake-up and a slow tick may get different
+    severities). Not done: `clock_nanosleep` with an absolute time (needs `unsafe`, and would not fix WSL).
+    Tests unchanged: 4 sample unit + 4 sample run tests pass, clippy and fmt clean.
+
+76. **Software bus design split out and settled** (2026-11-23; `docs/bus.md` new and complete for what is decided,
+    `docs/design.md` "Software Bus" is a pointer, its Events bullet on telemetry updated). No code. Decided with the
+    user: (a) use cases enumerated (telemetry state and queues by table, FDIR, pipelines, recorder, fan-in, flow
+    control); table driven modules are wired to every topic they could need at compile time and filter inside the
+    module, nothing subscribes at runtime; (b) typed handles for ordinary modules (`Module::In<'a>` and `Out<'a>`,
+    `ctx.inputs` and `ctx.out`, compile time errors) plus a dyn view by APID for telemetry, FDIR and the recorder,
+    both built from the same `Topic` (option Y; the F Prime split is the same); (c) state topic: one shared slot, no
+    copy per reader, `latest() -> Option<&Sample<T>>`; (d) queued topics: a queue per reader (fan-out), policy per
+    queue (refuse or drop and count), `publish` returns `Result<(), Full>`, flow control by `writer.space()` (a
+    credit count, no blocking), fan-in by one queue topic per producer; (e) a reader that runs before its writer is
+    a WARNING in the macro; (f) field access is required, done as DATA (2026-11-23, later in the day): the derive writes `encode` and a
+    `LAYOUT` (name, wire offset, kind per field) for every message type, one hand written `read(bytes, field)`
+    in safe Rust reads a field (no cast, no `unsafe`), rows name a field by index, queued topics have a layout but
+    no "latest"; the dyn view (`&dyn Topic`, implemented once generically) is the erased collection a table driven
+    module needs, since its topics have different types and the table gives APIDs as data (later than slice one); (g) core topics are normal topics; APIDs are unique and defined in ONE place, the deployment's topic list (never in a module crate), a duplicate is a compile error (no range check on the `u16` for now); (h) events: one `Ev`, `send` also
+    pushes to a second queue for the bus only if a severity filter allows (Off is an option and the default),
+    switched by a CORE command (reaching the core through a command sink fed by a link module), `Ev` has its own
+    step at the top of `core.tick` that flushes to the events topic, one tick of delay accepted. First slice: typed
+    state topics only, hand wired in the sample. Open: how a queued writer reaches its N queues, fan-in fairness,
+    derive field kinds and `Value`, the bus queue's depth and the filter command's shape. Also this session: the
+    sample's overrun warning now says how late the loop woke and how long the work took (item 75).
+
+77. **Bus slice 1, step 1: `bus::StateTopic<T>`** (`core-api/src/bus.rs`, new; `pub mod bus` in `lib.rs`). `Sample<T> {
+    value, seq, updated_at }` (derives `Debug, Clone, Copy, PartialEq, Eq`; `T` is not bounded) and `StateTopic<T>`:
+    `new()` (a `const fn`), `publish(now, value)`, `latest() -> Option<&Sample<T>>`, `Default`. No value until
+    the first publish (`None`, no default value). `seq` is 1 for the first publish and WRAPS at `u32::MAX` (a
+    counter that stuck would look like "no new value" for ever). The topic is one slot; there is no copy per
+    reader. 6 tests (core-api: 75 lib tests). Not yet: `StateWriter` and `StateReader` (the handles a module gets;
+    a module never holds the topic), `Module::In`/`Out`, `ctx.inputs`/`ctx.out`, the loop test and the sample's
+    second module (the rest of slice 1, in `docs/bus.md`).
+
+78. **Bus slice 1, step 2: the handles** (`core-api/src/bus.rs`). `StateTopic::writer(&mut self, now) ->
+    StateWriter<'_, T>` and `StateTopic::reader(&self) -> StateReader<'_, T>`. `StateWriter` holds `&mut StateTopic`
+    and the time of the call (private fields); its one method is `publish(value)`, which uses that time, so every
+    publish in a call has the same time. `StateReader` holds `&StateTopic`; its one method is `latest() ->
+    Option<&'a Sample<T>>` (the reference lives as long as the topic borrow `'a`, not only as long as the
+    handle). No derives on the handles. Checked by hand (a temporary test file, deleted): a reader has no
+    `publish`, a writer has no `latest`, a reader held across a write does not compile (E0502), and a reader
+    of another type does not fit. 4 new tests (core-api: 10 in `bus`; workspace 379). Not yet: `Module::In<'a>`
+    and `Out<'a>`, `ctx.inputs` and `ctx.out`, the loop test and the sample's second module.
+
+79. **Bus slice 1, step 3: `Module::In`/`Out` and `ctx.inputs`/`ctx.out`**. `Module` has two generic associated types,
+    `type In<'a>;` and `type Out<'a>;` (no defaults: a module with no bus handles writes `type In<'a> = ();` and
+    `type Out<'a> = ();`). `Ctx<'a, M>` has `pub inputs: M::In<'a>` and `pub out: M::Out<'a>`; `Ctx::new` takes both
+    (7 arguments). `Slot::init` and `Slot::step` take `inputs` and `out` too, with ONE lifetime `'a` for `&'a mut
+    self`, `&'a mut Ev`, `inputs` and `out`: the compiler cannot shorten `M::In<'a>` (it does not know how a module's
+    type uses `'a`), so the simple signature fails ("lifetime may not live long enough", tried by hand). Every
+    existing module and call now says `()` and `(), ()` (the example module, the three loop test modules, the two
+    ctx test modules and their `run_init`/`run_step` helpers, the sample's `Exec`). No behaviour change: 379 tests
+    pass, clippy and fmt clean. Not yet: a module that actually uses a topic. Next: the loop test with two modules
+    (one publishes, one reads), including the order rule, then the sample's second module.
+
+80. **Bus slice 1, step 4: the loop test** (`core/tests/bus_loop.rs`, new, 4 tests; workspace 383). A hand written
+    executive owns one `StateTopic<u32>` and two modules, `Sensor` (`Out` = `SensorOut { reading: StateWriter }`,
+    publishes 10, 20, 30 ... and sends an event) and `Controller` (`In` = `ControllerIn { reading: StateReader }`,
+    reports `value N seq S updated T` or `no reading` as an event). `Exec` makes the handles for each call with a
+    struct literal (`self.reading.writer(now)`, `self.reading.reader()`) and passes them to `Slot::step`; `Order`
+    picks which module is called first. Tests: a reader after its writer sees this tick's value; a reader before
+    it sees the last tick's (`no reading` in tick 0); a slow reader sees only the latest and `seq` jumps (1 to 5);
+    a fast reader sees the same sample and `seq` until the writer publishes again. Mutations checked: swapping the
+    call order fails the three order tests, a `seq` that does not increase fails all four. FOUND: the exec reads
+    the clock for a writer's `now` and `Slot::step` reads it again for `Ctx`, so the two can differ with a real
+    clock (the fake does not move inside a call): added to the open list in `bus.md`. Next: the sample
+    deployment's second module that reads the example module's topic.
+
+81. **One clock read per call** (`core/src/slot.rs`). `Slot::init` and `Slot::step` now take `time: u64` (the
+    monotonic time the executive read just before the call) instead of `clock: &impl Clock`, so the time in a
+    module's `Ctx` and the time the executive gave a writer's handle (`StateTopic::writer(now)`) are the same
+    number by construction. `slot.rs` no longer imports the OSAL clock. Callers read the clock inline per call
+    (`self.clock.monotonic_us()`): the sample's `Exec::tick` and `start`, `exec_loop.rs`; `bus_loop.rs` reads `now`
+    once per call and uses it for both. The open item in `bus.md` became a settled bullet. No behaviour change:
+    383 tests pass, clippy and fmt clean. Next: the sample deployment's second module that reads the example
+    module's topic.
+
+82. **Bus slice 1, step 5: the sample's second module. SLICE 1 IS DONE.** `vee-example` now publishes a state topic:
+    `Progress { steps }` (declared in that crate), `ExampleOut { progress: StateWriter<Progress> }` as
+    `Module::Out`, and `step` publishes after sending its event; 2 new tests (4). New crate `modules/watcher`
+    (`vee-watcher`, depends on `vee-core-api` and `vee-example` for the type; in the workspace members and the
+    sample's dependencies): `Watcher` has `In` = `WatcherIn { progress: StateReader<Progress> }`, keeps
+    `last_seen: Option<u32>` (the `seq` it last reported; `Option`, not 0, because `seq` wraps), and on a new `seq`
+    sends `Saw` (Info): `example at step N, seq S, M missed, A us old` (`M` = publishes replaced before it looked,
+    `A` = `ctx.monotonic() - updated_at`); nothing for no value or a value already seen. 5 tests. The sample's
+    `Exec` owns `progress: StateTopic<example::Progress>` and two slots; `tick` is core report, core tick, then
+    `step_example` (builds the writer) and `step_watcher` (builds the reader), in that order; `start` makes the
+    topic, calls both `init`s with their handles, and moves it into `Exec`. The watcher steps every 200 ticks
+    (`WATCHER_PERIOD_TICKS`), the example every 100, so the watcher misses every other value. By hand: `example
+    at step 2, seq 2, 1 missed, 19 us old` at 2 s, `step 4, seq 4, 1 missed` at 4 s. New program test in
+    `sample_runs.rs` (450 ticks, 4.6 s): checks the invariants (step equals seq, one missed after the first look)
+    and not the tick numbers, because those depend on how long startup took. One run of the old version of
+    that test (exact numbers) failed once under `--features alloc-guard` and passed 20 times after; the cause
+    was not found (startup time or a skipped tick are the suspects), so the test was made less exact. 391 tests,
+    clippy and fmt clean. NEXT (in `docs/bus.md`): queued topics (a queue per reader, policy, `space()`), then
+    `Ev`'s bus queue and flush, the `bus::Message` derive with a layout, APIDs and the dyn view.
+
 ## WHERE WE LEFT OFF (2026-11-20)
 Everything builds, all 369 tests pass, clippy (strict lints of item 29) and `cargo fmt --check` are
 clean. Committed by the user: up to `9934bdb "update docs"` (items 1 to 40). NOT yet committed:
@@ -1206,7 +1311,7 @@ with `sleep_until_us`, `files`, `syslog`, `panic_report`, `watchdog`, `platform`
 `LinuxPlatform`). `modules/example` is the sample module. `sample-deployment` (S2a to S2e done) is the first executable: `start`
 (the whole start sequence), `Exec::run` (the loop: absolute boundaries, an overrun skips, logged),
 `VEE_SAMPLE_TICKS=N` to end through `Core::stop`. The software bus is DESIGNED (item 58) and not written.
-The blocking event log write is gone (item 74); two sample overruns in 8 s remain, cause unknown.
+The blocking event log write is gone (item 74); the two sample overruns on WSL were late wake-ups (item 75); none on native Linux.
 
 ## Next
 Open choices, in the order I would do them, all for the user to pick:

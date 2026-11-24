@@ -9,15 +9,34 @@
 //! - An `impl module::Module` for the struct: `init` runs once at startup, `step` runs at the
 //!   module's rate. Each is given a `Ctx`, which is how the module reaches anything outside
 //!   itself.
+//! - The bus topics it writes, as a struct of writers (`ExampleOut`) that `Module::Out` names.
+//!   The type of what it publishes (`Progress`) is declared here, in this crate: a module that
+//!   reads it depends on this crate for the type.
 //!
 //! The deployment decides the rest: the module's source id, its rate, and where it sits in the
 //! order. The module never knows them.
 #![forbid(unsafe_code)]
 #![no_std]
 
+use vee_core_api::bus;
 use vee_core_api::ctx;
 use vee_core_api::event;
 use vee_core_api::module;
+
+/// What `Example` publishes on the bus, as a state topic: how far it has got. A state topic holds
+/// only the latest value, so a reader that looks less often than the module steps misses some
+/// (`bus::Sample::seq` shows how many).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Progress {
+    /// How many times `step` has run since startup.
+    pub steps: u32,
+}
+
+/// The topics `Example` writes: what `Module::Out` names. The executive makes one for each call,
+/// from the topic it owns (`StateTopic::writer`), and the module can only publish through it.
+pub struct ExampleOut<'a> {
+    pub progress: bus::StateWriter<'a, Progress>,
+}
 
 /// The events `Example` can send.
 ///
@@ -55,6 +74,8 @@ impl Example {
 
 impl module::Module for Example {
     type Event = ExampleEv;
+    type In<'a> = ();
+    type Out<'a> = ExampleOut<'a>;
 
     /// Runs once, before the first tick. A module reads `ctx.reset` here to learn how the last
     /// run ended, and does its setup.
@@ -74,12 +95,15 @@ impl module::Module for Example {
         let now = ctx.monotonic();
         ctx.ev
             .send(ExampleEv::Stepped, format_args!("step {steps} at {now} us"));
+        // Publishing replaces the topic's value. Its time is this call's, `now`.
+        ctx.out.progress.publish(Progress { steps });
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super as example;
+    use vee_core_api::bus;
     use vee_core_api::ctx;
     use vee_core_api::ev;
     use vee_core_api::event;
@@ -95,6 +119,8 @@ mod tests {
         ev: ev::Ev,
         throttle: throttle::Throttle,
         reset: reset::ResetInfo,
+        /// The topic the module publishes to. The harness owns it, as the executive does.
+        progress: bus::StateTopic<example::Progress>,
         example: example::Example,
     }
 
@@ -104,6 +130,7 @@ mod tests {
                 ev: ev::Ev::new(),
                 throttle: throttle::Throttle::new(),
                 reset,
+                progress: bus::StateTopic::new(),
                 example: example::Example::new(),
             }
         }
@@ -115,6 +142,10 @@ mod tests {
                 SOURCE,
                 time_us,
                 self.reset,
+                (),
+                example::ExampleOut {
+                    progress: self.progress.writer(time_us),
+                },
             );
             self.example.init(&mut ctx);
         }
@@ -126,6 +157,10 @@ mod tests {
                 SOURCE,
                 time_us,
                 self.reset,
+                (),
+                example::ExampleOut {
+                    progress: self.progress.writer(time_us),
+                },
             );
             self.example.step(&mut ctx);
         }
@@ -162,5 +197,24 @@ mod tests {
         assert_eq!(second.monotonic_us, 2_000);
         assert_eq!(second.code, event::Code::code(&example::ExampleEv::Stepped));
         assert!(harness.ev.log.is_empty());
+    }
+
+    #[test]
+    fn nothing_is_published_until_the_first_step() {
+        let mut harness = Harness::new(reset::ResetInfo::first_boot());
+        harness.init(100);
+        assert_eq!(harness.progress.reader().latest(), None);
+    }
+
+    #[test]
+    fn each_step_publishes_its_number_at_the_time_of_the_call() {
+        let mut harness = Harness::new(reset::ResetInfo::first_boot());
+        harness.step(1_000);
+        harness.step(2_000);
+
+        let sample = harness.progress.reader().latest().copied().unwrap();
+        assert_eq!(sample.value, example::Progress { steps: 2 });
+        assert_eq!(sample.seq, 2);
+        assert_eq!(sample.updated_at, 2_000);
     }
 }

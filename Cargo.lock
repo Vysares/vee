@@ -101,4 +101,13 @@ dependencies = [
  "vee-core-types",
  "vee-example",
  "vee-osal",
+ "vee-watcher",
+]
+
+[[package]]
+name = "vee-watcher"
+version = "0.1.0"
+dependencies = [
+ "vee-core-api",
+ "vee-example",
 ]
