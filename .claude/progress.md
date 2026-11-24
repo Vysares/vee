@@ -1294,6 +1294,26 @@ Size on 2026-11-17 (cloc, working tree, no target dir): 14 Rust files, 1729 line
     clippy and fmt clean. NEXT (in `docs/bus.md`): queued topics (a queue per reader, policy, `space()`), then
     `Ev`'s bus queue and flush, the `bus::Message` derive with a layout, APIDs and the dyn view.
 
+83. **Queued topics, step 1: storage (`QueuedTopic<T, N, D>`), no handles yet** (`core-api/src/bus.rs`). The open
+    question in `docs/bus.md` ("how does a queued topic's writer reach its N queues") was settled with the user
+    first: ALL readers of one topic share one depth `D` (`[queue::Queue<T, D>; N]`), not a depth per reader —
+    simpler, no macro needed, matches `Queue<T, N>`'s own const-generic shape; a reader that genuinely needs a
+    different depth gets its own topic. `Policy { Refuse, Drop }` is chosen PER READER, not per topic: `Refuse`
+    makes `publish` report `Err(Full)` when that reader's queue is full (a flow controlled link checks `space()`
+    first and should rarely see it); `Drop` lets a full queue silently drop the new message, counted by the queue
+    itself (`Queue::take_refused`, reused rather than a second counter). `publish(value) -> Result<(), Full>`
+    pushes a COPY (`T: Copy`, the first bound this crate puts on a bus message type) into every queue that has
+    room; one full queue never stops delivery to the others (checked by a test: a `Refuse` reader stays full and
+    keeps its old value while a `Drop` reader that had freed up still gets the new one). `pop(reader)`,
+    `len(reader)`, `is_empty(reader)`, `take_refused(reader)` (a plain `usize` index for now: the typed per-reader
+    handle is the next step) and `space()` (the smallest free count among all readers' queues; `D` if there are
+    none). No `Sample`, `seq` or `updated_at`: queued messages are not timestamped by the topic (unlike a state
+    topic's `Sample`). 8 new tests (core-api lib: 102; workspace 399). clippy and fmt clean. `docs/bus.md` updated
+    (the open question is settled, a new "Queued topics, step 1" section). Not yet: `QueueWriter`/`QueueReader`
+    handles (so a module's `ctx.out`/`ctx.inputs` hold a specific reader index, not a raw `usize`),
+    `Module::In`/`Out` wiring for a queued topic, a loop test (like `core/tests/bus_loop.rs` for state topics),
+    `Ev`'s bus queue.
+
 ## WHERE WE LEFT OFF (2026-11-20)
 Everything builds, all 369 tests pass, clippy (strict lints of item 29) and `cargo fmt --check` are
 clean. Committed by the user: up to `9934bdb "update docs"` (items 1 to 40). NOT yet committed:

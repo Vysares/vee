@@ -64,6 +64,9 @@ pub struct Sample<T> { pub value: T, pub seq: u32, pub updated_at: u64 }
 ## Queued topics (fan-out)
 - One writer, N readers, **a queue per reader** (`queue::Queue<T, D>`). Each reader gets its own copy of every
   message. Simple, and the memory is small.
+- **Settled 2026-11-24**: all readers of one topic share one depth `D` (`QueuedTopic<T, N, D>`, a `[Queue<T, D>;
+  N]`), not a depth per reader. Simpler, no macro needed, matches `Queue<T, N>`'s own const-generic shape. A
+  reader that genuinely needs a different depth gets its own topic.
 - A queue's **policy** is chosen per queue in the config: refuse (the writer keeps its data, for flow controlled
   links) or drop (and count, reported as an event, for lossy ones). Never a silent drop.
 - A full queue at one reader never blocks the others: the message goes to every queue that has room.
@@ -195,12 +198,15 @@ State topics only, typed, hand wired in the sample deployment. No derive, no API
 4. The sample deployment: `Example` publishes `Progress`, a new module `Watcher` (`modules/watcher`) reads it at
    half the rate and reports what it sees, including how many publishes it missed.
 
-Then, in this order: queued topics (queue per reader, policy, `space()`), `Ev`'s bus queue and flush, the
-`bus::Message` derive with field access, APIDs and the dyn view, the core commands for the events filter, the
-recorder, telemetry, FDIR.
+## Queued topics, step 1 (DONE 2026-11-24)
+Storage only, no handles yet: `bus::QueuedTopic<T, N, D>`, `Policy { Refuse, Drop }` per reader, `publish`,
+`pop`/`len`/`is_empty`/`take_refused` by a plain reader index, `space()`. See `core-api/src/bus.rs`.
+
+Then, in this order: `QueueWriter`/`QueueReader` handles and `Module::In`/`Out` wiring for a queued topic (a loop
+test like the state topic's), `Ev`'s bus queue and flush, the `bus::Message` derive with field access, APIDs and
+the dyn view, the core commands for the events filter, the recorder, telemetry, FDIR.
 
 ## Open
-- How a queued topic's writer reaches its N queues (a slice of same depth queues, or one depth per reader).
 - Fan-in fairness for the link module.
 - Field kinds the layout supports (arrays, nested, text) and the exact `Value` type.
 - The depth of `Ev`'s bus queue, and the shape of the core command that sets its filter.
