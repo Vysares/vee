@@ -8,12 +8,14 @@
 //! `Ev::send`, so a module cannot claim another module's id. The core's own code (such as
 //! `reset_log::report`) calls `send` with `core_event::SOURCE`.
 //!
-//! Who calls what: a sender calls `send`, which puts the event in the log queue. The event log's
-//! writer takes the events out of it (looking at the next one with `peek` and taking it with
-//! `pop` once it has room for it), and the core sends what the queue refused (`take_refused`) on
-//! as events. Other consumers of events (the downlink, FDIR) are subscribers on the bus, which the
-//! executive feeds from the events a module sent, right after that module's step.
+//! Who calls what: a sender calls `send`, which puts the event in the log queue, and, if the bus
+//! filter allows the event's severity, also in the bus queue. The event log's writer takes events
+//! out of the log queue (looking at the next one with `peek` and taking it with `pop` once it has
+//! room for it), and the core sends what the queue refused (`take_refused`) on as events.
+//! `flush_bus` takes events out of the bus queue and publishes them to the events topic: see
+//! `docs/bus.md`, "Events on the bus".
 
+use crate::bus;
 use crate::config;
 use crate::event;
 use crate::queue;
@@ -30,7 +32,14 @@ config::setting! {
     pub EV_LOG_QUEUE_DEPTH: usize = 1024, 1..=65535;
 }
 
-/// The event service: the log queue. Nothing is allocated.
+config::setting! {
+    /// How many events the BUS queue holds, separately from the log queue above. `flush_bus`
+    /// drains it into the events topic once a tick, so it only needs to hold what one tick's
+    /// worth of filtered events adds, plus margin. Default 64, 1..=65535.
+    pub EV_BUS_QUEUE_DEPTH: usize = 64, 1..=65535;
+}
+
+/// The event service: the log queue, the bus queue and the bus filter. Nothing is allocated.
 ///
 /// This is the core's, not a module's. It is `pub` and lives in this crate only because `Ctx`
 /// (which modules see) holds the handle `ctx.ev`, and that handle holds a `&mut Ev`. A module
@@ -42,13 +51,30 @@ config::setting! {
 pub struct Ev {
     /// Every event: the log is the on board record.
     pub log: queue::Queue<event::Event, EV_LOG_QUEUE_DEPTH>,
+    /// Events that passed `filter`, waiting for `flush_bus` to publish them to the events topic.
+    /// Separate from `log`, so a full bus queue (a slow telemetry reader) never affects what the
+    /// event log keeps, and vice versa.
+    pub bus: queue::Queue<event::Event, EV_BUS_QUEUE_DEPTH>,
+    /// The bus queue's severity floor. `None` is Off, the default: nothing reaches `bus` until a
+    /// core command sets a floor (the command is not written yet, see `docs/bus.md`). `Some(s)`
+    /// lets `s` and worse through.
+    filter: Option<event::Severity>,
 }
 
 impl Ev {
     pub const fn new() -> Self {
         Ev {
             log: queue::Queue::new(),
+            bus: queue::Queue::new(),
+            filter: None,
         }
+    }
+
+    /// Sets the bus queue's severity floor. `None` turns it off (the default): no event reaches
+    /// `bus` until this is called with `Some`. Will be called from the core command that switches
+    /// the filter, once that command exists; nothing else should hold a handle to it.
+    pub fn set_filter(&mut self, filter: Option<event::Severity>) {
+        self.filter = filter;
     }
 
     /// Builds an event and queues it. The event's code and severity come from `code`, and its
@@ -106,6 +132,40 @@ impl Ev {
             reason = "a refused event is dropped on purpose, and the queue has counted it"
         )]
         let _ = self.log.push(event);
+
+        // The bus queue gets a second copy, only if the filter lets this severity through
+        // (`Event` is `Copy`, so this is not the sender's event, just as `self.log.push` above
+        // took its own copy).
+        if let Some(floor) = self.filter
+            && event.severity >= floor
+        {
+            #[allow(
+                clippy::let_underscore_must_use,
+                reason = "a refused event is dropped on purpose, and the queue has counted it"
+            )]
+            let _ = self.bus.push(event);
+        }
+    }
+
+    /// Publishes everything waiting in the bus queue to the events topic, oldest first, then
+    /// empties the queue. Called once a tick, next to the log writer's `step` (see
+    /// `docs/bus.md`, "Events on the bus"); not yet called by `Core::tick`, because nothing reads
+    /// the events topic until telemetry exists to size it (`N`, `D`).
+    ///
+    /// A publish that a `Refuse` reader's full queue turns down is already counted on that
+    /// reader's own queue (`QueuedTopic::take_refused`): there is nothing left to do with it
+    /// here, the same as a full `log` or `bus` queue above.
+    pub fn flush_bus<const N: usize, const D: usize>(
+        &mut self,
+        topic: &mut bus::QueuedTopic<event::Event, N, D>,
+    ) {
+        while let Some(event) = self.bus.pop() {
+            #[allow(
+                clippy::let_underscore_must_use,
+                reason = "a refused reader has already counted it on its own queue"
+            )]
+            let _ = topic.publish(event);
+        }
     }
 }
 
@@ -121,5 +181,113 @@ fn log_level(severity: event::Severity) -> log::Level {
 impl Default for Ev {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super as ev;
+    use crate::bus;
+    use crate::event;
+
+    /// An enum of codes written out by hand (the derive's output does not resolve inside this
+    /// crate: see the same note in `throttle.rs`'s tests), with a different severity per variant
+    /// so the filter tests can tell them apart.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Sample {
+        Info,
+        Warn,
+        Err,
+    }
+
+    impl event::Code for Sample {
+        fn code(&self) -> u16 {
+            *self as u16
+        }
+        fn severity(&self) -> event::Severity {
+            match self {
+                Sample::Info => event::Severity::Info,
+                Sample::Warn => event::Severity::Warn,
+                Sample::Err => event::Severity::Err,
+            }
+        }
+        fn index(&self) -> usize {
+            *self as usize
+        }
+        fn from_index(index: usize) -> Option<Self> {
+            [Sample::Info, Sample::Warn, Sample::Err]
+                .get(index)
+                .copied()
+        }
+    }
+
+    #[test]
+    fn the_bus_queue_is_off_by_default_and_stays_empty() {
+        let mut sent = ev::Ev::new();
+        sent.send(1, 0, Sample::Err, format_args!("a"));
+        assert!(sent.bus.is_empty());
+        assert!(!sent.log.is_empty()); // the log queue is unaffected by the filter
+    }
+
+    #[test]
+    fn a_filter_lets_through_its_floor_and_worse_only() {
+        let mut sent = ev::Ev::new();
+        sent.set_filter(Some(event::Severity::Warn));
+        sent.send(1, 0, Sample::Info, format_args!("info"));
+        sent.send(1, 0, Sample::Warn, format_args!("warn"));
+        sent.send(1, 0, Sample::Err, format_args!("err"));
+        assert_eq!(sent.bus.len(), 2);
+        assert_eq!(sent.bus.pop().unwrap().text.as_str(), "warn");
+        assert_eq!(sent.bus.pop().unwrap().text.as_str(), "err");
+    }
+
+    #[test]
+    fn a_full_bus_queue_refuses_and_counts_separately_from_the_log_queue() {
+        let mut sent = ev::Ev::new();
+        sent.set_filter(Some(event::Severity::Info)); // everything passes
+        for _ in 0..ev::EV_BUS_QUEUE_DEPTH.saturating_add(3) {
+            sent.send(1, 0, Sample::Info, format_args!("x"));
+        }
+        assert_eq!(sent.bus.len(), ev::EV_BUS_QUEUE_DEPTH);
+        assert_eq!(sent.bus.take_refused(), 3);
+        // The log queue (depth 1024 by default) took every one of them: its own refusal count
+        // is unaffected by the bus queue filling up.
+        assert_eq!(sent.log.take_refused(), 0);
+    }
+
+    #[test]
+    fn flush_bus_publishes_everything_waiting_in_order_and_empties_the_queue() {
+        let mut sent = ev::Ev::new();
+        sent.set_filter(Some(event::Severity::Info));
+        sent.send(1, 10, Sample::Info, format_args!("one"));
+        sent.send(1, 20, Sample::Warn, format_args!("two"));
+
+        let mut topic = bus::QueuedTopic::<event::Event, 1, 4>::new([bus::Policy::Drop]);
+        sent.flush_bus(&mut topic);
+
+        assert!(sent.bus.is_empty());
+        let first = topic.pop(0).unwrap();
+        assert_eq!(first.text.as_str(), "one");
+        let second = topic.pop(0).unwrap();
+        assert_eq!(second.text.as_str(), "two");
+        assert_eq!(topic.pop(0), None);
+    }
+
+    #[test]
+    fn flush_bus_does_not_stop_at_a_reader_that_refuses() {
+        let mut sent = ev::Ev::new();
+        sent.set_filter(Some(event::Severity::Info));
+        sent.send(1, 10, Sample::Info, format_args!("one"));
+        sent.send(1, 20, Sample::Info, format_args!("two"));
+
+        // Depth 1, Refuse: the second publish is turned down, but flush keeps going (it does not
+        // see or care about the `Err`, the same as `Ev::send` does not retry a full `log`).
+        let mut topic = bus::QueuedTopic::<event::Event, 1, 1>::new([bus::Policy::Refuse]);
+        sent.flush_bus(&mut topic);
+
+        assert!(sent.bus.is_empty());
+        let first = topic.pop(0).unwrap();
+        assert_eq!(first.text.as_str(), "one");
+        assert_eq!(topic.pop(0), None); // "two" was lost: the queue was already full with "one"
     }
 }

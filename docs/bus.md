@@ -202,9 +202,52 @@ State topics only, typed, hand wired in the sample deployment. No derive, no API
 Storage only, no handles yet: `bus::QueuedTopic<T, N, D>`, `Policy { Refuse, Drop }` per reader, `publish`,
 `pop`/`len`/`is_empty`/`take_refused` by a plain reader index, `space()`. See `core-api/src/bus.rs`.
 
-Then, in this order: `QueueWriter`/`QueueReader` handles and `Module::In`/`Out` wiring for a queued topic (a loop
-test like the state topic's), `Ev`'s bus queue and flush, the `bus::Message` derive with field access, APIDs and
-the dyn view, the core commands for the events filter, the recorder, telemetry, FDIR.
+## Queued topics, step 2 (DONE 2026-11-24)
+`QueueWriter`/`QueueReader` handles, the queued counterpart of `StateWriter`/`StateReader`. One difference:
+a queued reader MUTATES (popping removes the message from its own queue), so unlike `StateReader` it borrows the
+whole topic mutably, not immutably; in practice this is no different from the writer and readers never
+overlapping, because each handle is made fresh for one module call and dropped when it returns. Checked by hand
+(temporary code, deleted): a writer has no `pop`, a reader has no `publish`, a reader held across a later write
+does not compile (E0499, not holding two `&mut` borrows of the topic at once), a reader of another message type
+does not fit. `QueueWriter` has `publish` and `space()`; `QueueReader` has `pop()` only (no `take_refused`: that
+stays on `QueuedTopic` itself, for whichever core-level code owns the topic, the same way `Ev`'s log queue is
+`pub` and used directly by its consumer).
+
+## Queued topics, step 3 (DONE 2026-11-24)
+`Module::In`/`Out` wiring for a queued topic and a loop test, `core/tests/queued_bus_loop.rs`: a `Producer` and
+two `Reader`s (the SAME module type, reused, since a reader's behaviour does not depend on which queue or policy
+it was wired to), one topic `QueuedTopic<u32, 2, 2>` with reader 0 `Refuse` and reader 1 `Drop`. Checks fan-out
+(both readers get their own copy, in order), a FIFO backlog up to the queue's depth for a reader that falls
+behind, and that only the `Refuse` reader's fullness makes the writer see `Err(Full)` (a `Drop` reader's
+fullness is silent to the writer, counted on the queue itself, found by `exec.feed.take_refused(1)` with no
+module involved).
+
+FOUND while writing it (not a bug in `QueuedTopic`, a gap in the test harness, inherited from `bus_loop.rs`):
+neither hand written executive ever called `Slot::report_suppressed`, which is also what starts a module's new
+tick of throttle counting. Without it, `EV_MAX_PER_TICK` (default 5) becomes a budget for the WHOLE RUN, not
+per tick, so a code sent every tick (this test's `Producer`/`Reader`, unlike `bus_loop.rs`'s, which never
+happened to run that many ticks) goes silently missing from the 6th occurrence on. Fixed in
+`queued_bus_loop.rs`'s `run_tick` by calling `report_suppressed` for every slot before `core.tick`, matching the
+documented loop shape (`docs/design.md`, Executive Requirements). `bus_loop.rs` has the same gap, latent only
+because its tests stay at or under 5 occurrences per code; not changed, since it is out of scope here.
+
+## Events on the bus, step 1 (DONE 2026-11-24)
+`Ev` gets a second queue, `bus` (depth `EV_BUS_QUEUE_DEPTH`, default 64, separate from `log`'s), and a severity
+floor filter, `None` (Off) by default. `send` pushes the same event into `bus` too, only if its severity meets
+the floor; a full `bus` queue refuses and counts on its own, same as `log`. `Ev::flush_bus(topic)` pops
+everything waiting in `bus` and publishes it to a `QueuedTopic<Event, N, D>`, oldest first; a publish a
+`Refuse` reader's full queue turns down is just lost and counted there, same as `log_writer.rs` doesn't retry a
+full `log`. `set_filter` is the only way to turn the floor on (no module holds it, per the design above); there
+is no core command yet to call it, so a deployment today gets no events on the bus until one is written.
+NOT wired into `Core::tick`: nothing sizes `N`/`D` yet (that is the events topic's reader count and depth,
+which belongs to whatever reads it — telemetry, later in this roadmap), so `flush_bus` is tested standalone
+(`core-api/src/ev.rs`) rather than through a loop test, unlike the state and queued topic slices before it.
+Wiring `Core::tick` to call it, and a loop test proving an event reaches a reader, waits until something
+exists to read the events topic.
+
+Then, in this order: the `bus::Message` derive with field access, APIDs and the dyn view, the core commands for
+the events filter (which will also be what wires `flush_bus` into `Core::tick`, once the events topic it writes
+to is sized), the recorder, telemetry, FDIR.
 
 ## Open
 - Fan-in fairness for the link module.

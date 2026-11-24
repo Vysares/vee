@@ -201,6 +201,60 @@ impl<T: Copy, const N: usize, const D: usize> QueuedTopic<T, N, D> {
             .min()
             .unwrap_or(D)
     }
+
+    /// The handle for the topic's one writer, for one call into that module. It borrows the whole
+    /// topic mutably (publishing reaches every queue), so while it lives nothing else can use the
+    /// topic: checked by the compiler, not by a rule.
+    pub fn writer(&mut self) -> QueueWriter<'_, T, N, D> {
+        QueueWriter { topic: self }
+    }
+
+    /// The handle for one reader, for one call into that module. `reader` is this reader's index
+    /// among the `N` queues, fixed when the handles are wired (by hand today, by `exec!` later).
+    /// Unlike a state topic's reader, this ALSO borrows the whole topic mutably: popping removes
+    /// the message from that one queue, and Rust cannot see that the other `N - 1` queues are
+    /// untouched, only that `QueuedTopic` as a whole was asked to change. In practice this is no
+    /// different from the state topic's writer and readers: each module's handle is made for one
+    /// call and dropped when it returns, so two modules never hold one at the same time.
+    pub fn reader(&mut self, reader: usize) -> QueueReader<'_, T, N, D> {
+        QueueReader {
+            topic: self,
+            reader,
+        }
+    }
+}
+
+/// What a module that WRITES a queued topic holds (in its `ctx.out`): it can publish and check
+/// `space()`, and nothing else.
+pub struct QueueWriter<'a, T, const N: usize, const D: usize> {
+    topic: &'a mut QueuedTopic<T, N, D>,
+}
+
+impl<T: Copy, const N: usize, const D: usize> QueueWriter<'_, T, N, D> {
+    /// Delivers `value` to every reader's queue that has room. See `QueuedTopic::publish`.
+    pub fn publish(&mut self, value: T) -> Result<(), Full> {
+        self.topic.publish(value)
+    }
+
+    /// The smallest number of free slots among all readers. See `QueuedTopic::space`.
+    pub fn space(&self) -> usize {
+        self.topic.space()
+    }
+}
+
+/// What a module that READS a queued topic holds (in its `ctx.inputs`): it can pop its own queue
+/// and nothing else. It does not see the other readers' queues, even though the same `QueuedTopic`
+/// holds them.
+pub struct QueueReader<'a, T, const N: usize, const D: usize> {
+    topic: &'a mut QueuedTopic<T, N, D>,
+    reader: usize,
+}
+
+impl<T: Copy, const N: usize, const D: usize> QueueReader<'_, T, N, D> {
+    /// The next message waiting, oldest first, or `None` if there is none. See `QueuedTopic::pop`.
+    pub fn pop(&mut self) -> Option<T> {
+        self.topic.pop(self.reader)
+    }
 }
 
 #[cfg(test)]
@@ -411,5 +465,45 @@ mod tests {
     fn a_topic_with_no_readers_has_no_bottleneck() {
         let topic = bus::QueuedTopic::<u32, 0, 5>::new([]);
         assert_eq!(topic.space(), 5);
+    }
+
+    #[test]
+    fn a_writer_handle_publishes_the_same_as_the_topic() {
+        let mut topic = bus::QueuedTopic::<u32, 2, 4>::new([bus::Policy::Drop, bus::Policy::Drop]);
+        let mut writer = topic.writer();
+        writer.publish(1).unwrap();
+        writer.publish(2).unwrap();
+        assert_eq!(topic.pop(0), Some(1));
+        assert_eq!(topic.pop(0), Some(2));
+        assert_eq!(topic.pop(1), Some(1));
+    }
+
+    #[test]
+    fn a_writer_handle_reports_space_the_same_as_the_topic() {
+        let mut topic = bus::QueuedTopic::<u32, 1, 2>::new([bus::Policy::Drop]);
+        let writer = topic.writer();
+        assert_eq!(writer.space(), 2);
+    }
+
+    #[test]
+    fn a_reader_handle_pops_only_its_own_queue() {
+        let mut topic = bus::QueuedTopic::<u32, 2, 4>::new([bus::Policy::Drop, bus::Policy::Drop]);
+        topic.publish(7).unwrap();
+        let mut reader0 = topic.reader(0);
+        assert_eq!(reader0.pop(), Some(7));
+        assert_eq!(reader0.pop(), None);
+        // Reader 1's own copy is untouched: popping through reader 0's handle did not reach it.
+        assert_eq!(topic.pop(1), Some(7));
+    }
+
+    #[test]
+    fn a_fresh_handle_is_made_for_each_call() {
+        // Mirrors the state topic's writer/reader: no handle is kept between calls, a new one is
+        // made from the topic each time.
+        let mut topic = bus::QueuedTopic::<u32, 1, 4>::new([bus::Policy::Drop]);
+        topic.writer().publish(10).unwrap();
+        assert_eq!(topic.reader(0).pop(), Some(10));
+        topic.writer().publish(20).unwrap();
+        assert_eq!(topic.reader(0).pop(), Some(20));
     }
 }

@@ -1314,24 +1314,95 @@ Size on 2026-11-17 (cloc, working tree, no target dir): 14 Rust files, 1729 line
     `Module::In`/`Out` wiring for a queued topic, a loop test (like `core/tests/bus_loop.rs` for state topics),
     `Ev`'s bus queue.
 
-## WHERE WE LEFT OFF (2026-11-20)
-Everything builds, all 369 tests pass, clippy (strict lints of item 29) and `cargo fmt --check` are
-clean. Committed by the user: up to `9934bdb "update docs"` (items 1 to 40). NOT yet committed:
-items 41 to 59 and the docs. The user commits.
+84. **Queued topics, step 2: `QueueWriter`/`QueueReader` handles** (`core-api/src/bus.rs`). The queued
+    counterpart of `StateWriter`/`StateReader`. `QueuedTopic::writer(&mut self) -> QueueWriter<'_, T, N, D>`
+    (no `now`: queued messages carry no `Sample`/timestamp, unlike a state topic) and
+    `QueuedTopic::reader(&mut self, reader: usize) -> QueueReader<'_, T, N, D>` (`reader` is this handle's index
+    among the `N` queues, fixed when the handles are wired). ONE DIFFERENCE from the state topic worth noting: a
+    queued reader MUTATES (popping removes the message from its own queue), so `QueueReader` borrows the WHOLE
+    topic mutably, not immutably like `StateReader` does; this costs nothing in practice because, same as the
+    state topic's handles, each module's handle is made fresh for one call and dropped when it returns, so a
+    writer's and a reader's borrows never overlap. `QueueWriter` has `publish` and `space()`; `QueueReader` has
+    only `pop()` (no `take_refused`: that stays on `QueuedTopic` itself, reached directly by whichever core-level
+    code owns the topic, the same way `Ev`'s log queue is a `pub` field its consumer uses directly). Checked by
+    hand (temporary code added then deleted, per item 78's method): a writer has no `pop` (E0599), a reader has
+    no `publish` (E0599), a reader held across a later `topic.writer()` call does not compile (E0499, two
+    `&mut` borrows of the topic at once), and a reader handle typed for the wrong message type does not fit
+    (E0308). 4 new tests (core-api lib: 106; workspace 403). clippy and fmt clean. `docs/bus.md` updated. Not
+    yet: `Module::In`/`Out` wiring for a queued topic, a loop test (like `core/tests/bus_loop.rs`), `Ev`'s bus
+    queue.
+
+85. **Queued topics, step 3: `Module::In`/`Out` wiring and a loop test** (`core/tests/queued_bus_loop.rs`, new).
+    A hand written executive owns one `QueuedTopic<u32, 2, 2>` (reader 0 `Refuse`, reader 1 `Drop`) and three
+    modules: `Producer` (`Out` = `QueueWriter`) and `Reader` (`In` = `QueueReader`) — ONE `Reader` type used for
+    BOTH readers, since a reader's behaviour does not depend on which queue or policy the executive wired it to,
+    only the index does (an instance of "one common implementation over two" from `CLAUDE.md`). 3 tests: fan-out
+    (both readers get their own copy of every message, in order), a FIFO backlog up to the queue's depth for a
+    reader that falls behind (oldest first, exact values checked), and that only the `Refuse` reader's fullness
+    makes the writer see `Err(Full)` for that publish (a `Drop` reader's fullness never blocks the writer; its
+    loss is silent to it, found instead with `exec.feed.take_refused(1)`, no module involved, matching item 84's
+    design).
+    FOUND while writing it, a gap in the test harness (not in `QueuedTopic`): this file's executive, like
+    `core/tests/bus_loop.rs` before it, never called `Slot::report_suppressed`, which is also what starts a
+    module's new tick of throttle counting (`core-api/src/throttle.rs`, item 25). Skipping it makes
+    `EV_MAX_PER_TICK` (default 5) a budget for the WHOLE TEST RUN instead of per tick: a code sent every tick
+    for more than 5 ticks (this file's `Producer`/`Reader`; `bus_loop.rs`'s tests never happened to run that
+    many ticks of the same code) is silently dropped by the throttle from the 6th occurrence on, with no error,
+    only a missing line in the event log. Spent real debugging time on this: first suspected the async file
+    service worker thread (a real OS thread even under `FakeFiles`), confirmed it was NOT that by instrumenting
+    `log_writer.rs`/`file_device.rs` with temporary `log::debug!` lines (reverted; `git status` confirms both
+    files are unchanged) and running with `VEE_TEST_LOG=debug`, which showed the module's `step` being called
+    but no event log line at all for it, which is what throttling (not a lost write) looks like. FIXED in
+    `queued_bus_loop.rs`'s `run_tick`: calls `report_suppressed` for every slot before `core.tick`, matching the
+    documented loop order (`docs/design.md`, Executive Requirements). `bus_loop.rs` has the SAME gap, left alone
+    (out of scope here; its own tests pass only because none of them send one code more than 5 times across the
+    whole run). `docs/bus.md` updated ("Queued topics, step 3"). Workspace: 406 tests (was 403). clippy and fmt
+    clean.
+
+86. **Events on the bus, step 1: `Ev`'s bus queue and flush** (`core-api/src/ev.rs`). `Ev` gets a second queue,
+    `bus` (new setting `EV_BUS_QUEUE_DEPTH`, default 64), beside the existing `log` queue, and a severity floor
+    filter (`Option<event::Severity>`, `None`/Off by default, set only through `set_filter`, no module holds
+    it). `send` now also pushes into `bus` when the event's severity meets the floor; a full `bus` queue
+    refuses and counts independently of `log`. `flush_bus<const N, const D>(&mut self, topic: &mut
+    bus::QueuedTopic<Event, N, D>)` drains `bus` into a queued topic, oldest first, ignoring a `Refuse`
+    reader's `Err(Full)` the same way `send` ignores a full `log` (the loss is already counted on that
+    reader's own queue). NOT wired into `Core::tick` and no loop test yet: nothing in the workspace reads an
+    events topic today, so there is no `N`/`D` to size one with; tested standalone instead (5 new tests:
+    off by default, floor lets through that severity and worse, a full bus queue's refusal count is separate
+    from `log`'s, flush publishes in order and empties the queue, flush is not stopped by a refusing reader).
+    `docs/bus.md` updated ("Events on the bus, step 1"). Workspace: 411 tests (was 406). clippy and fmt clean.
+
+## WHERE WE LEFT OFF (2026-11-24)
+Everything builds, 411 tests pass, clippy and `cargo fmt --check` are clean. Uncommitted (user commits,
+not me): `.claude/progress.md`, `core-api/src/bus.rs`, `core-api/src/ev.rs`, `docs/bus.md` (all modified),
+`core/tests/queued_bus_loop.rs` (new) — items 83 to 86, the queued-topics storage/handles/wiring+loop-test
+slices and the start of events-on-the-bus. See `docs/bus.md` for the full bus design and its roadmap ("Then,
+in this order: ...").
 The user is learning Rust (comes from C++): explain syntax and generics as they come up, and follow
 CLAUDE.md (one thing at a time, simplicity, callbacks only when needed, "do we really need this?", and
 after any edit name each file touched and what was done in it). `latest-chat.md` is updated only when the
 user says the session is ending.
 
-Where the code is: `Core<P: Platform>` (`core/src/lib.rs`) has `start`, `tick` (the log writer's step, the dropped report, then the
-watchdog feed), `stop`, `reset`, `files`,
-`watchdog`; `vee_core::slot::Slot<M>` is the per module bookkeeping. The OSAL has the interfaces (`clock`
-with `sleep_until_us`, `files`, `syslog`, `panic_report`, `watchdog`, `platform`), the fakes, and `linux/`
-(`std_clock`, `std_files`, `std_syslog`, `std_panic` the panic hook, `std_watchdog`, `std_alloc_guard`,
-`LinuxPlatform`). `modules/example` is the sample module. `sample-deployment` (S2a to S2e done) is the first executable: `start`
-(the whole start sequence), `Exec::run` (the loop: absolute boundaries, an overrun skips, logged),
-`VEE_SAMPLE_TICKS=N` to end through `Core::stop`. The software bus is DESIGNED (item 58) and not written.
-The blocking event log write is gone (item 74); the two sample overruns on WSL were late wake-ups (item 75); none on native Linux.
+Where the code is: `Core<P: Platform>` (`core/src/lib.rs`) has `start`, `tick` (the log writer's step, the dropped
+report, then the watchdog feed), `stop`, `reset`, `files`, `watchdog`; `vee_core::slot::Slot<M>` is the per module
+bookkeeping (`init`, `report_suppressed` — also resets the module's per-tick throttle counting, see item 85 — and
+`step`). The OSAL has the interfaces (`clock` with `sleep_until_us`, `files`, `syslog`, `panic_report`,
+`watchdog`, `platform`), the fakes, and `linux/` (`std_clock`, `std_files`, `std_syslog`, `std_panic` the panic
+hook, `std_watchdog`, `std_alloc_guard`, `LinuxPlatform`). `modules/example` is the sample module, `modules/watcher`
+reads its state topic. `sample-deployment` (S2a to S2e done) is the first executable: `start` (the whole start
+sequence), `Exec::run` (the loop: absolute boundaries, an overrun skips, logged), `VEE_SAMPLE_TICKS=N` to end
+through `Core::stop`.
+The software bus (`core-api/src/bus.rs`) is DESIGNED in full (`docs/bus.md`, item 58) and partly written: state
+topics (`StateTopic`/`StateWriter`/`StateReader`, item 58's first slice, DONE 2026-11-23) and queued topics
+(`QueuedTopic`/`QueueWriter`/`QueueReader`, items 83 to 85, DONE 2026-11-24), both with `Module::In`/`Out` wiring
+and a hand written loop test each (`core/tests/bus_loop.rs`, `core/tests/queued_bus_loop.rs`). `Ev`'s bus queue
+and filter (`core-api/src/ev.rs`, `Ev::bus`, `set_filter`, `flush_bus`, item 86, DONE 2026-11-24) are written and
+unit tested but NOT wired into `Core::tick`: there is no events topic yet to flush into (nothing sizes its `N`
+readers until telemetry exists). NOT yet written: the `bus::Message` derive, APIDs and the dyn view, the core
+commands for the events filter (which is also what will wire `flush_bus` into `Core::tick`), the recorder,
+telemetry, FDIR, `exec!`.
+The blocking event log write is gone (item 74); the two sample overruns on WSL were late wake-ups (item 75); none
+on native Linux.
 
 ## Next
 Open choices, in the order I would do them, all for the user to pick:
