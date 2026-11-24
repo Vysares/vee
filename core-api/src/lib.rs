@@ -10,6 +10,7 @@ pub mod ev;
 pub mod event;
 pub mod file;
 pub mod fixed_str;
+pub mod message;
 pub mod module;
 pub mod queue;
 pub mod reset;

@@ -1372,12 +1372,86 @@ Size on 2026-11-17 (cloc, working tree, no target dir): 14 Rust files, 1729 line
     from `log`'s, flush publishes in order and empties the queue, flush is not stopped by a refusing reader).
     `docs/bus.md` updated ("Events on the bus, step 1"). Workspace: 411 tests (was 406). clippy and fmt clean.
 
+87. **The `bus::Message` derive, with field access** (`core-api/src/message.rs` new, `core-derive/src/lib.rs`,
+    `core-api/src/bus.rs` re-exports it). `message.rs` has the hand written, type-agnostic half: `Kind` (the
+    11 wire kinds this step supports: `Bool`, `U8`..`U64`, `I8`..`I64`, `F32`, `F64` — nested structs, arrays
+    and text are explicitly open, see `docs/bus.md`), `Field` (name, wire offset, kind) and `read(bytes,
+    field) -> Option<Value>` (`Value` is `Int(i128)`/`Float(f64)`/`Bool(bool)`, widened so a table row's limit
+    need not match the field's exact width or signedness; a bad offset or short input is `None`, never a
+    panic). `#[derive(bus::Message)]` (`core-derive`, `derive_message`, same shape as `derive_code`) writes
+    the type-specific half on a plain named-field struct: `const WIRE_LEN: usize`, `const LAYOUT: &'static
+    [message::Field]`, and `fn encode(&self) -> [u8; WIRE_LEN]` (big endian, declaration order, no padding —
+    the WIRE layout, never the in-memory struct's). A field whose type is not one of the 11 kinds (a nested
+    struct, an array, a `String`) is a clear compile error naming the field. These are inherent methods/consts
+    on the struct, NOT a trait: nothing needs one yet (the dyn view, which does, is a later roadmap item), so
+    there is no `Message` trait, only the derive of that name. Tested in `core-api/src/message.rs` (5 unit
+    tests: each integer kind big endian, floats and bool, a nonzero byte is still `true`, a short or
+    out-of-range read is `None` not a panic, an offset near `usize::MAX` does not overflow) and
+    `core-api/tests/message_derive.rs` (7 tests, outside the crate because the derive's `::vee_core_api` paths
+    do not resolve inside it, same reason as `tests/code_derive.rs`: `WIRE_LEN`, `LAYOUT`'s offsets and kinds,
+    `encode`'s bytes, a `false` bool encodes to 0, a round trip through `read` by `LAYOUT`, a message with no
+    fields, and that a derived message type can be a `QueuedTopic`'s `T`). Hand checked (temporary, reverted):
+    a field of an unsupported type (`alloc::string::String`) is rejected with the derive's own error message,
+    not a confusing one from further down the generated code. `docs/bus.md` updated ("The `bus::Message`
+    derive, with field access"). Workspace: 423 tests (was 411). clippy and fmt clean.
+    Split right after, on request: `core-derive/src/lib.rs` now only has the two `#[proc_macro_derive]`
+    entry points (rustc requires those at the crate root) and their doc comments; each derive's own parsing
+    and codegen moved to its own file, `code.rs` (was already there, pulled out) and `message.rs`. No
+    behaviour change: same 423 tests.
+
+88. **Renamed APID to TID** (user, 2026-11-24): APID is a CCSDS downlink concept with its own constraints (11
+    bits, 0x7FF reserved); the bus's own topic identity does not need to carry that, so it is `bus::Tid = u16`
+    everywhere, and a deployment that downlinks CCSDS chooses its own TID-to-APID mapping later. Renamed
+    throughout `docs/bus.md` and `docs/design.md`; left untouched in dated log entries here and in
+    `latest-chat.md` (historical record of what was said at the time, not current-state docs).
+
+89. **Split `core-derive` into one file per derive** (`core-derive/src/code.rs`, `core-derive/src/message.rs`,
+    on request). `lib.rs` now only has the two `#[proc_macro_derive]` entry points and their doc comments
+    (rustc requires those functions at the crate root); each derive's own parsing and codegen moved out
+    unchanged. No behaviour change.
+
+90. **TIDs and the dyn view, step 1** (`core-api/src/bus.rs`, `core-api/src/message.rs`, `core-derive`). The
+    `Message` derive now ALSO writes `impl message::Message for` the struct (same `WIRE_LEN`/`LAYOUT`, plus
+    `encode_into(&self, out: &mut [u8]) -> Option<usize>`, since a generic `[u8; Self::WIRE_LEN]` return is
+    not something a trait method can do on stable Rust) — the first thing in this bus work that needed a
+    TRAIT, not just inherent items, because `impl<T: message::Message> Topic for StateTopic<T>` is generic
+    over every message type. `bus::Topic`: `layout()`, `latest_bytes(out) -> Option<usize>` (raw bytes, for
+    the recorder), `pop_encoded(reader, out) -> Option<usize>`, implemented once for `StateTopic<T>` and once
+    for `QueuedTopic<T, N, D>`; each leaves the other side's methods at the trait default (`None`), since a
+    state topic has no queue and a queued topic has no "latest". `bus::find(topics, tid)`: a binary search by
+    `Tid` over a `(Tid, &dyn Topic)` list, written once. New setting `MESSAGE_MAX_BYTES` (default 3072,
+    `core-api/src/message.rs`): the "Settled" cap ("a message is Copy plain data, up to about 3 kB") finally
+    has a concrete value, used as the stack buffer a default method encodes into.
+    SETTLED while building this, from a question the user asked about the previous step: nothing stops
+    `message::read(bytes, field)` from being called with a field and bytes that do not belong together — it
+    is a safe (bounds-checked, no panic) but fully trusting primitive, like `core-types/src/record.rs`'s
+    `field()`. Asked the user (AskUserQuestion) whether `Topic` should close that gap structurally for the
+    dyn view or stay as originally sketched and rely on caller discipline; chose to close it: `read_latest`
+    (NEW, not in the original sketch) is a DEFAULT method built on `latest_bytes` + `layout` of the SAME
+    topic, so a caller supplies only a plain index (validated against `layout().len()` once, at table load,
+    not written yet), never a raw `Field`. This only closes the gap for the "latest value" (state) side;
+    `pop_encoded` + `message::read` by index is still the queued-topic path, left for when telemetry/FDIR
+    actually evaluate table rows against queued topics (one pop can be followed by several field reads of
+    the same popped message, which one bundled call cannot express).
+    NOT done: a TID uniqueness check (nothing to check yet: only one real topic exists today, `Example`'s
+    `progress`) and the `(tid, &dyn Topic)` array and table themselves (`exec!`'s job). `docs/bus.md` updated
+    ("TIDs and the dyn view, step 1"). Tested in `core-api/tests/dyn_view.rs` (9 tests).
+    CAUGHT by the user asking directly: the first pass tested `find` (returns the right pointer) and a
+    generic field read (given a `&dyn Topic` directly) SEPARATELY, never the actual end-to-end path
+    (`find` by `Tid`, then read a field through what it returned) together in one test, so a mix-up
+    between two different topics' data behind `find` would not have been caught. Added
+    `a_consumer_that_looks_up_a_topic_by_tid_reads_that_topics_own_data` (two different message types,
+    `Reading` and `Status`, each with a published value; looks each up by its own `Tid` and checks the
+    field value, not just the pointer). Workspace: 433 tests (was 423). clippy and fmt clean.
+
 ## WHERE WE LEFT OFF (2026-11-24)
-Everything builds, 411 tests pass, clippy and `cargo fmt --check` are clean. Uncommitted (user commits,
-not me): `.claude/progress.md`, `core-api/src/bus.rs`, `core-api/src/ev.rs`, `docs/bus.md` (all modified),
-`core/tests/queued_bus_loop.rs` (new) — items 83 to 86, the queued-topics storage/handles/wiring+loop-test
-slices and the start of events-on-the-bus. See `docs/bus.md` for the full bus design and its roadmap ("Then,
-in this order: ...").
+Everything builds, 433 tests pass, clippy and `cargo fmt --check` are clean. Items 83 to 86 (queued topics,
+events-on-the-bus step 1) are committed by the user (`7e8c5d1`, `c8a96d2`). Uncommitted (user commits, not
+me): `.claude/progress.md`, `core-api/src/bus.rs`, `core-api/src/lib.rs`, `core-derive/src/lib.rs`,
+`docs/bus.md`, `docs/design.md` (all modified), `core-api/src/message.rs`, `core-api/tests/message_derive.rs`,
+`core-api/tests/dyn_view.rs`, `core-derive/src/code.rs`, `core-derive/src/message.rs` (new) — items 87 to 90:
+the `bus::Message` derive, the APID-to-TID rename, the `core-derive` file split, and TIDs/the dyn view step 1.
+See `docs/bus.md` for the full bus design and its roadmap ("Then, in this order: ...").
 The user is learning Rust (comes from C++): explain syntax and generics as they come up, and follow
 CLAUDE.md (one thing at a time, simplicity, callbacks only when needed, "do we really need this?", and
 after any edit name each file touched and what was done in it). `latest-chat.md` is updated only when the
@@ -1398,9 +1472,14 @@ topics (`StateTopic`/`StateWriter`/`StateReader`, item 58's first slice, DONE 20
 and a hand written loop test each (`core/tests/bus_loop.rs`, `core/tests/queued_bus_loop.rs`). `Ev`'s bus queue
 and filter (`core-api/src/ev.rs`, `Ev::bus`, `set_filter`, `flush_bus`, item 86, DONE 2026-11-24) are written and
 unit tested but NOT wired into `Core::tick`: there is no events topic yet to flush into (nothing sizes its `N`
-readers until telemetry exists). NOT yet written: the `bus::Message` derive, APIDs and the dyn view, the core
-commands for the events filter (which is also what will wire `flush_bus` into `Core::tick`), the recorder,
-telemetry, FDIR, `exec!`.
+readers until telemetry exists). The `bus::Message` derive (`core-api/src/message.rs`, `core-derive/src/message.rs`,
+item 87, DONE 2026-11-24, split into its own file item 89) writes a message type's `WIRE_LEN`/`LAYOUT`/`encode`
+(inherent) and `impl message::Message` (the trait generic code needs, item 90). `bus::Tid` (renamed from APID,
+item 88) and `bus::Topic` (item 90, DONE 2026-11-24), the dyn view: `layout()`, `latest_bytes()`,
+`read_latest(index)` (bundled so a caller cannot pair the wrong field with the wrong bytes), `pop_encoded(reader,
+out)`, `find(topics, tid)`; implemented for `StateTopic<T>` and `QueuedTopic<T,N,D>`. NOT yet written: the core
+commands for the events filter (also what will wire `flush_bus` into `Core::tick`), the recorder, telemetry,
+FDIR, `exec!` (which is what will build the real `(tid, &dyn Topic)` array and the table that reads it).
 The blocking event log write is gone (item 74); the two sample overruns on WSL were late wake-ups (item 75); none
 on native Linux.
 

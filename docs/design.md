@@ -57,7 +57,10 @@ The executive schedules the core like a module, every tick and with no divisor (
 `Core` (`vee_core::Core<F: Files>`, in `core/src/lib.rs`) exists with the Events domain and Health's reset info. `Core::start` and `Core::stop` are its startup and shutdown (see Executive Requirements). It owns the event queue (`pub ev`, which the executive lends to every `Ctx`), the file system `F` and the event log path. Its `tick(now)` does: (1) take every event out of the queue and append it to the event log, then (2) `events::report_dropped`, in that order, so the report has room in the queue. Until the file service exists the append is a blocking write in the tick, which the design forbids in the loop: it is temporary, and the file service will replace the `append` call with a request, leaving the loop as it is. A failed append loses that event (nothing else can be done with it) but the queue is still emptied, and the failures are reported once per tick to the system log. The events of a tick's modules are written in the next tick, and the suppressed reports in the same one. Not written yet: `exec!`, the other domains inside `core.tick` (their order is decided as each is written), and the Bus, Router, Tables and Files domains.
 
 ### Software Bus
-The bus has its own document: [bus.md](bus.md) (split out 2026-11-23; nothing is written yet). In short: typed topics with explicit APIDs, one writer per topic, state topics (latest value) and queued links, access listed per module and wired at compile time, a module declares the types it produces, and events will be a topic fed by the event service.
+The bus has its own document: [bus.md](bus.md) (split out 2026-11-23). In short: typed topics with explicit
+TIDs (Topic IDs, not CCSDS APIDs), one writer per topic, state topics (latest value) and queued links, access
+listed per module and wired at compile time, a module declares the types it produces, and events will be a
+topic fed by the event service.
 
 ### Command Routing
 - The core provides for command routing to modules.

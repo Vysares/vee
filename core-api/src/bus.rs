@@ -14,10 +14,25 @@
 //! reader never loses what a fast one already saw, and each reader's queue has its own policy for
 //! what happens when it is full.
 //!
-//! Not here yet: where a module gets its handles (`Module::In` and `Out`, `ctx.inputs` and
-//! `ctx.out`; done for state topics, not yet for queued ones), APIDs and the layout of a message.
+//! A topic's message type, `T`, is a plain struct with `#[derive(bus::Message)]` (the derive of
+//! the same name, re-exported here so the usage is `bus::Message`); see `crate::message` for what
+//! it writes (`encode`, `LAYOUT`) and for reading a field generically (`message::read`).
+//!
+//! `Topic`, below, is the DYN view: what a module that picks topics by table (telemetry, FDIR,
+//! the recorder) can do with ANY topic, whatever its message type, through one erased interface.
+//! Not here yet: `exec!`'s `(tid, &dyn Topic)` array and the table itself (see `docs/bus.md`,
+//! "Access").
 
+use crate::message;
 use crate::queue;
+
+/// The derive: see the module doc comment above and `crate::message`.
+pub use vee_core_derive::Message;
+
+/// A topic's identity: unique across the deployment, used by tables, the recorder and the ground
+/// dictionary. NOT a CCSDS APID (see `docs/bus.md`, "Settled"): a deployment that downlinks CCSDS
+/// packets chooses its own mapping from TIDs to APIDs.
+pub type Tid = u16;
 
 /// The latest value of a state topic, with when and which publish it came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -255,6 +270,79 @@ impl<T: Copy, const N: usize, const D: usize> QueueReader<'_, T, N, D> {
     pub fn pop(&mut self) -> Option<T> {
         self.topic.pop(self.reader)
     }
+}
+
+/// A topic with its message type erased: what a module that picks topics by table (telemetry,
+/// FDIR, the recorder) can do with ANY topic, through one interface. Implemented ONCE,
+/// generically, below, for every topic: a message type's own `#[derive(bus::Message)]` writes
+/// nothing for this.
+///
+/// A state topic has no queue, and a queued topic has no "latest": each leaves the other side's
+/// methods at their default, which report nothing (`None`) rather than fail.
+pub trait Topic {
+    /// This topic's message type's field layout: the same for every topic of one message type.
+    fn layout(&self) -> &'static [message::Field];
+
+    /// The latest value's encoded bytes, written into `out`, or `None` if the topic was never
+    /// published, `out` is shorter than the message, or this is a queued topic (no "latest").
+    /// For a consumer that wants the raw bytes, not a field (the recorder).
+    fn latest_bytes(&self, out: &mut [u8]) -> Option<usize> {
+        let _ = out;
+        None
+    }
+
+    /// Reads one field of the LATEST value, by its index into `layout()`. `None` if the topic was
+    /// never published, `index` is out of range, or this is a queued topic.
+    ///
+    /// This is built on `latest_bytes` and `layout`, both of THIS topic, so a caller can never
+    /// pair the wrong field with the wrong bytes the way a raw `message::read(bytes, field)` call
+    /// could if the two were sourced separately (see `docs/bus.md`, "Access"): the only thing a
+    /// caller chooses is a plain index, which a table validates against `layout().len()` once, at
+    /// load time.
+    fn read_latest(&self, index: usize) -> Option<message::Value> {
+        let field = self.layout().get(index)?;
+        let mut buf = [0u8; message::MESSAGE_MAX_BYTES];
+        let len = self.latest_bytes(&mut buf)?;
+        message::read(buf.get(..len)?, field)
+    }
+
+    /// The next message waiting for reader `reader`, encoded into `out`, or `None` if there is
+    /// none, `out` is shorter than the message, `reader` is out of range, or this is a state
+    /// topic (no queue).
+    fn pop_encoded(&mut self, reader: usize, out: &mut [u8]) -> Option<usize> {
+        let _ = (reader, out);
+        None
+    }
+}
+
+impl<T: message::Message> Topic for StateTopic<T> {
+    fn layout(&self) -> &'static [message::Field] {
+        T::LAYOUT
+    }
+
+    fn latest_bytes(&self, out: &mut [u8]) -> Option<usize> {
+        self.latest()?.value.encode_into(out)
+    }
+}
+
+impl<T: message::Message, const N: usize, const D: usize> Topic for QueuedTopic<T, N, D> {
+    fn layout(&self) -> &'static [message::Field] {
+        T::LAYOUT
+    }
+
+    fn pop_encoded(&mut self, reader: usize, out: &mut [u8]) -> Option<usize> {
+        self.pop(reader)?.encode_into(out)
+    }
+}
+
+/// The topic for `tid` in `topics`, a list sorted by `Tid` (as the `(tid, &dyn Topic)` array
+/// `exec!` will build is kept): `O(log n)`, written once here so every dyn consumer (telemetry,
+/// FDIR, the recorder) looks a topic up the same way. `None` if no entry has that `Tid`.
+pub fn find<'a>(topics: &[(Tid, &'a dyn Topic)], tid: Tid) -> Option<&'a dyn Topic> {
+    let index = topics
+        .binary_search_by_key(&tid, |(topic_tid, _)| *topic_tid)
+        .ok()?;
+    topics.get(index).map(|(_, topic)| *topic)
 }
 
 #[cfg(test)]

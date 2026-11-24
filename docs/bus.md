@@ -24,13 +24,14 @@ Rule for 1, 2, 3 and 5: these modules are wired to every topic they could ever n
 only chooses among topics they already have. Nothing subscribes at runtime.
 
 ## Settled
-- A **topic** has a name, a message type and an explicit APID (`u16`, also the CCSDS APID on downlink). The APID
-  is the identity in tables, the recorder and the dictionary.
-- **APIDs are unique and are all defined in one place: the deployment** (the `topics { .. }` block of `exec!`),
+- A **topic** has a name, a message type and an explicit TID, Topic ID (`u16`). The TID is the identity in
+  tables, the recorder and the dictionary. It is NOT a CCSDS APID: a deployment that downlinks CCSDS packets
+  chooses its own mapping from TIDs to APIDs (an APID is 11 bits, 0x7FF reserved for idle packets, a constraint
+  this bus does not need to carry everywhere).
+- **TIDs are unique and are all defined in one place: the deployment** (the `topics { .. }` block of `exec!`),
   never in a module crate (two instances of one module would collide). The core's topics are in the same list.
-  A duplicate is a compile error; before `exec!` exists, the hand written sample keeps an `apids` module and a
-  `const fn` check. There is no range check on the `u16` for now (a CCSDS APID is 11 bits, 0x7FF reserved for idle
-  packets; revisit when a deployment downlinks CCSDS). The ground dictionary
+  A duplicate is a compile error; before `exec!` exists, the hand written sample keeps a `tids` module and a
+  `const fn` check. The ground dictionary
   is generated from the same list.
 - A message is `Copy` plain data (up to about 3 kB). `#[derive(bus::Message)]` writes both the wire encoding (big
   endian, declaration order) and **field access** (see Messages). A field's index is its position in that layout.
@@ -115,31 +116,31 @@ impl Module for Controller {
 config, and every name in it is a plain Rust path that the compiler checks:
 
 ```
-topics     { sensor_reading: sensor::Reading, apid 0x100 }
+topics     { sensor_reading: sensor::Reading, tid 0x100 }
 sensor     { out: { reading: sensor_reading } }
 controller { in:  { reading: sensor_reading } }
 ```
 
 **Dyn (telemetry, FDIR, recorder).** A module that picks topics by a table cannot use typed handles: its wired
-topics have different types, the table gives it an APID as data, and Rust cannot look up a struct member by a
-number. So these modules get an erased collection of what they are wired to: a sorted `(apid, &dyn Topic)` array
-that the exec makes (binary search by APID). `Topic` is implemented ONCE, generically, for every topic
+topics have different types, the table gives it a TID as data, and Rust cannot look up a struct member by a
+number. So these modules get an erased collection of what they are wired to: a sorted `(tid, &dyn Topic)` array
+that the exec makes (binary search by TID). `Topic` is implemented ONCE, generically, for every topic
 (`impl<T: Message> Topic for StateTopic<T>`), so the derive writes nothing for it. Wired at compile time,
 filtered by the module's table. Alternatives to `dyn` that were considered: a generated `match` per module
 (more generated code) and keeping encoded bytes beside every state value (an encode per publish and a second
-copy). APIDs are unique, so a table row needs no module id.
+copy). TIDs are unique, so a table row needs no module id.
 - State side (latest value; a queued topic has none): `seq`, `updated_at`, `latest_bytes` (the encoded value).
 - Queue side: `pop_encoded(&mut [u8]) -> Option<usize>` (the next message as bytes). FDIR may use it for events.
 - Both: `layout() -> &'static [Field]`, the same layout for every topic of a message type.
-- Table rows are `(apid, field index, op, limit, ...)`. A field is read from the encoded bytes with the layout
+- Table rows are `(tid, field index, op, limit, ...)`. A field is read from the encoded bytes with the layout
   (below), so a row works on a state topic's latest bytes and on each message popped from a queue.
-- Validated once at table load: the APID is in the module's list, the field index is in the layout, the kinds
+- Validated once at table load: the TID is in the module's list, the field index is in the layout, the kinds
   and the operator fit, and a row on a queued topic is not a "latest" rule. A bad row rejects the table and
   names the row, using the field's name.
 - `compare(Value, Op, Value) -> Result<bool, CompareError>` never panics: integers exact via `i128`, floats as
   `f64`, a NaN is an error, a bool or text only with its own kind and only for equality.
 
-Considered and not chosen: every module resolving typed ids by APID at startup (`ctx.resolve(Id<T>)`). It is one
+Considered and not chosen: every module resolving typed ids by TID at startup (`ctx.resolve(Id<T>)`). It is one
 access style, but a wiring mistake becomes a boot time error instead of a compile error, and each read goes
 through a downcast with a can't-happen `None`. The F Prime design (typed ports in generated wiring, ids for
 telemetry and commands, serialized ports for generic consumers) is the same split as above.
@@ -186,11 +187,11 @@ const LAYOUT: &[Field] = &[
 - Later, optional: the log writer becomes another reader of the topic and `Ev`'s log queue goes away.
 
 ## The recorder
-A module (last in `order`, base rate, reads `all`, bytes only). Records `(apid, seq, updated_at, length, bytes)`
+A module (last in `order`, base rate, reads `all`, bytes only). Records `(tid, seq, updated_at, length, bytes)`
 for every state topic whose `seq` changed, and reports `seq` jumps as an event.
 
 ## First slice (DONE 2026-11-23)
-State topics only, typed, hand wired in the sample deployment. No derive, no APIDs, no dyn view.
+State topics only, typed, hand wired in the sample deployment. No derive, no TIDs, no dyn view.
 1. `bus::StateTopic<T>`, `StateWriter`, `StateReader` with `latest()`, `Sample` (`core-api/src/bus.rs`).
 2. `Module::In<'a>` and `Out<'a>`, `Ctx::inputs` and `Ctx::out`.
 3. A loop test with two modules (one publishes, one reads), including the order rule
@@ -245,9 +246,60 @@ which belongs to whatever reads it — telemetry, later in this roadmap), so `fl
 Wiring `Core::tick` to call it, and a loop test proving an event reaches a reader, waits until something
 exists to read the events topic.
 
-Then, in this order: the `bus::Message` derive with field access, APIDs and the dyn view, the core commands for
-the events filter (which will also be what wires `flush_bus` into `Core::tick`, once the events topic it writes
-to is sized), the recorder, telemetry, FDIR.
+## The `bus::Message` derive, with field access (DONE 2026-11-24)
+`#[derive(bus::Message)]` (`core-derive/src/message.rs`; the two `#[proc_macro_derive]` entry points stay in
+`core-derive/src/lib.rs` as rustc requires, each one's own logic in its own file, `code.rs`/`message.rs`)
+writes, on the message struct itself (inherent, not a trait — a typed caller needs no trait import):
+`const WIRE_LEN: usize`, `const LAYOUT: &'static [message::Field]` and `fn encode(&self) -> [u8; WIRE_LEN]`.
+Supports `bool` and the fixed-width numbers (`u8`..`u64`, `i8`..`i64`, `f32`, `f64`); a field of any other type
+is a compile error naming it. `core-api/src/message.rs` has the type-agnostic half, written once by hand:
+`Kind` (those 11 kinds), `Field` and `read(bytes, field) -> Option<Value>` (`Value::{Int(i128), Float(f64),
+Bool(bool)}`, widened for comparing). See `core-api/tests/message_derive.rs`.
+
+## TIDs and the dyn view, step 1 (DONE 2026-11-24)
+`Tid = u16` (`core-api/src/bus.rs`): a topic's identity, explicitly NOT a CCSDS APID (renamed from "APID"
+throughout this doc, 2026-11-24, on request: an APID is a CCSDS downlink concept with its own constraints an
+internal topic id does not need to carry).
+
+The derive also now writes `impl message::Message for` the struct (same `WIRE_LEN`/`LAYOUT` values, plus
+`encode_into(&self, out: &mut [u8]) -> Option<usize>`, which writes `encode()`'s bytes into a caller's buffer
+instead of returning a fixed-size array — a generic `Self::WIRE_LEN`-sized array return is not something a
+trait method can do on stable Rust). This is the first thing that needed a `Message` TRAIT, not just the
+inherent items: `impl<T: message::Message> Topic for StateTopic<T>` (below) is generic over every message
+type, and generic code can only reach a type's items through a trait bound.
+
+`bus::Topic`: the dyn view itself, implemented once for `StateTopic<T>` and once for `QueuedTopic<T, N, D>`.
+`layout()`, `latest_bytes(out) -> Option<usize>` (raw bytes, for the recorder) and `pop_encoded(reader, out) ->
+Option<usize>` match the original sketch; each topic kind leaves the other side's methods at their trait
+default (`None`), since a state topic has no queue and a queued topic has no "latest".
+
+Settled while building this (the user asked, while reviewing the `Message` derive step, what stops `read`
+from being called with a field and bytes that do not belong together — nothing did: `read(bytes, field)` is a
+safe, bounds-checked, but otherwise fully trusting primitive, like `core-types/src/record.rs`'s `field()`):
+`Topic::read_latest(index)` is a DEFAULT method, built on `latest_bytes` and `layout` of THIS SAME topic, so a
+caller of the dyn view can never pair a field with someone else's bytes — the only thing it supplies is a
+plain index, which a table will validate against `layout().len()` once, at load time (not written yet). This
+only closes the gap for the "latest value" side; a queued topic's popped message is still read through the
+lower level `message::read(bytes, &topic.layout()[index])` once something (telemetry, FDIR) actually
+evaluates table rows against queued topics, because one `pop_encoded` can be followed by several field reads
+of the same popped message, which a single bundled call cannot express.
+
+Also added: `bus::find(topics: &[(Tid, &dyn Topic)], tid) -> Option<&dyn Topic>`, a binary search by `Tid`,
+written once here so every dyn consumer looks a topic up the same way (the `(tid, &dyn Topic)` array itself is
+`exec!`'s job, not written yet). `MESSAGE_MAX_BYTES` (new setting, `core-api/src/message.rs`, default 3072):
+the stack buffer `read_latest`'s default encodes a value into before reading a field back out of it (the
+"Settled" cap, "a message is Copy plain data, up to about 3 kB", finally has a concrete value).
+
+NOT done this step, left for `exec!`/telemetry: a TID uniqueness check (there is only one real topic in the
+sample deployment today, `Example`'s `progress`, so a check now would have nothing to check against) and the
+`(tid, &dyn Topic)` array and table themselves. Tested in `core-api/tests/dyn_view.rs` (8 tests: a never
+published topic has no latest bytes or field, latest bytes match `encode()`, a too-small buffer is `None` not
+a partial write, `read_latest` reads the right field by index and is `None` out of range, a queued topic has
+no latest only its queue, `find` locates a topic in a sorted list, a generic function reads either topic kind
+through one `&dyn Topic`).
+
+Then, in this order: the core commands for the events filter (which will also be what wires `flush_bus` into
+`Core::tick`, once the events topic it writes to is sized), the recorder, telemetry, FDIR.
 
 ## Open
 - Fan-in fairness for the link module.
