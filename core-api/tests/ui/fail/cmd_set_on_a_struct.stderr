@@ -1,0 +1,5 @@
+error: CmdSet can only be derived for an enum
+ --> tests/ui/fail/cmd_set_on_a_struct.rs:4:8
+  |
+4 | struct S;
+  |        ^

@@ -290,4 +290,89 @@ mod tests {
         assert_eq!(first.text.as_str(), "one");
         assert_eq!(topic.pop(0), None); // "two" was lost: the queue was already full with "one"
     }
+
+    #[test]
+    fn flush_bus_with_nothing_waiting_publishes_nothing_and_does_not_fail() {
+        let mut sent = ev::Ev::new();
+        let mut topic = bus::QueuedTopic::<event::Event, 1, 2>::new([bus::Policy::Drop]);
+        sent.flush_bus(&mut topic);
+        assert_eq!(topic.len(0), 0);
+        // With the filter on but nothing sent, the same.
+        sent.set_filter(Some(event::Severity::Info));
+        sent.flush_bus(&mut topic);
+        assert_eq!(topic.len(0), 0);
+    }
+
+    #[test]
+    fn flush_bus_into_a_topic_with_no_readers_empties_the_queue_and_does_not_panic() {
+        let mut sent = ev::Ev::new();
+        sent.set_filter(Some(event::Severity::Info));
+        sent.send(1, 0, Sample::Info, format_args!("one"));
+        let mut topic = bus::QueuedTopic::<event::Event, 0, 2>::new([]);
+        sent.flush_bus(&mut topic);
+        assert!(sent.bus.is_empty());
+    }
+
+    #[test]
+    fn a_flush_gives_a_drop_reader_exactly_its_depth_and_counts_the_one_more() {
+        let mut sent = ev::Ev::new();
+        sent.set_filter(Some(event::Severity::Info));
+        for time in 0..3 {
+            sent.send(1, time, Sample::Info, format_args!("e"));
+        }
+        // A reader that holds 2: the third is dropped, and counted on the reader's own queue.
+        let mut topic = bus::QueuedTopic::<event::Event, 1, 2>::new([bus::Policy::Drop]);
+        sent.flush_bus(&mut topic);
+        assert_eq!(topic.len(0), 2);
+        assert_eq!(topic.take_refused(0), 1);
+        assert_eq!(topic.pop(0).map(|event| event.monotonic_us), Some(0));
+        assert_eq!(topic.pop(0).map(|event| event.monotonic_us), Some(1));
+    }
+
+    #[test]
+    fn turning_the_filter_off_keeps_what_is_queued_and_a_filter_on_later_misses_what_came_before() {
+        let mut sent = ev::Ev::new();
+        // Off at first: this event is not queued for the bus.
+        sent.send(1, 0, Sample::Err, format_args!("early"));
+        sent.set_filter(Some(event::Severity::Info));
+        sent.send(1, 1, Sample::Info, format_args!("kept"));
+        // Off again: what is already in the queue stays, and a flush still delivers it.
+        sent.set_filter(None);
+        sent.send(1, 2, Sample::Err, format_args!("late"));
+
+        let mut topic = bus::QueuedTopic::<event::Event, 1, 4>::new([bus::Policy::Drop]);
+        sent.flush_bus(&mut topic);
+        assert_eq!(topic.len(0), 1);
+        assert_eq!(topic.pop(0).map(|event| event.monotonic_us), Some(1));
+        // The log queue got all three, whatever the filter did.
+        assert_eq!(sent.log.len(), 3);
+    }
+
+    #[test]
+    fn every_severity_meets_every_filter_the_right_way() {
+        let filters = [
+            None,
+            Some(event::Severity::Info),
+            Some(event::Severity::Warn),
+            Some(event::Severity::Err),
+        ];
+        let events = [
+            (Sample::Info, event::Severity::Info),
+            (Sample::Warn, event::Severity::Warn),
+            (Sample::Err, event::Severity::Err),
+        ];
+        for filter in filters {
+            for (sample, severity) in events {
+                let mut sent = ev::Ev::new();
+                sent.set_filter(filter);
+                sent.send(1, 0, sample, format_args!("x"));
+                let reaches = filter.is_some_and(|floor| severity >= floor);
+                assert_eq!(
+                    sent.bus.len(),
+                    usize::from(reaches),
+                    "{filter:?} {severity:?}"
+                );
+            }
+        }
+    }
 }

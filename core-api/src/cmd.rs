@@ -733,6 +733,26 @@ mod tests {
     }
 
     #[test]
+    fn each_ack_event_has_its_own_code_severity_and_index_and_looks_up_by_index() {
+        use event::Code as _;
+        let events = [
+            (cmd::CmdEvent::Accepted, 0, event::Severity::Info),
+            (cmd::CmdEvent::Rejected, 1, event::Severity::Err),
+            (cmd::CmdEvent::Executed, 2, event::Severity::Info),
+            (cmd::CmdEvent::Failed, 3, event::Severity::Err),
+        ];
+        for (event, number, severity) in events {
+            assert_eq!(event.code(), number);
+            assert_eq!(event.index(), usize::from(number));
+            assert_eq!(event.severity(), severity);
+            assert_eq!(cmd::CmdEvent::from_index(event.index()), Some(event));
+        }
+        // One past the last event is no event, and neither is the largest index.
+        assert_eq!(cmd::CmdEvent::from_index(4), None);
+        assert_eq!(cmd::CmdEvent::from_index(usize::MAX), None);
+    }
+
+    #[test]
     fn every_reason_fits_the_ack_at_the_widest_values() {
         // Every reason this crate writes, after the longest prefix an ack can have. (`Invalid`'s
         // reason is the target's own text, so it can be as long as its author likes: it is cut

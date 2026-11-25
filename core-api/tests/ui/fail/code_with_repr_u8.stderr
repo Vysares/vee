@@ -1,0 +1,5 @@
+error: add `#[repr(u16)]`: the value of each variant is its event code
+ --> tests/ui/fail/code_with_repr_u8.rs:5:6
+  |
+5 | enum E {
+  |      ^

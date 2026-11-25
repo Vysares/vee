@@ -1,0 +1,5 @@
+error: a command has only one `#[validate]`
+ --> tests/ui/fail/command_with_two_validates.rs:5:1
+  |
+5 | #[validate]
+  | ^^^^^^^^^^^

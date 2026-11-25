@@ -1,0 +1,5 @@
+error: Message does not support generics
+ --> tests/ui/fail/message_with_generics.rs:4:9
+  |
+4 | struct S<const N: usize> {
+  |         ^^^^^^^^^^^^^^^^

@@ -771,6 +771,36 @@ mod tests {
     }
 
     #[test]
+    fn a_writer_that_cannot_start_is_reported_and_the_events_wait_in_the_queue() {
+        // An empty path is refused by the file service, so no writer starts.
+        let mut core = vee_core::Core::<Fake>::new(
+            fake_files::FakeFiles::new(),
+            fake_watchdog::FakeWatchdog::new(),
+            RESET_LOG,
+            "",
+        );
+        core.start_log_writer(77);
+        let event = core.ev.log.pop().unwrap();
+        assert_eq!(event.source, core_event::SOURCE);
+        assert_eq!(event.monotonic_us, 77);
+        assert_eq!(event.severity, event::Severity::Err);
+        assert!(
+            event
+                .text
+                .as_str()
+                .starts_with("event log unavailable: log path:"),
+            "{}",
+            event.text.as_str()
+        );
+
+        // With no writer, ticks and a flush carry on without panicking, and events stay queued.
+        send(&mut core, 1);
+        core.tick(100);
+        core.flush_event_log(100);
+        assert_eq!(core.ev.log.len(), 1);
+    }
+
+    #[test]
     fn the_core_refuses_a_command_when_its_own_queue_is_full() {
         let mut core = bare_core();
         let mut sink = [cmd::Sink::new(1)];
@@ -841,6 +871,43 @@ mod tests {
             next_text(&mut core).as_str(),
             "cmd 1/3 t0 op0x0001: rejected: invalid: floor must be 0..=3"
         );
+    }
+
+    #[test]
+    fn the_largest_sink_target_seq_and_opcode_and_the_most_args_are_routed_and_acked() {
+        let mut core = bare_core();
+        let mut sinks = [cmd::Sink::new(u8::MAX)];
+        let full = [0xAB_u8; cmd::CMD_ARGS_MAX_BYTES];
+        sinks[0]
+            .submit(u16::MAX, u8::MAX, u16::MAX, cmd::Args::new(&full).unwrap())
+            .unwrap();
+        let mut module = Keeper(None);
+        core.route_commands(&mut sinks, &mut [(u8::MAX, &mut module)], 10);
+
+        assert_eq!(
+            next_text(&mut core).as_str(),
+            "cmd 255/65535 t255 op0xffff: accepted"
+        );
+        let raw = module.0.unwrap();
+        assert_eq!(raw.args.as_slice(), &full);
+        assert_eq!(
+            (raw.sink, raw.seq, raw.target, raw.opcode),
+            (u8::MAX, u16::MAX, u8::MAX, u16::MAX)
+        );
+    }
+
+    #[test]
+    fn the_smallest_values_are_routed_too() {
+        let mut core = bare_core();
+        let mut sinks = [cmd::Sink::new(0)];
+        sinks[0].submit(0, 3, 0, cmd::Args::EMPTY).unwrap();
+        let mut module = Keeper(None);
+        core.route_commands(&mut sinks, &mut [(3, &mut module)], 0);
+        assert_eq!(
+            next_text(&mut core).as_str(),
+            "cmd 0/0 t3 op0x0000: accepted"
+        );
+        assert!(module.0.unwrap().args.is_empty());
     }
 
     #[test]

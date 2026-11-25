@@ -114,6 +114,29 @@ fn a_request_that_gets_no_answer_times_out_at_its_deadline() {
 }
 
 #[test]
+fn a_deadline_that_would_pass_the_end_of_time_stops_at_the_end_of_time() {
+    // `now + timeout` does not fit a u64: it stops at the largest time instead of wrapping to a
+    // deadline in the past (which would time the request out at once).
+    let (mut device, gate) = gated_device();
+    device.request(u64::MAX - 5, 100, append(b"x")).unwrap();
+    wait_for_the_gate(&gate, 1);
+    assert_eq!(device.poll(u64::MAX - 6), None);
+    assert_eq!(device.poll(u64::MAX - 1), None);
+    assert_eq!(device.poll(u64::MAX), Some(Err(file::Error::TimedOut)));
+    gate.grant(1);
+}
+
+#[test]
+fn a_timeout_of_zero_is_due_at_the_moment_of_the_request() {
+    let (mut device, gate) = gated_device();
+    device.request(50, 0, append(b"x")).unwrap();
+    wait_for_the_gate(&gate, 1);
+    assert_eq!(device.poll(49), None, "before the request was made");
+    assert_eq!(device.poll(50), Some(Err(file::Error::TimedOut)));
+    gate.grant(1);
+}
+
+#[test]
 fn after_a_timeout_the_device_stays_busy_until_the_worker_really_finishes() {
     let (mut device, gate) = gated_device();
     device.request(0, TIMEOUT_US, append(b"old")).unwrap();

@@ -1,0 +1,7 @@
+error[E0599]: no method named `validate` found for reference `&A` in the current scope
+  --> tests/ui/fail/cmd_set_wrapping_a_command_whose_validate_is_missing.rs:11:10
+   |
+11 | #[derive(cmd::CmdSet)]
+   |          ^^^^^^^^^^^ method not found in `&A`
+   |
+   = note: this error originates in the derive macro `cmd::CmdSet` (in Nightly builds, run with -Z macro-backtrace for more info)

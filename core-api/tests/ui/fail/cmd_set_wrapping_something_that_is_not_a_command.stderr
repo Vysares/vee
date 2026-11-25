@@ -1,0 +1,18 @@
+error[E0599]: no function or associated item named `decode` found for struct `NotACommand` in the current scope
+ --> tests/ui/fail/cmd_set_wrapping_something_that_is_not_a_command.rs:5:10
+  |
+3 | struct NotACommand;
+  | ------------------ function or associated item `decode` not found for this struct
+4 |
+5 | #[derive(cmd::CmdSet)]
+  |          ^^^^^^^^^^^ function or associated item not found in `NotACommand`
+  |
+  = note: this error originates in the derive macro `cmd::CmdSet` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0599]: no method named `validate` found for reference `&NotACommand` in the current scope
+ --> tests/ui/fail/cmd_set_wrapping_something_that_is_not_a_command.rs:5:10
+  |
+5 | #[derive(cmd::CmdSet)]
+  |          ^^^^^^^^^^^ method not found in `&NotACommand`
+  |
+  = note: this error originates in the derive macro `cmd::CmdSet` (in Nightly builds, run with -Z macro-backtrace for more info)

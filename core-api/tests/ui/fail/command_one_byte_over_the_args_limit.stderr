@@ -1,0 +1,5 @@
+error[E0080]: evaluation panicked: S is more bytes than cmd::CMD_ARGS_MAX_BYTES: raise it, or shrink the command
+ --> tests/ui/fail/command_one_byte_over_the_args_limit.rs:3:10
+  |
+3 | #[derive(cmd::Command)]
+  |          ^^^^^^^^^^^^ evaluation of `_` failed here

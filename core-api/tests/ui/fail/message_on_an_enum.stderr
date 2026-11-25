@@ -1,0 +1,5 @@
+error: Message can only be derived for a struct
+ --> tests/ui/fail/message_on_an_enum.rs:4:6
+  |
+4 | enum E {
+  |      ^

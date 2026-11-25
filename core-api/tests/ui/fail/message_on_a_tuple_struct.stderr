@@ -1,0 +1,5 @@
+error: Message needs named fields
+ --> tests/ui/fail/message_on_a_tuple_struct.rs:4:9
+  |
+4 | struct S(u8);
+  |         ^^^^

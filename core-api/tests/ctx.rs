@@ -517,3 +517,98 @@ fn commands_left_in_the_queue_by_a_module_that_never_drains_stay_there() {
     );
     assert_eq!(queue.len(), 1);
 }
+
+// ---- The throttle's edges, through a module ----
+
+/// Sends `self.0` copies of one event in one step.
+struct Burst(u16);
+
+impl module::Module for Burst {
+    type Event = NoisyEv;
+    type In<'a> = ();
+    type Out<'a> = ();
+    type Cmd = ();
+
+    fn init(&mut self, _ctx: &mut ctx::Ctx<'_, Self>) {}
+
+    fn step(&mut self, ctx: &mut ctx::Ctx<'_, Self>) {
+        for _ in 0..self.0 {
+            ctx.ev.send(NoisyEv::Spam, format_args!("spam"));
+        }
+    }
+}
+
+#[test]
+fn the_limit_the_limit_plus_one_and_far_past_it_are_each_sent_and_counted_exactly() {
+    let limit = u16::from(LIMIT);
+    // The most the count can say: it stops at 255 minus the limit.
+    let most_counted = 255 - LIMIT;
+    let cases = [
+        (0, 0, 0),
+        (1, 1, 0),
+        (limit - 1, limit - 1, 0),
+        (limit, limit, 0),
+        (limit + 1, limit, 1),
+        (limit + 2, limit, 2),
+        (255, limit, most_counted),
+        (256, limit, most_counted),
+        (1000, limit, most_counted),
+    ];
+    for (sent_by_the_module, reaches_the_queue, counted_as_suppressed) in cases {
+        let mut ev = ev::Ev::new();
+        let mut throttle = throttle::Throttle::new();
+        run_step(
+            &mut Burst(sent_by_the_module),
+            &mut ev,
+            &mut throttle,
+            1,
+            0,
+            (),
+            (),
+        );
+
+        assert_eq!(
+            drained(&mut ev).len(),
+            usize::from(reaches_the_queue),
+            "{sent_by_the_module} sent"
+        );
+        let mut reports = Vec::new();
+        throttle.new_tick::<NoisyEv, _>(|code, count| reports.push((code, count)));
+        if counted_as_suppressed == 0 {
+            assert!(reports.is_empty(), "{sent_by_the_module} sent");
+        } else {
+            assert_eq!(
+                reports,
+                [(NoisyEv::Spam, counted_as_suppressed)],
+                "{sent_by_the_module} sent"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_new_tick_gives_the_full_limit_again_and_a_different_event_has_its_own() {
+    let mut ev = ev::Ev::new();
+    let mut throttle = throttle::Throttle::new();
+    run_step(
+        &mut Burst(u16::from(LIMIT) + 3),
+        &mut ev,
+        &mut throttle,
+        1,
+        0,
+        (),
+        (),
+    );
+    throttle.new_tick::<NoisyEv, _>(|_, _| {});
+    run_step(
+        &mut Burst(u16::from(LIMIT)),
+        &mut ev,
+        &mut throttle,
+        1,
+        0,
+        (),
+        (),
+    );
+    // LIMIT in the first tick, LIMIT again in the second: nothing was left over.
+    assert_eq!(drained(&mut ev).len(), 2 * usize::from(LIMIT));
+}

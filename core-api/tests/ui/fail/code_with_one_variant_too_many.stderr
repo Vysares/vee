@@ -1,0 +1,5 @@
+error[E0080]: evaluation panicked: E has more events than throttle::EV_MAX_CODES: raise VEE_EV_MAX_CODES, or split it
+ --> tests/ui/fail/code_with_one_variant_too_many.rs:3:10
+  |
+3 | #[derive(event::Code)]
+  |          ^^^^^^^^^^^ evaluation of `_` failed here

@@ -271,7 +271,10 @@ type, and generic code can only reach a type's items through a trait bound.
 `bus::Topic`: the dyn view itself, implemented once for `StateTopic<T>` and once for `QueuedTopic<T, N, D>`.
 `layout()`, `latest_bytes(out) -> Option<usize>` (raw bytes, for the recorder) and `pop_encoded(reader, out) ->
 Option<usize>` match the original sketch; each topic kind leaves the other side's methods at their trait
-default (`None`), since a state topic has no queue and a queued topic has no "latest".
+default (`None`), since a state topic has no queue and a queued topic has no "latest". A refusal never
+costs a message: `pop_encoded` checks that `out` can hold the message BEFORE it takes it out of the queue, so a
+buffer one byte too small leaves the message waiting (found by a boundary test, 2026-11-24; it used to pop
+first and lose it).
 
 Settled while building this (the user asked, while reviewing the `Message` derive step, what stops `read`
 from being called with a field and bytes that do not belong together — nothing did: `read(bytes, field)` is a

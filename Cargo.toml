@@ -12,6 +12,10 @@ version = "0.1.0"
 # The logging facade for the system log. No default features: it works without std.
 log = { version = "0.4", default-features = false }
 
+# Dev only (never in the flight binary): checks that the derives and `config::setting!` refuse what they
+# should, by compiling small programs that must fail (`core-api/tests/compile_fail.rs`).
+trybuild = "1"
+
 # Every crate opts in with `[lints] workspace = true`.
 # `unsafe_code` is `deny` here so the osal, the only crate that may use unsafe, can allow a
 # specific block with `#[allow(unsafe_code, reason = "...")]`. Every flight crate also says

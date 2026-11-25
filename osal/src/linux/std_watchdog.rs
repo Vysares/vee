@@ -479,4 +479,33 @@ mod tests {
         assert_eq!(after, before);
         assert_eq!(received(&receiver).len(), 1);
     }
+
+    #[test]
+    fn each_start_error_says_what_went_wrong_and_only_a_socket_error_has_a_source() {
+        use std::error::Error as _;
+        let texts = [
+            (
+                std_watchdog::StartError::InvalidSocketName,
+                "NOTIFY_SOCKET is not a path or an @name",
+            ),
+            (
+                std_watchdog::StartError::InvalidWatchdogUsec,
+                "WATCHDOG_USEC is not a number",
+            ),
+            (
+                std_watchdog::StartError::InvalidWatchdogPid,
+                "WATCHDOG_PID is not a number",
+            ),
+        ];
+        for (error, text) in texts {
+            assert_eq!(error.to_string(), text);
+            assert!(error.source().is_none());
+        }
+        let socket = std_watchdog::StartError::Socket(io::Error::other("no socket"));
+        assert_eq!(
+            socket.to_string(),
+            "cannot set up the notify socket: no socket"
+        );
+        assert!(socket.source().is_some());
+    }
 }

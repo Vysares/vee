@@ -1,0 +1,5 @@
+error: a CmdSet variant must wrap exactly one `#[derive(Command)]` struct, as `Name(Args)`
+  --> tests/ui/fail/cmd_set_variant_with_two_fields.rs:11:5
+   |
+11 |     X(A, A) = 1,
+   |     ^^^^^^^^^^^

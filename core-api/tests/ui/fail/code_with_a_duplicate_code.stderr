@@ -1,0 +1,11 @@
+error[E0081]: discriminant value `1` assigned more than once
+ --> tests/ui/fail/code_with_a_duplicate_code.rs:5:1
+  |
+5 | enum E {
+  | ^^^^^^
+6 |     #[severity(Info)]
+7 |     A = 1,
+  |         - `1` assigned here
+8 |     #[severity(Info)]
+9 |     B = 1,
+  |         - `1` assigned here

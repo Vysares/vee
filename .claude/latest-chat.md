@@ -1,35 +1,31 @@
-# Hand-off (end of session, 2026-11-23)
+# Hand-off (end of session, 2026-11-24)
 
-`.claude/progress.md` is the source of truth (item 82 is the newest). This is a short summary.
+`.claude/progress.md` is the source of truth (item 97 is the newest; "WHERE WE LEFT OFF" has the state). This is a
+short summary.
 
 ## Done this session
-- The sample's 2 overruns on WSL were explained: the loop woke 2 to 12 ms late (WSL2 scheduler), the work took
-  microseconds. Native Linux: none. The overrun warning now says `woke N us late and its work took M us` (item 75).
-- Software bus designed with the user and written down in the new `docs/bus.md` (`design.md` points to it; item 76).
-  Settled: typed handles (`Module::In<'a>`/`Out<'a>`, `ctx.inputs`/`ctx.out`) for ordinary modules plus a dyn view by
-  APID for telemetry, FDIR and the recorder; state topic = one shared slot, `latest()` returns a reference; queued
-  topic = a queue per reader, policy per queue, flow control by `writer.space()`; messages get a `LAYOUT` (data:
-  name, wire offset, kind) and a hand written `read(bytes, field)`, rows name fields by index; APIDs are unique and
-  defined in one place (the deployment), no range check for now; events: one `Ev`, `send` also pushes to a second
-  queue for the bus only if a severity filter allows (Off by default, set by a core command), `Ev` has its own step
-  at the top of `core.tick`, one tick of delay accepted.
-- Bus slice 1 is DONE (items 77 to 82): `core-api/src/bus.rs` (`StateTopic`, `StateWriter`, `StateReader`,
-  `Sample`), GATs on `Module`, `Slot::init`/`step` take `time: u64` (one clock read per call), the loop test
-  `core/tests/bus_loop.rs`, and the sample's second module `modules/watcher` reading `Example`'s `Progress` topic.
-- 391 tests pass, clippy and fmt clean.
+- Command router finished for the core (items 92 to 96): `CoreCommands` (`core/src/commands.rs`), command sinks
+  (`cmd::Sink`, one queue each, the module gets a `SinkHandle` through its `Out`), `Core::route_commands`, the core
+  draining its own commands in `Core::tick`, `ctx.drain_cmds` so a module writes only the match and the outcome ack
+  ("succeeded/failed/pending", the module's own source, never throttled) is baked in, a core `Noop` command,
+  `CmdSet::opcode()`, and the sample deployment's `pinger` module sending that `Noop` once a second (both acks
+  come back; also checked under `--features alloc-guard`).
+- Testing pass (item 97): `trybuild` (43 must-not-compile programs, 10 on-the-limit programs that must compile),
+  `LogWriter` tests, boundary tests across the crates, bus loop tests. Two real bugs found and fixed: `pop_encoded`
+  lost a message when the caller's buffer was one byte short, and a log cap of 0 failed on a missing log.
+- `cargo-llvm-cov` installed (with the user's OK). Coverage 97.6% regions, 97.4% lines. 622 tests, clippy and fmt clean.
+- Size: 4,090 lines of Rust excluding tests (61 files), 2,171 comment lines.
 
 ## Open
-- Next planned: queued topics (queue per reader, policy, `space()`), then `Ev`'s bus queue and flush, the
-  `bus::Message` derive with `LAYOUT`, APIDs and the dyn view. Open questions are at the end of `docs/bus.md`
-  (how a queued writer reaches its N queues, fan-in fairness, field kinds and `Value`, the bus queue's depth).
-- User noted: the reset report text (boot event) could become "From dreamless sleep, Vee wakes." but the count and
-  previous-end details live only in that text; it was left unchanged. Idea saved for "the core noop".
-- The new sample program test failed once under `--features alloc-guard` (cause unknown, then 20 clean runs); it was
-  made less exact (checks invariants, not tick numbers).
-- Still open from before: `Core::tick` is not asserted allocation-free.
+- TECH DEBT FIRST: `too_many_arguments` is allowed (with `TODO(revisit)`) on `Ctx::new` and `Slot::step`; bundle
+  `inputs`, `out`, `cmds` into one struct before `Ctx` grows again.
+- The user wants a better way of assigning target IDs (duplicate ids: first wins, untested). Worked out later.
+- Not written: the link module, the result for the sender's `seq`, a sink registry, `flush_bus` in `Core::tick`,
+  tables, `exec!`, the recorder, telemetry, FDIR. Remaining coverage gaps are listed in item 96/97 (mostly "cannot
+  happen" branches, the writer thread failing to spawn, the alloc guard's abort path, the sample's startup failures).
 
 ## Uncommitted
-Everything from this session (the user commits): `docs/bus.md`, `core-api/src/bus.rs`, `core/tests/bus_loop.rs`,
-`modules/watcher/`, and edits to core-api (`ctx.rs`, `module.rs`, `lib.rs`, `tests/ctx.rs`), `core/src/slot.rs`,
-`core/tests/exec_loop.rs`, `modules/example`, the sample deployment, `Cargo.toml`/`Cargo.lock`, `docs/design.md`,
-`.claude/progress.md`.
+Everything from this session (the user commits): new `core/tests/{cmd_loop,log_writer,bus_flow_loop}.rs`,
+`core-api/tests/compile_fail.rs` and `core-api/tests/ui/`, `sample-deployment/src/pinger.rs`, and edits across
+`core-api`, `core`, `core-types`, `core-derive`, `osal`, the sample deployment, `docs/design.md`, `docs/bus.md`,
+`Cargo.toml`/`Cargo.lock` and `.claude/progress.md`.

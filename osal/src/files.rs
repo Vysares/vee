@@ -76,3 +76,23 @@ pub trait Files {
     /// so the next `append` starts a new file.
     fn rotate(&self, path: &str) -> Result<(), FileError>;
 }
+
+#[cfg(test)]
+mod tests {
+    use super as files;
+
+    #[test]
+    fn each_file_error_has_its_own_text() {
+        let texts = [
+            (files::FileError::NotFound, "entity not found"),
+            (files::FileError::PermissionDenied, "permission denied"),
+            (files::FileError::StorageFull, "no storage space"),
+            (files::FileError::UnexpectedEof, "unexpected end of file"),
+            (files::FileError::Other, "other error"),
+            (files::FileError::TooLarge, "file too large for the buffer"),
+        ];
+        for (error, text) in texts {
+            assert_eq!(error.to_string(), text);
+        }
+    }
+}

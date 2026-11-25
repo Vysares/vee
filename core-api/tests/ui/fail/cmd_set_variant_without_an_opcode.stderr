@@ -1,0 +1,5 @@
+error: give this command an opcode, its discriminant: `Name(Args) = 1`
+  --> tests/ui/fail/cmd_set_variant_without_an_opcode.rs:11:5
+   |
+11 |     X(A),
+   |     ^

@@ -1,0 +1,5 @@
+error: add `#[repr(u16)]`: a variant's discriminant is its opcode
+  --> tests/ui/fail/cmd_set_with_repr_u8.rs:10:6
+   |
+10 | enum E {
+   |      ^

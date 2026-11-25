@@ -93,15 +93,27 @@ struct SetArgs {
     value: u16,
 }
 
+/// Four `u64`s: 32 bytes, exactly `cmd::CMD_ARGS_MAX_BYTES` at its default. (The derive refuses a
+/// command bigger than that, so a deployment that lowers the setting cannot build this file.)
+#[derive(Debug, Clone, Copy, PartialEq, cmd::Command)]
+struct WideArgs {
+    a: u64,
+    b: u64,
+    c: u64,
+    d: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, cmd::CmdSet)]
 #[repr(u16)]
 enum WorkerCmd {
     Add(AddArgs) = 1,
     Set(SetArgs) = 2,
+    Wide(WideArgs) = 3,
 }
 
 const ADD: u16 = 1;
 const SET: u16 = 2;
+const WIDE: u16 = 3;
 
 // ---- Module 1: the target ----
 
@@ -140,6 +152,17 @@ impl Worker {
         match command {
             WorkerCmd::Add(args) => {
                 self.total = self.total.saturating_add(u32::from(args.amount));
+                ctx.ev
+                    .send(WorkerEv::Handled, format_args!("total {}", self.total));
+                cmd::CmdResult::Success
+            }
+            WorkerCmd::Wide(args) => {
+                let sum = args
+                    .a
+                    .saturating_add(args.b)
+                    .saturating_add(args.c)
+                    .saturating_add(args.d);
+                self.total = u32::try_from(sum).unwrap_or(u32::MAX);
                 ctx.ev
                     .send(WorkerEv::Handled, format_args!("total {}", self.total));
                 cmd::CmdResult::Success
@@ -203,6 +226,16 @@ fn set(seq: u16, value: u16) -> Submit {
     }
 }
 
+/// A `Wide` command with `bytes` as its args, whatever their length.
+fn wide(seq: u16, bytes: Vec<u8>) -> Submit {
+    Submit {
+        seq,
+        target: WORKER,
+        opcode: WIDE,
+        args: bytes,
+    }
+}
+
 fn set_event_filter(seq: u16, floor: u8) -> Submit {
     Submit {
         seq,
@@ -244,7 +277,11 @@ impl module::Module for Link {
         let mut accepted = 0_u32;
         let mut refused = 0_u32;
         for submit in batch {
-            let args = cmd::Args::new(&submit.args).unwrap();
+            // Args too big for a command never get as far as the sink.
+            let Ok(args) = cmd::Args::new(&submit.args) else {
+                refused = refused.saturating_add(1);
+                continue;
+            };
             match ctx
                 .out
                 .cmd
@@ -609,6 +646,79 @@ fn a_target_queue_that_was_emptied_takes_commands_again() {
     // Tick 1 routes and the worker empties its queue; tick 2 routes two more.
     assert_eq!(exec.acks().len(), 4);
     assert_eq!(exec.totals().last().unwrap(), "total 4");
+}
+
+// ---- Limits of a command ----
+
+#[test]
+fn a_command_with_args_of_exactly_the_most_a_command_can_hold_goes_all_the_way_through() {
+    let args = WideArgs {
+        a: 1,
+        b: 2,
+        c: 3,
+        d: 4,
+    }
+    .encode();
+    assert_eq!(args.len(), cmd::CMD_ARGS_MAX_BYTES);
+    let mut exec = ground_only(vec![vec![wide(1, args.to_vec())]], 2);
+    assert_eq!(exec.acks(), ["cmd 11/1 t3 op0x0003: accepted"]);
+    assert_eq!(exec.totals(), ["total 10"]);
+    assert_eq!(exec.outcomes(), ["cmd 11/1 t3 op0x0003: succeeded"]);
+}
+
+#[test]
+fn args_one_byte_short_of_the_commands_layout_are_rejected_and_not_run() {
+    let short = vec![0u8; cmd::CMD_ARGS_MAX_BYTES - 1];
+    let mut exec = ground_only(vec![vec![wide(1, short)]], 2);
+    assert_eq!(
+        exec.acks(),
+        ["cmd 11/1 t3 op0x0003: rejected: bad args size"]
+    );
+    assert!(exec.totals().is_empty());
+    assert!(exec.outcomes().is_empty());
+}
+
+#[test]
+fn args_one_byte_over_the_most_a_command_can_hold_never_reach_the_sink() {
+    // The module cannot even build the args: `Args::new` refuses, and the link counts a refusal.
+    let over = vec![0u8; cmd::CMD_ARGS_MAX_BYTES + 1];
+    let mut exec = ground_only(vec![vec![wide(1, over)]], 2);
+    assert_eq!(exec.texts(LINK_GROUND)[0], "submitted 0, refused 1");
+    assert_eq!(exec.acks(), Vec::<String>::new());
+}
+
+#[test]
+fn extra_bytes_after_the_commands_layout_are_ignored_not_an_error() {
+    // `Add` is 2 bytes. Three are sent; the third is not looked at.
+    let command = Submit {
+        args: vec![0, 5, 0xFF],
+        ..add(1, 0)
+    };
+    let mut exec = ground_only(vec![vec![command]], 2);
+    assert_eq!(exec.acks(), ["cmd 11/1 t3 op0x0001: accepted"]);
+    assert_eq!(exec.totals(), ["total 5"]);
+}
+
+#[test]
+fn the_extreme_seq_and_opcode_values_are_carried_into_the_ack_unchanged() {
+    // `seq` 0 and 65535, an opcode that is the smallest and the largest a u16 holds (neither is a
+    // real opcode of the worker, so both are rejected: the ack says which).
+    let low = Submit {
+        opcode: 0,
+        ..add(0, 1)
+    };
+    let high = Submit {
+        opcode: u16::MAX,
+        ..add(u16::MAX, 1)
+    };
+    let mut exec = ground_only(vec![vec![low, high]], 2);
+    assert_eq!(
+        exec.acks(),
+        [
+            "cmd 11/0 t3 op0x0000: rejected: unknown opcode",
+            "cmd 11/65535 t3 op0xffff: rejected: unknown opcode",
+        ]
+    );
 }
 
 // ---- The core as a target ----

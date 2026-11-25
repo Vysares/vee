@@ -1,0 +1,5 @@
+error: a code has no fields: put the details in the event's text
+ --> tests/ui/fail/code_variant_with_fields.rs:7:6
+  |
+7 |     A(u8),
+  |      ^^^^

@@ -394,4 +394,16 @@ mod tests {
         assert!(at(log::Level::Info));
         assert!(!at(log::Level::Debug));
     }
+
+    #[test]
+    fn each_start_error_says_what_went_wrong() {
+        assert_eq!(
+            std_syslog::StartError::NotInstalled.to_string(),
+            "the system log is not installed"
+        );
+        assert_eq!(
+            std_syslog::StartError::AlreadyStarted.to_string(),
+            "the log queue was started already"
+        );
+    }
 }

@@ -244,6 +244,55 @@ fn a_tick_limit_that_is_not_a_number_fails_loudly() {
     assert!(!dir.file(RESET_LOG).exists());
 }
 
+/// Every tick limit that is not a whole number, including the edges of what a number is: empty,
+/// a minus sign, a space, a fraction, one more than a `u64` holds, and bytes that are not even text.
+#[test]
+fn a_tick_limit_that_is_not_a_whole_number_never_starts_anything() {
+    use std::os::unix::ffi::OsStrExt as _;
+    let not_text = std::ffi::OsStr::from_bytes(&[0xFF, 0xFE]);
+    let values: [&std::ffi::OsStr; 7] = [
+        "".as_ref(),
+        "-1".as_ref(),
+        " 5".as_ref(),
+        "5 ".as_ref(),
+        "1.5".as_ref(),
+        "18446744073709551616".as_ref(),
+        not_text,
+    ];
+    for (index, value) in values.into_iter().enumerate() {
+        let dir = TempDir::new(&format!("a_tick_limit_that_is_not_whole_{index}"));
+        let output = sample(&dir)
+            .env("VEE_SAMPLE_TICKS", value)
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{value:?} was accepted");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("InvalidTickLimit"), "{value:?}: {stderr}");
+        assert!(!dir.file(RESET_LOG).exists(), "{value:?} started something");
+    }
+}
+
+#[test]
+fn the_smallest_and_largest_tick_limits_that_are_numbers_are_accepted_as_numbers() {
+    // 1 tick runs one tick and stops cleanly. (0 is a number too: the loop always runs one tick
+    // before it looks at the limit, so it stops after that one. A leading plus is what Rust's own
+    // number parser allows, and harmless here.)
+    for limit in ["0", "1", "+2"] {
+        let dir = TempDir::new(&format!("a_tick_limit_of_{limit}"));
+        let output = sample(&dir)
+            .env("VEE_SAMPLE_TICKS", limit)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{limit}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // Boot and clean shutdown.
+        assert_eq!(reset_log_len(&dir), 2 * reset_log::RECORD_LEN, "{limit}");
+    }
+}
+
 #[test]
 fn the_pinger_sends_the_core_a_noop_and_both_acks_come_back() {
     let dir = TempDir::new("the_pinger_sends_a_noop");

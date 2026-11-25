@@ -131,6 +131,14 @@ mod tests {
     }
 
     #[test]
+    fn a_length_that_cannot_be_asked_for_is_an_error_not_a_missing_file() {
+        // A path with a zero byte is not a name any file can have: the OS refuses it, which is
+        // not the same as "there is no such file" (`Ok(None)`).
+        let real = std_files::StdFiles;
+        assert_eq!(real.len("a\0b"), Err(files::FileError::Other));
+    }
+
+    #[test]
     fn append_creates_then_extends() {
         let tmp = TempDir::new("append_creates_then_extends");
         let real = std_files::StdFiles;

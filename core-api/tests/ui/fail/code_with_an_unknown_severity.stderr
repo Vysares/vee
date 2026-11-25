@@ -1,0 +1,5 @@
+error: the severity must be Info, Warn or Err
+ --> tests/ui/fail/code_with_an_unknown_severity.rs:6:16
+  |
+6 |     #[severity(Fatal)]
+  |                ^^^^^

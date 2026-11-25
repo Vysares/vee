@@ -195,6 +195,26 @@ mod tests {
         config::parse_or(Some("99999999999999999999999999"), 50);
     }
 
+    #[test]
+    #[should_panic(expected = "too big")]
+    fn one_more_than_the_largest_usize_is_rejected() {
+        // The last digit is the one that does not fit: the multiplication by ten is fine and the
+        // addition is what overflows.
+        let text = if usize::MAX == u32::MAX as usize {
+            "4294967296"
+        } else {
+            "18446744073709551616"
+        };
+        config::parse_or(Some(text), 0);
+    }
+
+    #[test]
+    fn the_default_is_used_as_it_is_with_no_check_at_this_level() {
+        // `parse_or` only reads: the range is the macro's job (see `compile_fail.rs`).
+        assert_eq!(config::parse_or(None, usize::MAX), usize::MAX);
+        assert_eq!(config::parse_or(None, 0), 0);
+    }
+
     // Settings declared with the macro, to test what it writes. (Nothing sets these variables.)
     config::setting! {
         /// A plain setting.

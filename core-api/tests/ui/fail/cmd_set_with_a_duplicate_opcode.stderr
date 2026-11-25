@@ -1,0 +1,19 @@
+error[E0081]: discriminant value `1` assigned more than once
+  --> tests/ui/fail/cmd_set_with_a_duplicate_opcode.rs:10:1
+   |
+10 | enum E {
+   | ^^^^^^
+11 |     X(A) = 1,
+   |            - `1` assigned here
+12 |     Y(A) = 1,
+   |            - `1` assigned here
+
+warning: unreachable pattern
+  --> tests/ui/fail/cmd_set_with_a_duplicate_opcode.rs:12:12
+   |
+11 |     X(A) = 1,
+   |            - matches all the relevant values
+12 |     Y(A) = 1,
+   |            ^ no value can reach this
+   |
+   = note: `#[warn(unreachable_patterns)]` (part of `#[warn(unused)]`) on by default

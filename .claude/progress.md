@@ -1609,20 +1609,78 @@ Size on 2026-11-17 (cloc, working tree, no target dir): 14 Rust files, 1729 line
     Also known and untested: the router with duplicate target ids (first wins). USER (2026-11-24): wants a BETTER WAY
     OF ASSIGNING TARGET IDS anyway, to be worked out later; do not patch the duplicate case before that.
 
-## WHERE WE LEFT OFF (2026-11-24)
-Everything builds, 469 tests pass, clippy and `cargo fmt --check` are clean. Items 87 to 90 (the
-`bus::Message` derive, the APID-to-TID rename, the `core-derive` file split, TIDs and the dyn view step 1)
-were committed by the user between sessions (`55247fd`). This session's work is item 91: the Command
-Router's pieces 1 to 4 (shared router types and `drain` in `core-api/src/cmd.rs`, the `Command` and
-`CmdSet` derives, and the core's own `SetEventFilter` command in `core-types/src/core_cmd.rs`), including
-the mid-session redesign where a command's opcode moved from an attribute on the `Command` struct to the
-`CmdSet` variant's own discriminant, and the `Floor` enum split out of `SetEventFilterArgs`.
-See `docs/bus.md` for the bus design and roadmap, and the plan file above for the Command Router's full
-piece-by-piece design and what remains (pieces 5 and 6).
+97. **A thorough testing pass: `trybuild`, coverage gaps, boundaries, and the bus** (2026-11-24, with the user's OK for
+    `trybuild`). Tests went from 542 to 622; coverage from 95.8% to 97.6% of regions (94.9% to 97.4% of lines).
+    TWO REAL BUGS FOUND BY BOUNDARY TESTS, BOTH FIXED:
+    (1) `Topic::pop_encoded` (`core-api/src/bus.rs`, the queued topic's dyn view) took the message out of the queue
+    BEFORE checking that the caller's buffer could hold it, so a buffer one byte too small silently destroyed the
+    message. It now checks first and leaves the message waiting. Written into `docs/bus.md`.
+    (2) `event_log::start` and `reset_log::start` rotated a log that did not exist when `max_records` was 0
+    (`Err(NotFound)`). The setting's minimum is 1, so flight could not reach it, but the functions take any value:
+    a log with no records is now never full, whatever the cap.
+    WHAT WAS ADDED:
+    - `trybuild` (workspace dev dependency, `core-api` only; never in the flight binary): `core-api/tests/
+      compile_fail.rs` with 43 programs that must NOT compile (`tests/ui/fail/*.rs` and the saved compiler messages
+      `*.stderr`) and 10 that must (`tests/ui/pass/`, each exactly ON a limit: 256 event codes, a 32 byte command,
+      opcodes 0 and 65535, a setting at the bottom and top of its range). Covers all four derives (`Code`,
+      `Command`, `CmdSet`, `Message`) and `config::setting!`. Each saved message was checked by hand to be the
+      error meant. CAVEATS: the `.stderr` files are tied to the compiler's wording, so a new Rust version may need
+      `TRYBUILD=overwrite cargo test -p vee-core-api --test compile_fail` and a review of the diff; the limits in the
+      names are the DEFAULT settings (`VEE_EV_MAX_CODES`, `VEE_CMD_ARGS_MAX_BYTES`). FOUND: `#[validate]` with no
+      `validate` method compiles on its own (nothing in `Command`'s generated code calls it); the error is at the
+      `CmdSet` that wraps it, so that is where the test is.
+    - `core/tests/log_writer.rs` (13 tests, new): the writer's own behavior with the real worker thread: one write in
+      flight, a batch of exactly one record under, at and over what fits (`FILE_DATA_MAX_BYTES / RECORD_LEN`),
+      `flush` (several writes, in flight, nothing to write, GIVING UP after the 5 second timeout: this one test takes
+      5 s of real time), and the once-per-streak failure report (with a captured system log).
+    - Boundaries: the log caps (one under, at, one over; a cap of 1; the partial record at 1 byte and at all but
+      one), the reset log's 8 record window (a damaged record just outside is ignored, just inside is seen),
+      `FileDevice`'s deadline at the end of `u64` and a timeout of 0, the throttle through a real `Ctx` (limit - 1,
+      limit, +1, +2, 255, 256, 1000), the largest and smallest value of every message kind, a command with args of
+      exactly `CMD_ARGS_MAX_BYTES` through sink, router and target (and one short, one over), the largest and smallest
+      sink, target, seq and opcode, `CmdEvent`'s code lookup, a bad tick limit (empty, sign, space, fraction,
+      one past `u64`, bytes that are not text) in the real binary, the pinger's `seq` wrapping at `u16::MAX` and its
+      full sink, `Core` with a writer that cannot start, and the `osal` error texts.
+    - Bus: dyn view edges (`pop_encoded` exact buffer, one short, empty, bigger; reader one past the last; `find` at both
+      ends; `read_latest` for a message of exactly `MESSAGE_MAX_BYTES` and one byte more), queued topic edges (depth
+      exactly, one past, depth 0, reader out of range, `space()` at 0), `Ev`'s bus queue edges (flush with nothing,
+      into 0 readers, exactly the reader's depth, the filter turned off or on later, every severity against every
+      filter), a message with every field kind at its smallest and largest, and `core/tests/bus_flow_loop.rs` (4
+      tests, new): one module writing a state topic AND a queued topic, and a writer that checks `space()` first
+      and so is never refused and loses nothing, with a reader that is slow.
+    MUTATION CHECK of this pass: 10 of 12 breakages caught; the two that survived are not gaps (an equivalent
+    mutation, since with the default sizes a batch can never be exactly full, and an edit that changed nothing).
+    STILL UNCOVERED (what is left, from `cargo llvm-cov`): the branches that "cannot happen" (`log_writer` 90.8% of
+    lines, `file_device`, `reset_log`'s `get_mut`), the writer thread failing to spawn, `std_alloc_guard`'s abort path,
+    `sample-deployment/src/main.rs` startup failure branches (89.5%), `core-derive/src/message.rs` (79.5%: only 6
+    refusal cases), `crc.rs` (false: the table is built at compile time), and test-only stub impls. No branch
+    coverage on this toolchain.
+
+## WHERE WE LEFT OFF (2026-11-24, end of session)
+Everything builds, 622 tests pass, clippy and `cargo fmt --check` are clean, coverage is 97.6% of regions (97.4% of
+lines). Items 92 to 97 are this session's work and are UNCOMMITTED (the user commits): the command router is
+complete for the core (sinks, `Core::route_commands`, the core's own commands `SetEventFilter` and `Noop`,
+`ctx.drain_cmds` with the outcome ack baked in), the sample deployment sends the core a `Noop` through a sink once a
+second and both acks come back (item 96), and a thorough testing pass added `trybuild`, `LogWriter` tests, boundary
+tests everywhere and bus loop tests, and found and fixed two real bugs (item 97).
+SIZE (2026-11-24): 4,090 lines of Rust code (61 files) EXCLUDING tests, plus 2,171 comment lines. Counted as the
+non-blank, non-comment lines of each `src` file before its `#[cfg(test)]` module, so integration test directories,
+UI test programs and in-file test modules are all left out. Per crate (code / comments): core-api 1,174 / 758,
+core-derive 539 / 176, core-types 253 / 126, core 846 / 439, osal 869 / 507, modules/example 51 / 42,
+modules/watcher 53 / 26, sample-deployment 305 / 97. About 2,560 lines of Markdown. (`cloc` is installed:
+`cloc --include-lang=Rust` counts tests too.) Coverage tool: `cargo llvm-cov --workspace --summary-only
+--ignore-filename-regex '(/tests/|/target/)'` (see item 96).
+TECH DEBT TO DO FIRST (item 95): `too_many_arguments` is allowed on `Ctx::new` and `Slot::step` (8 of 7), marked
+`TODO(revisit)`: bundle `inputs`, `out` and `cmds` into one struct before anything else is added to `Ctx`.
+USER DECISIONS TO KEEP: a better way of assigning target IDs is wanted, to be worked out later (do not patch the
+duplicate target id case before that); the module's command outcome ack comes from the module's own source and is
+never throttled; sinks are one queue each, owned by the executive.
+See `docs/bus.md` for the bus design and roadmap, `docs/design.md` "Command Routing" for the router.
 The user is learning Rust (comes from C++): explain syntax and generics as they come up, and follow
 CLAUDE.md (one thing at a time, simplicity, callbacks only when needed, "do we really need this?", and
-after any edit name each file touched and what was done in it). `latest-chat.md` is updated only when the
-user says the session is ending.
+after any edit name each file touched and what was done in it). Tell the user the plan BEFORE writing code (they
+stopped me once for starting a file without saying so). `latest-chat.md` is updated only when the user says the
+session is ending.
 
 Where the code is: `Core<P: Platform>` (`core/src/lib.rs`) has `start`, `tick` (the log writer's step, the dropped
 report, then the watchdog feed), `stop`, `reset`, `files`, `watchdog`; `vee_core::slot::Slot<M>` is the per module
@@ -1645,13 +1703,14 @@ item 87, DONE 2026-11-24, split into its own file item 89) writes a message type
 item 88) and `bus::Topic` (item 90, DONE 2026-11-24), the dyn view: `layout()`, `latest_bytes()`,
 `read_latest(index)` (bundled so a caller cannot pair the wrong field with the wrong bytes), `pop_encoded(reader,
 out)`, `find(topics, tid)`; implemented for `StateTopic<T>` and `QueuedTopic<T,N,D>`.
-The Command Router (item 91, DONE pieces 1 to 4, 2026-11-24): shared router types, `drain`, and both derives
-are in `core-api/src/cmd.rs` and `core-derive`; the core's one real command, `SetEventFilter`, is in
-`core-types/src/core_cmd.rs`. `core/src/commands.rs` (`CoreCommands`, piece 5) is written (item 92). NOT yet written: wiring
-`Core::submit_command` into `core/src/lib.rs` (piece 6) — this is also what will wire `flush_bus` into
-`Core::tick`, since the events-filter command is what switches it on. The recorder, telemetry, FDIR, and
-`exec!` (which will build the real `(tid, &dyn Topic)` array and the table that reads it) are also not
-started.
+The Command Router (items 91 to 96, DONE 2026-11-24): shared router types, `Sink`/`SinkHandle`, `ack`, `drain` and
+the `Command` and `CmdSet` derives (the latter also writes `opcode()`) are in `core-api/src/cmd.rs` and
+`core-derive`; the core's commands (`SetEventFilter`, `Noop`) are in `core-types/src/core_cmd.rs` and handled by
+`core/src/commands.rs` (`CoreCommands`), which `Core::tick` drains with `cmd::drain`; `Core::route_commands(sinks,
+targets, now)` is the router; a module drains its own queue with `ctx.drain_cmds`. NOT written: the link module, the
+result for the sender's `seq`, a sink registry, a way of assigning target IDs, `flush_bus` in `Core::tick`
+(nothing reads the events topic yet), the recorder, telemetry, FDIR, tables and `exec!` (the sample deployment is
+its hand written precursor).
 The blocking event log write is gone (item 74); the two sample overruns on WSL were late wake-ups (item 75); none
 on native Linux.
 

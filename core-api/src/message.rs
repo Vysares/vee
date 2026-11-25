@@ -155,6 +155,117 @@ mod tests {
         }
     }
 
+    /// The bytes of `value`, in an 8 byte array padded with zeros, and how many are the value's.
+    fn be<const N: usize>(bytes: [u8; N]) -> ([u8; 8], usize) {
+        let mut padded = [0u8; 8];
+        for (slot, byte) in padded.iter_mut().zip(bytes) {
+            *slot = byte;
+        }
+        (padded, N)
+    }
+
+    #[test]
+    fn reads_the_smallest_and_largest_value_of_each_integer_kind() {
+        let cases = [
+            (message::Kind::U8, be(0u8.to_be_bytes()), 0),
+            (message::Kind::U8, be(u8::MAX.to_be_bytes()), 255),
+            (message::Kind::I8, be(i8::MIN.to_be_bytes()), -128),
+            (message::Kind::I8, be(i8::MAX.to_be_bytes()), 127),
+            (message::Kind::U16, be(u16::MAX.to_be_bytes()), 65_535),
+            (message::Kind::I16, be(i16::MIN.to_be_bytes()), -32_768),
+            (message::Kind::I16, be(i16::MAX.to_be_bytes()), 32_767),
+            (
+                message::Kind::U32,
+                be(u32::MAX.to_be_bytes()),
+                4_294_967_295,
+            ),
+            (
+                message::Kind::I32,
+                be(i32::MIN.to_be_bytes()),
+                -2_147_483_648,
+            ),
+            (
+                message::Kind::I32,
+                be(i32::MAX.to_be_bytes()),
+                2_147_483_647,
+            ),
+            (
+                message::Kind::U64,
+                be(u64::MAX.to_be_bytes()),
+                i128::from(u64::MAX),
+            ),
+            (
+                message::Kind::I64,
+                be(i64::MIN.to_be_bytes()),
+                i128::from(i64::MIN),
+            ),
+            (
+                message::Kind::I64,
+                be(i64::MAX.to_be_bytes()),
+                i128::from(i64::MAX),
+            ),
+        ];
+        for (kind, (padded, len), expected) in cases {
+            let field = message::Field {
+                name: "x",
+                offset: 0,
+                kind,
+            };
+            assert_eq!(
+                message::read(&padded[..len], &field),
+                Some(message::Value::Int(expected)),
+                "{kind:?}"
+            );
+            // One byte short is `None`, never a partial read.
+            assert_eq!(
+                message::read(&padded[..len - 1], &field),
+                None,
+                "{kind:?} one byte short"
+            );
+        }
+    }
+
+    #[test]
+    fn reads_a_64_bit_float_and_the_special_float_values() {
+        let field = |kind| message::Field {
+            name: "x",
+            offset: 0,
+            kind,
+        };
+        let f64_field = field(message::Kind::F64);
+        assert_eq!(
+            message::read(&(-2.25_f64).to_be_bytes(), &f64_field),
+            Some(message::Value::Float(-2.25))
+        );
+        assert_eq!(
+            message::read(&f64::INFINITY.to_be_bytes(), &f64_field),
+            Some(message::Value::Float(f64::INFINITY))
+        );
+        assert_eq!(
+            message::read(&f64::MIN_POSITIVE.to_be_bytes(), &f64_field),
+            Some(message::Value::Float(f64::MIN_POSITIVE))
+        );
+        let Some(message::Value::Float(nan)) = message::read(&f64::NAN.to_be_bytes(), &f64_field)
+        else {
+            panic!("a NaN is still a float");
+        };
+        assert!(nan.is_nan());
+
+        // A 32-bit float widens exactly.
+        let f32_field = field(message::Kind::F32);
+        assert_eq!(
+            message::read(&f32::MAX.to_be_bytes(), &f32_field),
+            Some(message::Value::Float(f64::from(f32::MAX)))
+        );
+        assert_eq!(
+            message::read(&f32::NEG_INFINITY.to_be_bytes(), &f32_field),
+            Some(message::Value::Float(f64::NEG_INFINITY))
+        );
+        // One byte short of either width is `None`.
+        assert_eq!(message::read(&[0; 7], &f64_field), None);
+        assert_eq!(message::read(&[0; 3], &f32_field), None);
+    }
+
     #[test]
     fn reads_floats_and_bool() {
         let volts = 3.5_f32;

@@ -1,0 +1,5 @@
+error: CmdSet does not support generics
+  --> tests/ui/fail/cmd_set_with_generics.rs:10:7
+   |
+10 | enum E<const N: usize> {
+   |       ^^^^^^^^^^^^^^^^

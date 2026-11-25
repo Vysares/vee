@@ -47,7 +47,9 @@ pub fn start<F: files::Files>(
     let len = fs.len(path)?.unwrap_or(0);
     let shape = records::shape(len, log_types::RECORD_LEN);
 
-    let full = shape.whole >= max_records;
+    // A log with no records is never full, whatever the cap: a missing file has nothing to rotate
+    // (rotating it would be `NotFound`).
+    let full = shape.whole > 0 && shape.whole >= max_records;
     if full || shape.has_partial {
         fs.rotate(path)?;
     }
@@ -169,6 +171,72 @@ mod tests {
         );
         assert_eq!(files.get(PATH), None);
         assert_eq!(files.get("events.log.1"), before);
+    }
+
+    #[test]
+    fn a_log_one_record_over_the_cap_is_rotated() {
+        let files = files_with(5);
+        let before = files.get(PATH);
+        event_log::start(&files, PATH, 4).unwrap();
+        assert_eq!(files.get(PATH), None);
+        assert_eq!(files.get("events.log.1"), before);
+    }
+
+    #[test]
+    fn at_each_side_of_the_cap_only_a_full_log_is_rotated() {
+        // The cap itself, one under, and one over, for a cap of 1 (the smallest the setting
+        // allows), 2 and 10.
+        for cap in [1_u64, 2, 10] {
+            for (records, rotated) in [(cap - 1, false), (cap, true), (cap + 1, true)] {
+                let files = files_with(records);
+                event_log::start(&files, PATH, cap).unwrap();
+                assert_eq!(
+                    files.get(PATH).is_none() && records > 0,
+                    rotated,
+                    "cap {cap}, {records} records"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_partial_record_of_one_byte_or_of_all_but_one_is_found_and_the_whole_ones_are_kept() {
+        for extra in [1, RECORD_LEN - 1] {
+            let files = files_with(2);
+            let mut bytes = files.get(PATH).unwrap();
+            bytes.resize(bytes.len() + extra, 0xEE);
+            files.write_file(PATH, &bytes).unwrap();
+
+            let started = event_log::start(&files, PATH, 100).unwrap();
+            assert!(started.partial_record, "{extra} extra bytes");
+            assert_eq!(files.get(PATH), None);
+            assert_eq!(
+                files.get("events.log.1"),
+                Some(bytes),
+                "{extra} extra bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn a_file_of_exactly_whole_records_has_no_partial_record() {
+        let files = files_with(2);
+        let started = event_log::start(&files, PATH, 100).unwrap();
+        assert!(!started.partial_record);
+    }
+
+    #[test]
+    fn a_cap_of_zero_is_not_reachable_from_the_setting_but_does_not_fail_on_a_missing_log() {
+        // The setting's smallest value is 1, so this is not a real input. A cap of 0 makes every
+        // log full, and a missing one has nothing to rotate: it must not become an error.
+        let files = fake_files::FakeFiles::new();
+        assert_eq!(
+            event_log::start(&files, PATH, 0),
+            Ok(event_log::Started {
+                partial_record: false
+            })
+        );
+        assert_eq!(files.get("events.log.1"), None);
     }
 
     #[test]

@@ -1,0 +1,5 @@
+error: Code does not support generics
+ --> tests/ui/fail/code_with_generics.rs:5:13
+  |
+5 | enum Generic<const N: usize> {
+  |             ^^^^^^^^^^^^^^^^

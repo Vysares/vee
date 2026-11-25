@@ -308,7 +308,8 @@ pub trait Topic {
 
     /// The next message waiting for reader `reader`, encoded into `out`, or `None` if there is
     /// none, `out` is shorter than the message, `reader` is out of range, or this is a state
-    /// topic (no queue).
+    /// topic (no queue). A refusal takes nothing out of the queue: with `out` too short the
+    /// message stays, for a caller that comes back with room for it.
     fn pop_encoded(&mut self, reader: usize, out: &mut [u8]) -> Option<usize> {
         let _ = (reader, out);
         None
@@ -331,6 +332,11 @@ impl<T: message::Message, const N: usize, const D: usize> Topic for QueuedTopic<
     }
 
     fn pop_encoded(&mut self, reader: usize, out: &mut [u8]) -> Option<usize> {
+        // Checked BEFORE the pop: a message taken out and then refused for want of room would be
+        // lost, and the caller could not tell. With a buffer too small it stays in the queue.
+        if out.len() < T::WIRE_LEN {
+            return None;
+        }
         self.pop(reader)?.encode_into(out)
     }
 }
@@ -547,6 +553,91 @@ mod tests {
         assert_eq!(topic.pop(0), Some(1)); // reader 0 keeps up
         // Reader 1 never pops: it is the bottleneck.
         assert_eq!(topic.space(), 2);
+    }
+
+    #[test]
+    fn a_refuse_queue_takes_exactly_its_depth_and_refuses_the_next() {
+        let mut topic = bus::QueuedTopic::<u32, 1, 3>::new([bus::Policy::Refuse]);
+        assert_eq!(topic.space(), 3);
+        for n in 0..3 {
+            assert_eq!(topic.publish(n), Ok(()), "message {n} fits");
+        }
+        assert_eq!(topic.space(), 0);
+        assert_eq!(topic.publish(3), Err(bus::Full), "one past the depth");
+        assert_eq!(topic.len(0), 3);
+        // The queue counts every message it turned away, whatever the reader's policy is.
+        assert_eq!(topic.take_refused(0), 1);
+        // One pop makes exactly one slot.
+        assert_eq!(topic.pop(0), Some(0));
+        assert_eq!(topic.space(), 1);
+        assert_eq!(topic.publish(4), Ok(()));
+        assert_eq!(topic.publish(5), Err(bus::Full));
+    }
+
+    #[test]
+    fn a_drop_queue_counts_every_message_past_its_depth() {
+        let mut topic = bus::QueuedTopic::<u32, 1, 2>::new([bus::Policy::Drop]);
+        for n in 0..5 {
+            assert_eq!(topic.publish(n), Ok(()), "a Drop queue never refuses");
+        }
+        assert_eq!(topic.len(0), 2);
+        assert_eq!(topic.take_refused(0), 3, "5 sent, 2 kept, 3 dropped");
+        // What it kept is the oldest two.
+        assert_eq!(topic.pop(0), Some(0));
+        assert_eq!(topic.pop(0), Some(1));
+        assert_eq!(topic.pop(0), None);
+    }
+
+    #[test]
+    fn a_queue_of_depth_zero_holds_nothing_and_does_not_panic() {
+        let mut refuse = bus::QueuedTopic::<u32, 1, 0>::new([bus::Policy::Refuse]);
+        assert_eq!(refuse.space(), 0);
+        assert_eq!(refuse.publish(1), Err(bus::Full));
+        assert_eq!(refuse.pop(0), None);
+
+        let mut drop = bus::QueuedTopic::<u32, 1, 0>::new([bus::Policy::Drop]);
+        assert_eq!(drop.publish(1), Ok(()));
+        assert_eq!(drop.take_refused(0), 1);
+    }
+
+    #[test]
+    fn a_reader_index_one_past_the_last_reader_has_nothing_and_does_not_panic() {
+        let mut topic = bus::QueuedTopic::<u32, 2, 2>::new([bus::Policy::Refuse; 2]);
+        topic.publish(1).unwrap();
+        for out_of_range in [2, 3, usize::MAX] {
+            assert_eq!(topic.pop(out_of_range), None);
+            assert_eq!(topic.len(out_of_range), 0);
+            assert!(topic.is_empty(out_of_range));
+            assert_eq!(topic.take_refused(out_of_range), 0);
+            assert_eq!(topic.reader(out_of_range).pop(), None);
+        }
+        // The last real reader, index 1, is not out of range.
+        assert_eq!(topic.len(1), 1);
+        assert_eq!(topic.reader(1).pop(), Some(1));
+    }
+
+    #[test]
+    fn space_is_zero_when_any_reader_is_full_and_comes_back_one_slot_at_a_time() {
+        let mut topic = bus::QueuedTopic::<u32, 2, 2>::new([bus::Policy::Drop; 2]);
+        topic.publish(1).unwrap();
+        topic.publish(2).unwrap();
+        assert_eq!(topic.space(), 0);
+        assert_eq!(topic.pop(0), Some(1));
+        assert_eq!(topic.space(), 0, "reader 1 is still full");
+        assert_eq!(topic.pop(1), Some(1));
+        assert_eq!(topic.space(), 1, "both readers have one free slot");
+    }
+
+    #[test]
+    fn a_state_topic_keeps_the_extremes_of_time_and_value() {
+        let mut topic = bus::StateTopic::new();
+        topic.publish(u64::MAX, u64::MAX);
+        let sample = topic.latest().unwrap();
+        assert_eq!(sample.updated_at, u64::MAX);
+        assert_eq!(sample.value, u64::MAX);
+        topic.publish(0, 0);
+        let sample = topic.latest().unwrap();
+        assert_eq!((sample.updated_at, sample.value, sample.seq), (0, 0, 2));
     }
 
     #[test]

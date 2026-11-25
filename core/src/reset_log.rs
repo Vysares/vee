@@ -183,7 +183,9 @@ pub fn start<F: files::Files>(
     }
     problems[1] = reading.problem;
 
-    let over_cap = whole_records >= max_records;
+    // A log with no records is never over the cap, whatever the cap: a missing file has nothing
+    // to rotate (rotating it would be `NotFound`).
+    let over_cap = whole_records > 0 && whole_records >= max_records;
     if over_cap || has_partial_record || reading.problem.is_some() {
         fs.rotate(path)?;
     }
@@ -593,6 +595,118 @@ mod tests {
         reset_log::start(&files, PATH, 4).unwrap();
         assert_eq!(files.get("reset.log.1"), None);
         assert_eq!(files.len(PATH), Ok(Some(4 * log_types::RECORD_LEN as u64)));
+    }
+
+    #[test]
+    fn at_each_side_of_the_cap_only_a_full_log_is_rotated() {
+        // One under, at, and one over the cap, for a cap of 1 (the smallest the setting allows),
+        // 2 and 5.
+        for cap in [1_u64, 2, 5] {
+            for records in [cap - 1, cap, cap + 1] {
+                let all = [boot(1), boot(2), boot(3), boot(4), boot(5), boot(6)];
+                let files = files_with(&all[..usize::try_from(records).unwrap()]);
+                reset_log::start(&files, PATH, cap).unwrap();
+                let record = log_types::RECORD_LEN as u64;
+                if records > 0 && records >= cap {
+                    assert!(files.get("reset.log.1").is_some(), "cap {cap}, {records}");
+                    assert_eq!(files.len(PATH), Ok(Some(record)), "only this boot");
+                } else {
+                    assert_eq!(files.get("reset.log.1"), None, "cap {cap}, {records}");
+                    assert_eq!(files.len(PATH), Ok(Some((records + 1) * record)));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_cap_of_zero_is_not_reachable_from_the_setting_but_does_not_fail_on_a_missing_log() {
+        let files = fake_files::FakeFiles::new();
+        let started = reset_log::start(&files, PATH, 0).unwrap();
+        assert_eq!(started.info.count, 1);
+        assert_eq!(files.get("reset.log.1"), None);
+        assert_eq!(files.len(PATH), Ok(Some(log_types::RECORD_LEN as u64)));
+    }
+
+    #[test]
+    fn a_partial_record_of_one_byte_or_of_all_but_one_is_found_with_the_count_kept() {
+        for extra in [1, log_types::RECORD_LEN - 1] {
+            let files = files_with(&[boot(1), boot(2)]);
+            let mut bytes = files.get(PATH).unwrap();
+            bytes.resize(bytes.len() + extra, 0xEE);
+            files.write_file(PATH, &bytes).unwrap();
+
+            let started = reset_log::start(&files, PATH, 100).unwrap();
+            assert_eq!(
+                started.problems,
+                [Some(reset_log::Problem::PartialRecord), None],
+                "{extra} extra bytes"
+            );
+            assert_eq!(
+                started.info.count, 3,
+                "{extra} extra bytes: the count carries on"
+            );
+            assert_eq!(files.get("reset.log.1"), Some(bytes));
+        }
+    }
+
+    /// A log of `count` boots, 1 to `count`, with the record at `corrupt` damaged (if any).
+    fn boots_with_one_damaged(count: u32, corrupt: Option<usize>) -> fake_files::FakeFiles {
+        let files = fake_files::FakeFiles::new();
+        // Room for one more record than the window: the longest log these tests make.
+        let mut bytes = [0u8; (reset_log::TAIL_RECORDS + 1) * log_types::RECORD_LEN];
+        for (record, n) in bytes.chunks_mut(log_types::RECORD_LEN).zip(1..=count) {
+            record.copy_from_slice(&boot(n).encode());
+        }
+        let len = usize::try_from(count)
+            .unwrap()
+            .saturating_mul(log_types::RECORD_LEN);
+        if let Some(index) = corrupt {
+            let position = index
+                .saturating_mul(log_types::RECORD_LEN)
+                .saturating_add(1);
+            *bytes.get_mut(position).unwrap() ^= 0xFF;
+        }
+        files.write_file(PATH, &bytes[..len]).unwrap();
+        files
+    }
+
+    #[test]
+    fn a_damaged_record_just_outside_the_window_is_not_read_and_one_just_inside_is() {
+        let window = reset_log::TAIL_RECORDS;
+        let count = u32::try_from(window).unwrap() + 1;
+
+        // The log has one more record than the window holds, so the first (index 0) is the one
+        // just outside it: damaged, it is never looked at.
+        let files = boots_with_one_damaged(count, Some(0));
+        let started = reset_log::start(&files, PATH, 1000).unwrap();
+        assert_eq!(started.problems, [None, None]);
+        assert_eq!(started.info.count, count + 1);
+
+        // Index 1 is the first record of the window: damaged, it is a problem.
+        let files = boots_with_one_damaged(count, Some(1));
+        let started = reset_log::start(&files, PATH, 1000).unwrap();
+        assert!(matches!(
+            started.problems,
+            [None, Some(reset_log::Problem::CorruptRecord(_))]
+        ));
+        // And the last record, the other end of the window, is too.
+        let files = boots_with_one_damaged(count, Some(window));
+        let started = reset_log::start(&files, PATH, 1000).unwrap();
+        assert!(matches!(
+            started.problems,
+            [None, Some(reset_log::Problem::CorruptRecord(_))]
+        ));
+    }
+
+    #[test]
+    fn a_log_of_exactly_the_window_and_one_record_less_are_read_whole() {
+        for count in [reset_log::TAIL_RECORDS - 1, reset_log::TAIL_RECORDS] {
+            let count = u32::try_from(count).unwrap();
+            let files = boots_with_one_damaged(count, None);
+            let started = reset_log::start(&files, PATH, 1000).unwrap();
+            assert_eq!(started.info.count, count + 1, "{count} records");
+            assert_eq!(started.problems, [None, None]);
+        }
     }
 
     #[test]

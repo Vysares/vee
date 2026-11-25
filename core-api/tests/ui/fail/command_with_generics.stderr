@@ -1,0 +1,5 @@
+error: Command does not support generics
+ --> tests/ui/fail/command_with_generics.rs:4:9
+  |
+4 | struct S<const N: usize> {
+  |         ^^^^^^^^^^^^^^^^

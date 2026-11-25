@@ -1,0 +1,5 @@
+error: a code has only one `#[severity(..)]`
+ --> tests/ui/fail/code_variant_with_two_severities.rs:7:5
+  |
+7 |     #[severity(Warn)]
+  |     ^^^^^^^^^^^^^^^^^
