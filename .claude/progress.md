@@ -1444,14 +1444,60 @@ Size on 2026-11-17 (cloc, working tree, no target dir): 14 Rust files, 1729 line
     `Reading` and `Status`, each with a published value; looks each up by its own `Tid` and checks the
     field value, not just the pointer). Workspace: 433 tests (was 423). clippy and fmt clean.
 
+91. **Command Router, pieces 1 to 3: shared types, the `Command` derive, the `CmdSet` derive** (`core-api/src/cmd.rs`,
+    `core-derive/src/command.rs`, `core-derive/src/cmd_set.rs`, new; entry points in `core-derive/src/lib.rs`).
+    Per the corrected design (no `Module::command()` hook; a module, the core included, handles its own
+    commands inside its own `step()` by draining its own queue): `cmd.rs` has `Args` (fixed `[u8;
+    CMD_ARGS_MAX_BYTES]`, `new` only — no truncating constructor; the user's rule, command args are never
+    silently cut), `RawCmd`, `CmdMeta`, `CmdErr { UnknownTarget, UnknownOpcode, BadArgs, Invalid(&'static
+    str), QueueFull }` (renamed from `Busy` on the user's instruction), `CmdResult { Success, Fail, Pending
+    }`, `CmdEvent` (the ack/nak codes, hand-written `event::Code` since the derive's `::vee_core_api` paths
+    do not resolve from inside `core-api` itself), `CORE_TARGET`, `CommandTarget` trait, `route`,
+    `route_and_ack` (sends the received/rejected ack itself), and `drain` (pops a target's whole queue,
+    calls a per-command closure taking `ev` as an EXPLICIT argument, not captured, so the handler's own use
+    of `ev` and `drain`'s later use of it to send the outcome never overlap one borrow; this is also what
+    makes every module's outcome ack automatic, never something a module author writes by hand). 16 tests.
+    `#[derive(Command)]`: a struct's wire `encode`/`decode` (plain arrays/slices, not `cmd::Args`; a sender
+    calls `Args::new(&value.encode())` itself) and `validate` (generated to always succeed, unless
+    `#[validate]` says the struct hand-writes one). `#[derive(CmdSet)]`: an enum of `Name(Args)` variants
+    dispatching `decode`/`validate` by opcode.
+    DECIDED WITH THE USER mid-session, and applied at once, not left for later: an opcode is NOT a
+    `#[opcode(N)]` attribute on the `Command` struct. It is the `CmdSet` variant's own discriminant
+    (`Name(Args) = 1`, under `#[repr(u16)]`, required because Rust needs to know the discriminant's integer
+    type on a variant that carries a field) — the same convention `#[derive(Code)]` already uses for event
+    codes. This also settled an open question from this session (does a command struct knowing its own
+    opcode, without knowing its target, mean anything?): it does not, so now there is exactly one place an
+    opcode can be written, inside the one `CmdSet` that is a target's whole command list. The wrapped
+    struct is renamed in every example to end in `Args` (`SetEventFilterArgs`, not `SetEventFilter`): it is
+    not itself a command, only the command's payload, the user's framing. Tests: `core-api/tests/
+    command_derive.rs` (9), `core-api/tests/cmd_set_derive.rs` (6).
+    Piece 4, `core-types/src/core_cmd.rs` (new): `SetEventFilterArgs { pub floor: u8 }` (`#[validate]`),
+    `CoreCmd { SetEventFilter(SetEventFilterArgs) = 1 }` (`#[repr(u16)]`). `floor` stays a plain `u8`
+    (explicit wire size, not hidden inside an enum) with a separate `pub enum Floor { Off = 0, Info = 1,
+    Warn = 2, Err = 3 }` (`#[repr(u8)]`, explicit discriminants, so nothing relies on declaration order) and
+    `impl TryFrom<u8> for Floor`, so a reader of this file — ground, or a later export of these definitions
+    into a command database, the user's stated vision — can see what each byte means without that meaning
+    buried in a match. `validate` uses `Floor::try_from(..).is_ok()`.
+    DECIDED WITH THE USER, same reasoning as the opcode question: the mapping from `Floor` to
+    `event::Severity` (what the command actually causes `Ev::set_filter` to do) is flight-software's
+    business, not this file's. It stays out of `core_cmd.rs` entirely (an earlier `SetEventFilterArgs::
+    floor() -> Option<Severity>` method was removed) and will live in `core/src/commands.rs` (piece 5, not
+    yet written): the args struct only decides whether a command is legal, not what it does. 5 tests.
+    Workspace: 469 tests (was 433). clippy and fmt clean. Plan file (kept in sync with every decision above):
+    `~/.claude/plans/synthetic-cuddling-origami.md`. Pieces 5 and 6 — `core/src/commands.rs` (`CoreCommands`
+    as a `CommandTarget`, its `step` calling `cmd::drain`, matching `Floor` to `Severity`) and `core/src/
+    lib.rs` (`Core::submit_command`, wiring `commands.step` into `tick`) — are NOT yet written.
+
 ## WHERE WE LEFT OFF (2026-11-24)
-Everything builds, 433 tests pass, clippy and `cargo fmt --check` are clean. Items 83 to 86 (queued topics,
-events-on-the-bus step 1) are committed by the user (`7e8c5d1`, `c8a96d2`). Uncommitted (user commits, not
-me): `.claude/progress.md`, `core-api/src/bus.rs`, `core-api/src/lib.rs`, `core-derive/src/lib.rs`,
-`docs/bus.md`, `docs/design.md` (all modified), `core-api/src/message.rs`, `core-api/tests/message_derive.rs`,
-`core-api/tests/dyn_view.rs`, `core-derive/src/code.rs`, `core-derive/src/message.rs` (new) — items 87 to 90:
-the `bus::Message` derive, the APID-to-TID rename, the `core-derive` file split, and TIDs/the dyn view step 1.
-See `docs/bus.md` for the full bus design and its roadmap ("Then, in this order: ...").
+Everything builds, 469 tests pass, clippy and `cargo fmt --check` are clean. Items 87 to 90 (the
+`bus::Message` derive, the APID-to-TID rename, the `core-derive` file split, TIDs and the dyn view step 1)
+were committed by the user between sessions (`55247fd`). This session's work is item 91: the Command
+Router's pieces 1 to 4 (shared router types and `drain` in `core-api/src/cmd.rs`, the `Command` and
+`CmdSet` derives, and the core's own `SetEventFilter` command in `core-types/src/core_cmd.rs`), including
+the mid-session redesign where a command's opcode moved from an attribute on the `Command` struct to the
+`CmdSet` variant's own discriminant, and the `Floor` enum split out of `SetEventFilterArgs`.
+See `docs/bus.md` for the bus design and roadmap, and the plan file above for the Command Router's full
+piece-by-piece design and what remains (pieces 5 and 6).
 The user is learning Rust (comes from C++): explain syntax and generics as they come up, and follow
 CLAUDE.md (one thing at a time, simplicity, callbacks only when needed, "do we really need this?", and
 after any edit name each file touched and what was done in it). `latest-chat.md` is updated only when the
@@ -1477,9 +1523,14 @@ item 87, DONE 2026-11-24, split into its own file item 89) writes a message type
 (inherent) and `impl message::Message` (the trait generic code needs, item 90). `bus::Tid` (renamed from APID,
 item 88) and `bus::Topic` (item 90, DONE 2026-11-24), the dyn view: `layout()`, `latest_bytes()`,
 `read_latest(index)` (bundled so a caller cannot pair the wrong field with the wrong bytes), `pop_encoded(reader,
-out)`, `find(topics, tid)`; implemented for `StateTopic<T>` and `QueuedTopic<T,N,D>`. NOT yet written: the core
-commands for the events filter (also what will wire `flush_bus` into `Core::tick`), the recorder, telemetry,
-FDIR, `exec!` (which is what will build the real `(tid, &dyn Topic)` array and the table that reads it).
+out)`, `find(topics, tid)`; implemented for `StateTopic<T>` and `QueuedTopic<T,N,D>`.
+The Command Router (item 91, DONE pieces 1 to 4, 2026-11-24): shared router types, `drain`, and both derives
+are in `core-api/src/cmd.rs` and `core-derive`; the core's one real command, `SetEventFilter`, is in
+`core-types/src/core_cmd.rs`. NOT yet written: `core/src/commands.rs` (`CoreCommands`, piece 5) and wiring
+`Core::submit_command` into `core/src/lib.rs` (piece 6) — this is also what will wire `flush_bus` into
+`Core::tick`, since the events-filter command is what switches it on. The recorder, telemetry, FDIR, and
+`exec!` (which will build the real `(tid, &dyn Topic)` array and the table that reads it) are also not
+started.
 The blocking event log write is gone (item 74); the two sample overruns on WSL were late wake-ups (item 75); none
 on native Linux.
 
@@ -1494,8 +1545,8 @@ Open choices, in the order I would do them, all for the user to pick:
 Older plan, still relevant: STRETCH GOAL, only after everything else works (noted in the design doc,
 Executive Requirements): a threaded module type for slow work (image processing, say) that gets its
 own thread or core, talking through bounded queues like the file service.
-Possible follow-ups: `trybuild` for the derive's compile-fail cases (adds a dev dependency);
-the command derives (`Command`, `CmdSet`) could use the same idea (opcode = enum value).
+Possible follow-ups: `trybuild` for the derive's compile-fail cases (adds a dev dependency).
+Command Router pieces 5 and 6 (item 91): `core/src/commands.rs` and wiring `core/src/lib.rs`.
 
 ## Decisions to remember
 - Debug and test only features (the allocation guard, fakes, the test hooks) must be invisible to the code they
@@ -1543,6 +1594,6 @@ the command derives (`Command`, `CmdSet`) could use the same idea (opcode = enum
 - How a module waits for a command result without blocking (see item 19). Part of the command design.
 
 ## Not started
-command routing, the software bus (designed, item 58), tables, the file service, `exec!` (the sample
-deployment is its hand written precursor), more modules, the `bus::Message` derive, the ground tool. (The
-`module-types` crate was dropped: no mission wide types crate, item 58.)
+command router pieces 5 and 6 (item 91: `core/src/commands.rs`, wiring into `core/src/lib.rs`), tables,
+`exec!` (the sample deployment is its hand written precursor), more modules, the recorder, telemetry,
+FDIR, the ground tool. (The `module-types` crate was dropped: no mission wide types crate, item 58.)

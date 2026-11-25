@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 #![no_std]
 
+pub mod core_cmd;
 pub mod core_event;
 pub mod event_log;
 mod record;

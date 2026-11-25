@@ -3,6 +3,7 @@
 #![no_std]
 
 pub mod bus;
+pub mod cmd;
 pub mod config;
 pub mod crc;
 pub mod ctx;
