@@ -7,8 +7,9 @@
 //! A module also says which bus topics it reads (`In`) and writes (`Out`). Those are the handles
 //! the executive puts in the module's `Ctx`, so what a module can reach is written in its type.
 //!
-//! Not here yet: `command()` (it waits for the command design), and tables and devices (they will
-//! be more of what `Ctx` holds).
+//! A module handles its commands in its own `step`, with `ctx.drain_cmds`.
+//!
+//! Not here yet: tables and devices (they will be more of what `Ctx` holds).
 
 use crate::ctx;
 use crate::event;
@@ -31,6 +32,12 @@ pub trait Module: Sized {
     /// The bus topics the module WRITES: a struct of writers, in `ctx.out`. A module that writes
     /// nothing says `type Out<'a> = ();`.
     type Out<'a>;
+
+    /// The commands the module handles: an enum with `#[derive(cmd::CmdSet)]`, whose variants each
+    /// wrap a `#[derive(cmd::Command)]` struct. The executive owns the module's command queue
+    /// (the router fills it) and the module drains it with `ctx.drain_cmds`. A module with no
+    /// commands says `type Cmd = ();`.
+    type Cmd: 'static;
 
     /// Runs once at startup, before the first tick. Use it to read `ctx.reset` (how the last run
     /// ended) and do other setup.

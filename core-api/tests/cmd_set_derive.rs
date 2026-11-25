@@ -125,3 +125,22 @@ fn validate_on_a_variant_with_no_hand_written_validate_always_succeeds() {
     let decoded = AtsCmd::decode(&raw).unwrap();
     assert_eq!(decoded.validate(), Ok(()));
 }
+
+#[test]
+fn opcode_is_the_variants_own_discriminant_and_matches_what_decode_accepts() {
+    let activate = AtsCmd::Activate(ActivateArgs { slot: 5 });
+    let set_limit = AtsCmd::SetLimit(SetLimitArgs { max_rts: 10 });
+    assert_eq!(activate.opcode(), 1);
+    assert_eq!(set_limit.opcode(), 2);
+
+    // A sender builds the raw command from `opcode()` and `encode()`, and the target decodes it
+    // back to the same command.
+    let raw = cmd::RawCmd {
+        sink: 1,
+        seq: 1,
+        target: 9,
+        opcode: set_limit.opcode(),
+        args: cmd::Args::new(&SetLimitArgs { max_rts: 10 }.encode()).unwrap(),
+    };
+    assert_eq!(AtsCmd::decode(&raw).unwrap(), set_limit);
+}

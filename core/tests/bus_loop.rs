@@ -27,6 +27,7 @@
 
 use vee_core::slot::Slot;
 use vee_core_api::bus;
+use vee_core_api::cmd;
 use vee_core_api::ctx;
 use vee_core_api::event;
 use vee_core_api::module;
@@ -73,6 +74,7 @@ impl module::Module for Sensor {
     type Event = SensorEv;
     type In<'a> = ();
     type Out<'a> = SensorOut<'a>;
+    type Cmd = ();
 
     fn init(&mut self, _ctx: &mut ctx::Ctx<'_, Self>) {}
 
@@ -105,6 +107,7 @@ impl module::Module for Controller {
     type Event = ControllerEv;
     type In<'a> = ControllerIn<'a>;
     type Out<'a> = ();
+    type Cmd = ();
 
     fn init(&mut self, _ctx: &mut ctx::Ctx<'_, Self>) {}
 
@@ -172,8 +175,15 @@ impl Exec {
         let out = SensorOut {
             reading: self.reading.writer(now),
         };
-        self.sensor
-            .step(self.tick, &mut self.core.ev, now, reset, (), out);
+        self.sensor.step(
+            self.tick,
+            &mut self.core.ev,
+            now,
+            reset,
+            (),
+            out,
+            cmd::Inbox::empty(),
+        );
         self.clock.advance(MODULE_COST_US);
     }
 
@@ -184,8 +194,15 @@ impl Exec {
         let inputs = ControllerIn {
             reading: self.reading.reader(),
         };
-        self.controller
-            .step(self.tick, &mut self.core.ev, now, reset, inputs, ());
+        self.controller.step(
+            self.tick,
+            &mut self.core.ev,
+            now,
+            reset,
+            inputs,
+            (),
+            cmd::Inbox::empty(),
+        );
         self.clock.advance(MODULE_COST_US);
     }
 

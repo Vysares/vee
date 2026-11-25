@@ -37,3 +37,7 @@ VEE_FILE_PATH_MAX_BYTES = "128"
 
 # How many commands the core's own command queue holds: what can arrive in one tick. Default 8, 1..=65535.
 VEE_CORE_CMD_QUEUE_DEPTH = "8"
+
+# How many commands one command sink's staging queue holds: what a module can submit in one tick before the
+# core routes them at the start of the next. Default 8, 1..=65535.
+VEE_CMD_SINK_QUEUE_DEPTH = "8"

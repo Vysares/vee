@@ -25,6 +25,7 @@
 
 use std::sync;
 use vee_core::slot::Slot;
+use vee_core_api::cmd;
 use vee_core_api::ctx;
 use vee_core_api::event;
 use vee_core_api::event::Code as _;
@@ -78,6 +79,7 @@ impl module::Module for Heartbeat {
     type Event = HeartbeatEv;
     type In<'a> = ();
     type Out<'a> = ();
+    type Cmd = ();
 
     fn init(&mut self, ctx: &mut ctx::Ctx<'_, Self>) {
         ctx.ev.send(HeartbeatEv::Started, format_args!("started"));
@@ -107,6 +109,7 @@ impl module::Module for Slow {
     type Event = SlowEv;
     type In<'a> = ();
     type Out<'a> = ();
+    type Cmd = ();
 
     fn init(&mut self, ctx: &mut ctx::Ctx<'_, Self>) {
         ctx.ev.send(SlowEv::Started, format_args!("started"));
@@ -137,6 +140,7 @@ impl module::Module for Noisy {
     type Event = NoisyEv;
     type In<'a> = ();
     type Out<'a> = ();
+    type Cmd = ();
 
     fn init(&mut self, ctx: &mut ctx::Ctx<'_, Self>) {
         ctx.ev.send(NoisyEv::Started, format_args!("started"));
@@ -187,14 +191,32 @@ impl Exec {
     /// Startup: `init` for each module once, in order. Each call takes `MODULE_COST_US`.
     fn init(&mut self) {
         let reset = self.core.reset();
-        self.heartbeat
-            .init(&mut self.core.ev, self.clock.monotonic_us(), reset, (), ());
+        self.heartbeat.init(
+            &mut self.core.ev,
+            self.clock.monotonic_us(),
+            reset,
+            (),
+            (),
+            cmd::Inbox::empty(),
+        );
         self.clock.advance(MODULE_COST_US);
-        self.slow
-            .init(&mut self.core.ev, self.clock.monotonic_us(), reset, (), ());
+        self.slow.init(
+            &mut self.core.ev,
+            self.clock.monotonic_us(),
+            reset,
+            (),
+            (),
+            cmd::Inbox::empty(),
+        );
         self.clock.advance(MODULE_COST_US);
-        self.noisy
-            .init(&mut self.core.ev, self.clock.monotonic_us(), reset, (), ());
+        self.noisy.init(
+            &mut self.core.ev,
+            self.clock.monotonic_us(),
+            reset,
+            (),
+            (),
+            cmd::Inbox::empty(),
+        );
         self.clock.advance(MODULE_COST_US);
     }
 
@@ -224,6 +246,7 @@ impl Exec {
             reset,
             (),
             (),
+            cmd::Inbox::empty(),
         );
         self.clock.advance(MODULE_COST_US);
         self.slow.step(
@@ -233,6 +256,7 @@ impl Exec {
             reset,
             (),
             (),
+            cmd::Inbox::empty(),
         );
         self.clock.advance(MODULE_COST_US);
         self.noisy.step(
@@ -242,6 +266,7 @@ impl Exec {
             reset,
             (),
             (),
+            cmd::Inbox::empty(),
         );
         self.clock.advance(MODULE_COST_US);
 

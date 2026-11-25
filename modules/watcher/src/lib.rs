@@ -55,6 +55,7 @@ impl module::Module for Watcher {
     type Event = WatcherEv;
     type In<'a> = WatcherIn<'a>;
     type Out<'a> = ();
+    type Cmd = ();
 
     fn init(&mut self, _ctx: &mut ctx::Ctx<'_, Self>) {}
 
@@ -90,6 +91,7 @@ impl module::Module for Watcher {
 mod tests {
     use super as watcher;
     use vee_core_api::bus;
+    use vee_core_api::cmd;
     use vee_core_api::ctx;
     use vee_core_api::ev;
     use vee_core_api::event;
@@ -137,6 +139,7 @@ mod tests {
                     progress: self.progress.reader(),
                 },
                 (),
+                cmd::Inbox::empty(),
             );
             self.watcher.step(&mut ctx);
         }

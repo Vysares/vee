@@ -1,16 +1,19 @@
 //! The command router's shared types: see `docs/design.md`, "Command Routing".
 //!
-//! A command arrives as `RawCmd`, a neutral, decoded-nothing-yet envelope. `route` (or
-//! `route_and_ack`, which also sends the received/rejected event) picks the right target by
-//! `RawCmd::target` and hands it the raw command; the target (`CommandTarget`) decodes it with
+//! A command arrives as `RawCmd`, a neutral, decoded-nothing-yet envelope. A module that brings
+//! commands in (a link, an RTS) pushes them into its `Sink`, a staging queue; the core pops them.
+//! `route` picks the right target by `RawCmd::target` and hands it the raw command, and `ack`
+//! sends the received/rejected event for the result; the target (`CommandTarget`) decodes it with
 //! its own `#[derive(CmdSet)]` enum, validates it, and queues the typed result alongside a
 //! `CmdMeta` (the little of `RawCmd` worth keeping once it is decoded).
 //!
-//! A module (the core included) later drains its own queue, inside its own `step`, with `drain`:
-//! it supplies only the per-command match (`handle`), and `drain` sends that command's outcome
-//! event itself. No module author writes ack/nak text by hand, for either half.
+//! A module drains its own queue, inside its own `step`, with `ctx.drain_cmds` (`ctx.rs`); the
+//! core does the same with `drain` below, since it holds its `Ev` directly. Either way the
+//! author supplies only the per-command match, and the drain sends that command's outcome event
+//! itself (`send_outcome`: from the module's own source, or the core's). No module author writes
+//! ack/nak text by hand, for either half.
 //!
-//! This lives in `core-api`, not `core-types`, because an ordinary module calls `drain` from its
+//! This lives in `core-api`, not `core-types`, because an ordinary module uses these from its
 //! own crate, and modules depend on `core-api` but not `core-types` (see `design.md`'s dependency
 //! table). `CmdEvent` is the ack/nak vocabulary for that reason: it is routing infrastructure
 //! every module can reach, not one of the core's own specific events
@@ -34,6 +37,12 @@ config::setting! {
     /// The most bytes of args in one command. Every command's `Args` is this size, so this sets
     /// how much memory a `RawCmd` and a module's command queue take. Default 32, 1..=4096.
     pub CMD_ARGS_MAX_BYTES: usize = 32, 1..=4096;
+}
+
+config::setting! {
+    /// How many commands one sink's staging queue holds: what a sink's module can submit in one
+    /// tick before the core routes them at the start of the next. Default 8, 1..=65535.
+    pub CMD_SINK_QUEUE_DEPTH: usize = 8, 1..=65535;
 }
 
 /// A command's encoded fields, up to `CMD_ARGS_MAX_BYTES`, held inside the value: the same inline,
@@ -155,7 +164,9 @@ impl fmt::Display for CmdErr {
         match self {
             CmdErr::UnknownTarget => f.write_str("unknown command target"),
             CmdErr::UnknownOpcode => f.write_str("unknown opcode"),
-            CmdErr::BadArgs => f.write_str("args do not match the command's layout"),
+            // Short on purpose: in the ack text it follows a prefix of up to 39 bytes, and the
+            // event text is 64 by default. See `every_reason_fits_the_ack_at_the_widest_values`.
+            CmdErr::BadArgs => f.write_str("bad args size"),
             CmdErr::Invalid(reason) => write!(f, "invalid: {reason}"),
             CmdErr::QueueFull => f.write_str("command queue is full"),
         }
@@ -246,16 +257,11 @@ pub fn route(targets: &mut [(u8, &mut dyn CommandTarget)], raw: RawCmd) -> Resul
     }
 }
 
-/// `route`, and also sends the received ack (`CmdEvent::Accepted`) or the rejected nak
-/// (`CmdEvent::Rejected`, with the `CmdErr` in the text) — so a caller such as `Core::submit_command`
-/// never builds either event by hand.
-pub fn route_and_ack(
-    targets: &mut [(u8, &mut dyn CommandTarget)],
-    raw: RawCmd,
-    ev: &mut ev::Ev,
-    now: u64,
-) -> Result<(), CmdErr> {
-    let result = route(targets, raw);
+/// Sends the received ack (`CmdEvent::Accepted`) if `result` is `Ok`, or the rejected nak
+/// (`CmdEvent::Rejected`, with the `CmdErr` in the text) if it is not. `result` is what `route`
+/// (or a target's `accept`) returned for `raw`. Every command goes through this once, whichever
+/// way it was routed, so the text is written in one place.
+pub fn ack(ev: &mut ev::Ev, raw: &RawCmd, result: &Result<(), CmdErr>, now: u64) {
     match result {
         Ok(()) => ev.send(
             CORE_TARGET,
@@ -276,7 +282,64 @@ pub fn route_and_ack(
             ),
         ),
     }
-    result
+}
+
+/// What a module uses to submit commands: a sink with only `submit` on it. A module that submits
+/// commands names this in its `Out` (`type Out<'a> = ...`), and the executive makes one for each
+/// call from the sink it owns, as it makes a topic's writer. With no `pop`, a module cannot take
+/// commands out of a sink, only put its own in (the same idea as `ctx::EvHandle`).
+pub struct SinkHandle<'a> {
+    sink: &'a mut Sink,
+}
+
+impl SinkHandle<'_> {
+    /// Queues a command from this sink: `Sink::submit`, which stamps the sink's id on it and
+    /// gives `QueueFull` if the sink is full.
+    pub fn submit(&mut self, seq: u16, target: u8, opcode: u16, args: Args) -> Result<(), CmdErr> {
+        self.sink.submit(seq, target, opcode, args)
+    }
+}
+
+/// A command sink: the staging queue a module pushes its commands into, and the core drains
+/// (`design.md`, "Command Routing"). One per sink, owned by the executive, which lends a module
+/// only the way to `submit` (through its `Ctx`); `pop` is the core's.
+pub struct Sink {
+    /// The sink's id from the deployment. It is stamped on every command, so a module cannot
+    /// send as another source.
+    id: u8,
+    queue: queue::Queue<RawCmd, CMD_SINK_QUEUE_DEPTH>,
+}
+
+impl Sink {
+    pub const fn new(id: u8) -> Self {
+        Sink {
+            id,
+            queue: queue::Queue::new(),
+        }
+    }
+
+    /// Queues a command from this sink, or `QueueFull` if the queue is full: the submitter knows
+    /// at once, and the command is not queued.
+    pub fn submit(&mut self, seq: u16, target: u8, opcode: u16, args: Args) -> Result<(), CmdErr> {
+        let raw = RawCmd {
+            sink: self.id,
+            seq,
+            target,
+            opcode,
+            args,
+        };
+        self.queue.push(raw).map_err(|_| CmdErr::QueueFull)
+    }
+
+    /// The handle a module submits through, for one call.
+    pub fn handle(&mut self) -> SinkHandle<'_> {
+        SinkHandle { sink: self }
+    }
+
+    /// The oldest queued command. The core's router calls this.
+    pub fn pop(&mut self) -> Option<RawCmd> {
+        self.queue.pop()
+    }
 }
 
 /// Pops every command waiting in `queue`, in order, calling `handle` on each and then sending its
@@ -293,15 +356,24 @@ pub fn drain<C, const N: usize>(
 ) {
     while let Some((cmd, meta)) = queue.pop() {
         let result = handle(cmd, ev);
-        send_outcome(ev, now, meta, result);
+        send_outcome(ev, CORE_TARGET, now, meta, result);
     }
 }
 
-/// The outcome half of the ack/nak text, shared by every target's `drain` call.
-fn send_outcome(ev: &mut ev::Ev, now: u64, meta: CmdMeta, result: CmdResult) {
+/// The outcome half of the ack/nak text, shared by every target's drain: the core's `drain` above
+/// (source `CORE_TARGET`) and `Ctx::drain_cmds` (the module's own source). `source` and `now` say
+/// who ran the command and when; the text has the command's own sink, seq, target and opcode.
+/// It goes straight to `ev`, not through a throttle: every command gets its outcome.
+pub(crate) fn send_outcome(
+    ev: &mut ev::Ev,
+    source: u8,
+    now: u64,
+    meta: CmdMeta,
+    result: CmdResult,
+) {
     match result {
         CmdResult::Success => ev.send(
-            CORE_TARGET,
+            source,
             now,
             CmdEvent::Executed,
             format_args!(
@@ -310,7 +382,7 @@ fn send_outcome(ev: &mut ev::Ev, now: u64, meta: CmdMeta, result: CmdResult) {
             ),
         ),
         CmdResult::Fail(reason) => ev.send(
-            CORE_TARGET,
+            source,
             now,
             CmdEvent::Failed,
             format_args!(
@@ -319,7 +391,7 @@ fn send_outcome(ev: &mut ev::Ev, now: u64, meta: CmdMeta, result: CmdResult) {
             ),
         ),
         CmdResult::Pending => ev.send(
-            CORE_TARGET,
+            source,
             now,
             CmdEvent::Executed,
             format_args!(
@@ -327,6 +399,42 @@ fn send_outcome(ev: &mut ev::Ev, now: u64, meta: CmdMeta, result: CmdResult) {
                 meta.sink, meta.seq, meta.target, meta.opcode
             ),
         ),
+    }
+}
+
+/// The popping end of a command queue, with the queue's depth `N` left out, so a `Ctx` can hold
+/// any module's queue whatever its depth. Only `Inbox` uses it.
+trait Pop<C> {
+    fn pop(&mut self) -> Option<(C, CmdMeta)>;
+}
+
+impl<C, const N: usize> Pop<C> for queue::Queue<(C, CmdMeta), N> {
+    fn pop(&mut self) -> Option<(C, CmdMeta)> {
+        queue::Queue::pop(self)
+    }
+}
+
+/// A module's command queue, as its `Ctx` holds it (`Module::Cmd` is `C`). The executive makes
+/// one for each call from the queue it owns, as it makes a topic's reader; a module cannot pop
+/// from it itself: `Ctx::drain_cmds` does, and sends each outcome.
+pub struct Inbox<'a, C> {
+    queue: Option<&'a mut dyn Pop<C>>,
+}
+
+impl<'a, C> Inbox<'a, C> {
+    /// An inbox on `queue`, which is what a target's `accept` fills.
+    pub fn new<const N: usize>(queue: &'a mut queue::Queue<(C, CmdMeta), N>) -> Self {
+        Inbox { queue: Some(queue) }
+    }
+
+    /// An inbox that is always empty: for a module with no commands (`type Cmd = ();`).
+    pub const fn empty() -> Self {
+        Inbox { queue: None }
+    }
+
+    /// The oldest queued command, if any.
+    pub(crate) fn pop(&mut self) -> Option<(C, CmdMeta)> {
+        self.queue.as_mut()?.pop()
     }
 }
 
@@ -356,6 +464,18 @@ mod tests {
         fn from_index(index: usize) -> Option<Self> {
             (index == 0).then_some(TestCode)
         }
+    }
+
+    /// `route`, then `ack`: what the core does for every command.
+    fn route_and_ack(
+        targets: &mut [(u8, &mut dyn cmd::CommandTarget)],
+        raw: cmd::RawCmd,
+        ev: &mut ev::Ev,
+        now: u64,
+    ) -> Result<(), cmd::CmdErr> {
+        let result = cmd::route(targets, raw);
+        cmd::ack(ev, &raw, &result, now);
+        result
     }
 
     fn raw(target: u8, opcode: u16, bytes: &[u8]) -> cmd::RawCmd {
@@ -485,7 +605,7 @@ mod tests {
         let mut targets: [(u8, &mut dyn cmd::CommandTarget); 1] = [(1, &mut a)];
         let mut sent = ev::Ev::new();
 
-        cmd::route_and_ack(&mut targets, raw(1, 0x05, &[]), &mut sent, 10).unwrap();
+        route_and_ack(&mut targets, raw(1, 0x05, &[]), &mut sent, 10).unwrap();
 
         let event = sent.log.pop().unwrap();
         assert_eq!(event.source, cmd::CORE_TARGET);
@@ -499,7 +619,7 @@ mod tests {
         let mut targets: [(u8, &mut dyn cmd::CommandTarget); 1] = [(1, &mut a)];
         let mut sent = ev::Ev::new();
 
-        let result = cmd::route_and_ack(&mut targets, raw(9, 0x05, &[]), &mut sent, 10);
+        let result = route_and_ack(&mut targets, raw(9, 0x05, &[]), &mut sent, 10);
         assert_eq!(result, Err(cmd::CmdErr::UnknownTarget));
 
         let event = sent.log.pop().unwrap();
@@ -524,13 +644,117 @@ mod tests {
             args: cmd::Args::EMPTY,
         };
 
-        cmd::route_and_ack(&mut targets, widest, &mut sent, 0).unwrap_err();
+        route_and_ack(&mut targets, widest, &mut sent, 0).unwrap_err();
 
         let event = sent.log.pop().unwrap();
         assert_eq!(
             event.text.as_str(),
             "cmd 255/65535 t255 op0xffff: rejected: unknown command target"
         );
+    }
+
+    #[test]
+    fn a_sink_stamps_its_own_id_on_what_is_submitted() {
+        let mut sink = cmd::Sink::new(7);
+        sink.submit(3, 2, 0x10, cmd::Args::new(&[9]).unwrap())
+            .unwrap();
+        let popped = sink.pop().unwrap();
+        assert_eq!(popped.sink, 7);
+        assert_eq!(popped.seq, 3);
+        assert_eq!(popped.target, 2);
+        assert_eq!(popped.opcode, 0x10);
+        assert_eq!(popped.args.as_slice(), &[9]);
+        assert_eq!(sink.pop(), None);
+    }
+
+    #[test]
+    fn a_sink_hands_commands_back_oldest_first() {
+        let mut sink = cmd::Sink::new(1);
+        sink.submit(1, 0, 1, cmd::Args::EMPTY).unwrap();
+        sink.submit(2, 0, 1, cmd::Args::EMPTY).unwrap();
+        assert_eq!(sink.pop().unwrap().seq, 1);
+        assert_eq!(sink.pop().unwrap().seq, 2);
+    }
+
+    #[test]
+    fn a_full_sink_refuses_and_keeps_what_it_has() {
+        let mut sink = cmd::Sink::new(1);
+        for _ in 0..cmd::CMD_SINK_QUEUE_DEPTH {
+            sink.submit(1, 0, 1, cmd::Args::EMPTY).unwrap();
+        }
+        assert_eq!(
+            sink.submit(999, 0, 1, cmd::Args::EMPTY),
+            Err(cmd::CmdErr::QueueFull)
+        );
+        // The refused command (seq 999) was not queued: what comes out is the earlier ones.
+        assert_eq!(sink.pop().unwrap().seq, 1);
+    }
+
+    #[test]
+    fn a_handle_submits_into_its_sink_with_the_sinks_id() {
+        let mut sink = cmd::Sink::new(4);
+        sink.handle()
+            .submit(1, 2, 0x30, cmd::Args::new(&[5, 6]).unwrap())
+            .unwrap();
+        let popped = sink.pop().unwrap();
+        assert_eq!(popped.sink, 4);
+        assert_eq!(popped.args.as_slice(), &[5, 6]);
+    }
+
+    #[test]
+    fn handles_made_one_after_another_share_the_same_queue() {
+        let mut sink = cmd::Sink::new(1);
+        sink.handle().submit(1, 0, 1, cmd::Args::EMPTY).unwrap();
+        sink.handle().submit(2, 0, 1, cmd::Args::EMPTY).unwrap();
+        assert_eq!(sink.pop().unwrap().seq, 1);
+        assert_eq!(sink.pop().unwrap().seq, 2);
+    }
+
+    #[test]
+    fn a_handle_reports_a_full_sink_to_its_caller() {
+        let mut sink = cmd::Sink::new(1);
+        for _ in 0..cmd::CMD_SINK_QUEUE_DEPTH {
+            sink.handle().submit(1, 0, 1, cmd::Args::EMPTY).unwrap();
+        }
+        assert_eq!(
+            sink.handle().submit(2, 0, 1, cmd::Args::EMPTY),
+            Err(cmd::CmdErr::QueueFull)
+        );
+    }
+
+    #[test]
+    fn a_sink_that_was_emptied_takes_commands_again() {
+        let mut sink = cmd::Sink::new(1);
+        for _ in 0..cmd::CMD_SINK_QUEUE_DEPTH {
+            sink.submit(1, 0, 1, cmd::Args::EMPTY).unwrap();
+        }
+        sink.pop().unwrap();
+        assert_eq!(sink.submit(2, 0, 1, cmd::Args::EMPTY), Ok(()));
+    }
+
+    #[test]
+    fn every_reason_fits_the_ack_at_the_widest_values() {
+        // Every reason this crate writes, after the longest prefix an ack can have. (`Invalid`'s
+        // reason is the target's own text, so it can be as long as its author likes: it is cut
+        // off at the end like any event text, which is why it is not here.)
+        let widest = cmd::RawCmd {
+            sink: u8::MAX,
+            seq: u16::MAX,
+            target: u8::MAX,
+            opcode: u16::MAX,
+            args: cmd::Args::EMPTY,
+        };
+        for err in [
+            cmd::CmdErr::UnknownTarget,
+            cmd::CmdErr::UnknownOpcode,
+            cmd::CmdErr::BadArgs,
+            cmd::CmdErr::QueueFull,
+        ] {
+            let mut sent = ev::Ev::new();
+            cmd::ack(&mut sent, &widest, &Err(err), 0);
+            let text = sent.log.pop().unwrap().text;
+            assert!(!text.as_str().ends_with('~'), "cut off: {}", text.as_str());
+        }
     }
 
     #[test]

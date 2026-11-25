@@ -39,6 +39,11 @@ pub fn expand(input: &syn::DeriveInput) -> syn::Result<proc_macro2::TokenStream>
             ),
         }
     });
+    let opcode_arms = variants.iter().map(|variant| {
+        let name = variant.name;
+        let opcode = variant.opcode;
+        quote::quote! { Self::#name(_) => #opcode, }
+    });
     let validate_arms = variants.iter().map(|variant| {
         let name = variant.name;
         quote::quote! { Self::#name(value) => value.validate(), }
@@ -57,6 +62,15 @@ pub fn expand(input: &syn::DeriveInput) -> syn::Result<proc_macro2::TokenStream>
                 match raw.opcode {
                     #(#decode_arms)*
                     _ => ::core::result::Result::Err(::vee_core_api::cmd::CmdErr::UnknownOpcode),
+                }
+            }
+
+            /// This command's opcode: the variant's own discriminant, the same value `decode`
+            /// matches. A sender uses it to fill in `RawCmd::opcode`, so the number is written
+            /// only once, on the variant.
+            pub fn opcode(&self) -> u16 {
+                match self {
+                    #(#opcode_arms)*
                 }
             }
 

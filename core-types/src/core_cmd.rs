@@ -57,12 +57,19 @@ impl TryFrom<u8> for Floor {
     }
 }
 
+/// `Noop`'s args: none. The core does nothing and reports success, so a sender can check that a
+/// command reaches the core and comes back acknowledged (the router's "accepted", then the
+/// core's "succeeded"), end to end, without changing anything.
+#[derive(Debug, Clone, Copy, PartialEq, cmd::Command)]
+pub struct NoopArgs {}
+
 /// The core's commands, dispatched by `cmd::RawCmd::opcode`. See `vee_core_api::cmd` for how a
 /// target's queue stores and drains one of these.
 #[derive(Debug, Clone, Copy, PartialEq, cmd::CmdSet)]
 #[repr(u16)]
 pub enum CoreCmd {
     SetEventFilter(SetEventFilterArgs) = 1,
+    Noop(NoopArgs) = 2,
 }
 
 #[cfg(test)]
@@ -76,6 +83,21 @@ mod tests {
     #[test]
     fn the_core_is_the_same_target_id_as_its_own_event_source() {
         assert_eq!(cmd::CORE_TARGET, crate::core_event::SOURCE);
+    }
+
+    #[test]
+    fn noop_is_opcode_two_and_takes_no_args() {
+        let raw = cmd::RawCmd {
+            sink: 1,
+            seq: 1,
+            target: cmd::CORE_TARGET,
+            opcode: 2,
+            args: cmd::Args::EMPTY,
+        };
+        let decoded = core_cmd::CoreCmd::decode(&raw).unwrap();
+        assert_eq!(decoded, core_cmd::CoreCmd::Noop(core_cmd::NoopArgs {}));
+        assert_eq!(decoded.validate(), Ok(()));
+        assert_eq!(core_cmd::NoopArgs::WIRE_LEN, 0);
     }
 
     #[test]

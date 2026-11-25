@@ -58,7 +58,7 @@ impl cmd::CommandTarget for CoreCommands {
 
 /// What each core command does. This is the only place the meaning of a command lives:
 /// `core_cmd` only says what is legal.
-pub fn handle(command: core_cmd::CoreCmd, ev: &mut ev::Ev) -> cmd::CmdResult {
+pub(crate) fn handle(command: core_cmd::CoreCmd, ev: &mut ev::Ev) -> cmd::CmdResult {
     match command {
         core_cmd::CoreCmd::SetEventFilter(args) => match core_cmd::Floor::try_from(args.floor) {
             Ok(floor) => {
@@ -69,6 +69,8 @@ pub fn handle(command: core_cmd::CoreCmd, ev: &mut ev::Ev) -> cmd::CmdResult {
             // a panic.
             Err(()) => cmd::CmdResult::Fail("floor out of range"),
         },
+        // Does nothing, on purpose: the outcome event `drain` sends is the whole point.
+        core_cmd::CoreCmd::Noop(core_cmd::NoopArgs {}) => cmd::CmdResult::Success,
     }
 }
 
@@ -93,6 +95,7 @@ mod tests {
     use vee_core_types::core_event;
 
     const SET_EVENT_FILTER: u16 = 1;
+    const NOOP: u16 = 2;
 
     fn raw(opcode: u16, bytes: &[u8]) -> cmd::RawCmd {
         cmd::RawCmd {
@@ -154,6 +157,22 @@ mod tests {
         core_commands.accept(&raw(SET_EVENT_FILTER, &[0])).unwrap();
         cmd::drain(&mut core_commands.queue, &mut ev, 10, commands::handle);
         assert!(!passes_filter(&mut ev, event::Severity::Err));
+    }
+
+    #[test]
+    fn a_noop_succeeds_and_changes_nothing() {
+        let mut core_commands = commands::CoreCommands::new();
+        let mut ev = ev::Ev::new();
+        ev.set_filter(Some(event::Severity::Warn));
+        core_commands.accept(&raw(NOOP, &[])).unwrap();
+        cmd::drain(&mut core_commands.queue, &mut ev, 10, commands::handle);
+
+        let outcome = ev.log.pop().unwrap();
+        assert_eq!(outcome.text.as_bytes(), b"cmd 1/7 t0 op0x0002: succeeded");
+        assert!(ev.log.is_empty());
+        // The filter is as it was: Warn still passes, Info still does not.
+        assert!(!passes_filter(&mut ev, event::Severity::Info));
+        assert!(passes_filter(&mut ev, event::Severity::Warn));
     }
 
     #[test]

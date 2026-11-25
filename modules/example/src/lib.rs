@@ -76,6 +76,7 @@ impl module::Module for Example {
     type Event = ExampleEv;
     type In<'a> = ();
     type Out<'a> = ExampleOut<'a>;
+    type Cmd = ();
 
     /// Runs once, before the first tick. A module reads `ctx.reset` here to learn how the last
     /// run ended, and does its setup.
@@ -104,6 +105,7 @@ impl module::Module for Example {
 mod tests {
     use super as example;
     use vee_core_api::bus;
+    use vee_core_api::cmd;
     use vee_core_api::ctx;
     use vee_core_api::ev;
     use vee_core_api::event;
@@ -146,6 +148,7 @@ mod tests {
                 example::ExampleOut {
                     progress: self.progress.writer(time_us),
                 },
+                cmd::Inbox::empty(),
             );
             self.example.init(&mut ctx);
         }
@@ -161,6 +164,7 @@ mod tests {
                 example::ExampleOut {
                     progress: self.progress.writer(time_us),
                 },
+                cmd::Inbox::empty(),
             );
             self.example.step(&mut ctx);
         }

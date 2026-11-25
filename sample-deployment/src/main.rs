@@ -4,16 +4,20 @@
 //! Run it from this directory, so that `.cargo/config.toml` (the build-time settings) applies:
 //! `cd sample-deployment && cargo run`. It writes its logs to the current directory.
 //!
-//! It starts Vee (see `start`) and its two modules (`vee-example`, which publishes a bus topic,
-//! and `vee-watcher`, which reads it), and then runs the loop (see
+//! It starts Vee (see `start`) and its three modules (`vee-example`, which publishes a bus topic,
+//! `vee-watcher`, which reads it, and the `pinger`, which sends the core a `Noop` command once a
+//! second through a command sink), and then runs the loop (see
 //! `Exec::run`) at 100 Hz until it is killed. Set `VEE_SAMPLE_TICKS=250` (any number) to run that
 //! many ticks and then stop cleanly, which is how to see a clean shutdown (and the next boot
 //! report it).
 #![forbid(unsafe_code)]
 
+mod pinger;
+
 use vee_core::Core;
 use vee_core::slot;
 use vee_core_api::bus;
+use vee_core_api::cmd;
 use vee_core_api::reset;
 use vee_core_types::core_event;
 use vee_example as example;
@@ -41,6 +45,11 @@ const EVENT_LOG: &str = "events.log";
 /// The modules' ids, which go into every event they send. 0 is the core's.
 const EXAMPLE_SOURCE: u8 = 1;
 const WATCHER_SOURCE: u8 = 2;
+const PINGER_SOURCE: u8 = 3;
+
+/// The pinger's command sink. A sink's id says where commands come from (ground, an RTS, ...),
+/// and is not a module's id: this one stands in for the ground link.
+const PINGER_SINK: u8 = 1;
 
 /// The time between the start of one tick and the start of the next: a tick rate of 100 Hz. Ticks
 /// start at multiples of this on the clock, so a tick has a number: its start time divided by this.
@@ -53,6 +62,9 @@ const EXAMPLE_PERIOD_TICKS: u64 = 100;
 /// The watcher steps on every this many ticks: once every two seconds, half as often as the
 /// example publishes, so it misses every other value (a state topic keeps only the latest).
 const WATCHER_PERIOD_TICKS: u64 = 200;
+
+/// The pinger steps on every this many ticks: once a second, like the example.
+const PINGER_PERIOD_TICKS: u64 = 100;
 
 /// The system log keeps messages at this level and more severe.
 const LOG_LEVEL: log::LevelFilter = log::LevelFilter::Info;
@@ -113,24 +125,35 @@ struct Exec {
     core: Core<linux::LinuxPlatform>,
     /// `Example`'s progress: written by `example`, read by `watcher`.
     progress: bus::StateTopic<example::Progress>,
+    /// The pinger's command sink: the core's router empties it at the start of every tick.
+    pinger_sink: cmd::Sink,
     example: slot::Slot<example::Example>,
     watcher: slot::Slot<watcher::Watcher>,
+    pinger: slot::Slot<pinger::Pinger>,
 }
 
 impl Exec {
     /// Tick number `tick`, in the order the design gives (see "Executive Requirements"):
     /// 1. Each module's suppressed events from the tick before, and a new count for each.
-    /// 2. The core's tick: the event queue is written to the event log, and the watchdog is fed.
-    /// 3. Each module that is due steps, in order: `example` (which writes `progress`) and then
-    ///    `watcher` (which reads it), so the watcher sees the value from this tick.
+    /// 2. The router (`Core::route_commands`): every command the sinks hold goes to its target's
+    ///    queue and is acked. No module has commands yet, so the only target is the core's own.
+    /// 3. The core's tick: it runs its own queued commands, the event queue is written to the
+    ///    event log, and the watchdog is fed.
+    /// 4. Each module that is due steps, in order: `example` (which writes `progress`), then
+    ///    `watcher` (which reads it), so the watcher sees the value from this tick, then
+    ///    `pinger` (which submits a command, routed at the start of the next tick).
     fn tick(&mut self, tick: u64) {
         let now = self.clock.monotonic_us();
 
         self.example.report_suppressed(&mut self.core.ev, now);
         self.watcher.report_suppressed(&mut self.core.ev, now);
+        self.pinger.report_suppressed(&mut self.core.ev, now);
+        self.core
+            .route_commands(std::slice::from_mut(&mut self.pinger_sink), &mut [], now);
         self.core.tick(now);
         self.step_example(tick);
         self.step_watcher(tick);
+        self.step_pinger(tick);
     }
 
     /// One call into `example`, with a writer for `progress`. The clock is read once, and that
@@ -142,8 +165,15 @@ impl Exec {
         let out = example::ExampleOut {
             progress: self.progress.writer(now),
         };
-        self.example
-            .step(tick, &mut self.core.ev, now, reset, (), out);
+        self.example.step(
+            tick,
+            &mut self.core.ev,
+            now,
+            reset,
+            (),
+            out,
+            cmd::Inbox::empty(),
+        );
     }
 
     /// One call into `watcher`, with a reader for `progress`.
@@ -153,8 +183,33 @@ impl Exec {
         let inputs = watcher::WatcherIn {
             progress: self.progress.reader(),
         };
-        self.watcher
-            .step(tick, &mut self.core.ev, now, reset, inputs, ());
+        self.watcher.step(
+            tick,
+            &mut self.core.ev,
+            now,
+            reset,
+            inputs,
+            (),
+            cmd::Inbox::empty(),
+        );
+    }
+
+    /// One call into `pinger`, with a handle on its sink.
+    fn step_pinger(&mut self, tick: u64) {
+        let reset = self.core.reset();
+        let now = self.clock.monotonic_us();
+        let out = pinger::PingerOut {
+            cmd: self.pinger_sink.handle(),
+        };
+        self.pinger.step(
+            tick,
+            &mut self.core.ev,
+            now,
+            reset,
+            (),
+            out,
+            cmd::Inbox::empty(),
+        );
     }
 
     /// The loop: runs a tick at the start of each period, for `tick_limit` ticks, or for ever if
@@ -210,7 +265,7 @@ impl Exec {
 /// 3. The watchdog, from the environment. If that fails, a watchdog that does nothing takes its
 ///    place and the error is reported once the core exists, because startup does not fail.
 /// 4. The core (`Core::start`): the reset log and the event log.
-/// 5. Each module's `init`, in order, with the bus handles it declared.
+/// 5. Each module's `init`, in order, with the handles it declared (bus topics, command sink).
 /// 6. The system log's queue, and then the allocation guard (`arm`). The queue's thread
 ///    allocates, so it comes before `arm`.
 fn start(clock: std_clock::StdClock) -> Result<Exec, StartError> {
@@ -253,6 +308,8 @@ fn start(clock: std_clock::StdClock) -> Result<Exec, StartError> {
         WATCHER_SOURCE,
         WATCHER_PERIOD_TICKS,
     );
+    let mut pinger = slot::Slot::new(pinger::Pinger::new(), PINGER_SOURCE, PINGER_PERIOD_TICKS);
+    let mut pinger_sink = cmd::Sink::new(PINGER_SINK);
     // The bus topic, which `Exec` takes over. Each `init` is given the handle its module declared.
     let mut progress = bus::StateTopic::new();
     let reset = core.reset();
@@ -260,12 +317,17 @@ fn start(clock: std_clock::StdClock) -> Result<Exec, StartError> {
     let out = example::ExampleOut {
         progress: progress.writer(now),
     };
-    example.init(&mut core.ev, now, reset, (), out);
+    example.init(&mut core.ev, now, reset, (), out, cmd::Inbox::empty());
     let now = clock.monotonic_us();
     let inputs = watcher::WatcherIn {
         progress: progress.reader(),
     };
-    watcher.init(&mut core.ev, now, reset, inputs, ());
+    watcher.init(&mut core.ev, now, reset, inputs, (), cmd::Inbox::empty());
+    let now = clock.monotonic_us();
+    let out = pinger::PingerOut {
+        cmd: pinger_sink.handle(),
+    };
+    pinger.init(&mut core.ev, now, reset, (), out, cmd::Inbox::empty());
 
     if let Err(error) = std_syslog::start_queue() {
         log::error!("the system log stays in direct mode: {error}");
@@ -284,8 +346,10 @@ fn start(clock: std_clock::StdClock) -> Result<Exec, StartError> {
         clock,
         core,
         progress,
+        pinger_sink,
         example,
         watcher,
+        pinger,
     })
 }
 

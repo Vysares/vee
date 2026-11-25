@@ -1499,6 +1499,116 @@ Size on 2026-11-17 (cloc, working tree, no target dir): 14 Rust files, 1729 line
     event can land there). Piece 6 NOT written: `Core::submit_command` (routes with `cmd::route_and_ack`) and
     the `cmd::drain` call in `Core::tick`; also wiring `flush_bus`.
 
+93. **Command sinks and the router (Command Router piece 6)** (`docs/design.md` "Command Routing", `core-api/src/cmd.rs`,
+    `core/src/lib.rs`). Decided with the user: a SINK is a staging queue. A module pushes, the core drains. One
+    queue per sink, owned by the executive; the module only gets `submit` (the sink stamps its own id on the
+    command, so a module cannot forge a source). A module cannot call the router: the router needs every
+    target's queue, which belong to modules the exec is not lending while one runs. Full sink = `QueueFull` to
+    the submitter. One tick of delay (submitted in tick N, routed in N+1). Every command gets both acks (commands
+    only come from ground or RTS/ATS); acks are the core's source and skip the throttle.
+    Code: `cmd::Sink { id, queue }` (`new(id)`, `submit(seq, target, opcode, args)`, `pop()`), setting
+    `CMD_SINK_QUEUE_DEPTH` (`VEE_CMD_SINK_QUEUE_DEPTH`, 8, `1..=65535`, one depth for every sink, so `Sink` is not
+    generic and the router can hold a slice of them; in the sample config). `cmd::route_and_ack` was REPLACED by
+    `cmd::ack(ev, &raw, &result, now)` (the text in one place), because the core's own target cannot be put in the
+    modules' slice without allocating. `Core::route_commands(sinks, targets, now)`: pops every sink, sends a
+    `CORE_TARGET` command to `self.commands.accept`, any other through `cmd::route`, and acks each. `Core::tick`
+    now starts with `cmd::drain(&mut self.commands.queue, &mut self.ev, now, commands::handle)`
+    (`Core` has a `commands: CoreCommands` field). 7 new tests in core-api (sink 3; the old route_and_ack tests
+    use a test helper that does route then ack), 4 in core. NOT written (item 94 did the handle): who calls `route_commands` (the exec/sample deployment, between the suppressed reports
+    and `tick`), `flush_bus`, and the link module (later, tests drive the sinks directly).
+
+94. **`SinkHandle`, the router's integration test, and what testing it found** (`core-api/src/cmd.rs`,
+    `core/tests/cmd_loop.rs` new, `core/src/lib.rs` tests). Decided with the user: the `ctx.cmd` question is
+    answered by putting the sink handle in the module's `Out` (`type Out<'a> = LinkOut<'a>` with a `cmd:
+    cmd::SinkHandle<'a>` field), no new mechanism: `Ctx`, `Module` and `Slot` are unchanged; a module with no
+    sink says `type Out<'a> = ();`, and the compiler enforces it. `cmd::SinkHandle<'a>` wraps `&'a mut Sink` and
+    has only `submit` (no `pop`); the exec makes one per call with `sink.handle()`, as for a topic writer.
+    `core/tests/cmd_loop.rs` (25 tests) is a hand written executive: two sinks (ids 11, 12, deliberately not the
+    link modules' ids 1, 2), two `Link` modules (the same type, scripted submits, one summary event per step), a
+    `Worker` target module (own `CmdSet`, queue depth 2, owned by the exec and lent as both a target and an
+    `In`), and the real `Core`. Tick order: suppressed reports, `route_commands`, `core.tick`, modules. It
+    covers: one tick of delay, handled in the target's own step (also at a slow rate), FIFO, every refusal
+    (unknown target, opcode, args size, `validate`, full target queue), a refused command not stopping the next
+    ones, the core as a target (acked and run in the same tick, the filter reaching `ev.bus`, an illegal floor
+    changing nothing), the sink's id on the ack, two sinks drained in order, a full sink telling its module, a
+    drained sink taking a full batch again, acks never throttled, and a 50 tick run. 6 more tests in `core`
+    (core queue full, then taking commands again after a tick, mixed core and module commands in one sink, nothing
+    to route, routed once, ack code and severity), 4 in `cmd.rs` for the handle, 1 for the widest ack text.
+    Workspace: 521 tests. MUTATION CHECK (by hand, with a throwaway script): 15 deliberate breakages of the
+    router, the sink, the acks, `accept`, `handle` and `tick` were each caught by at least one test. One weak
+    spot found that way (acks were only checked by text, not by code and severity) and fixed.
+    FOUND BY THE TESTS: (1) `CmdErr::BadArgs` printed "args do not match the command's layout", which made the
+    rejection ack longer than the 64 byte event text, so it was cut off with `~`. It now prints "bad args size"
+    (the widest prefix of an ack is 39 bytes, leaving 25 for the reason). `Invalid(reason)` is the target's own
+    text, so it can still be cut (accepted: cut text ends in `~`). (2) A MODULE CANNOT CALL `cmd::drain`:
+    it needs `&mut Ev` to send the outcome ack, and a module's `Ctx` has only `EvHandle`. So today only the core
+    gets the automatic "succeeded/failed" ack; the test `Worker` pops its queue itself and reports with its own
+    event. (RESOLVED in item 95.) Options were: give `Ctx` a way to drain (a method that takes the module's
+    queue and the handler and sends the outcome from the core's source, skipping the throttle), or have the exec
+    send outcomes. NOTE for tooling: restoring a file with `shutil.move` keeps its old mtime and cargo then
+    reuses the mutated build; touch the file after restoring.
+
+95. **`ctx.drain_cmds`: a module handles its commands and the outcome ack is baked in** (`core-api/src/{cmd,ctx,module}.rs`,
+    `core/src/slot.rs`, every `Module` impl and every `Slot::init`/`step` caller). Decided with the user: the
+    module author writes only the `match` and one function per command returning a `cmd::CmdResult`;
+    `ctx.drain_cmds(|command, ctx| ...)` pops every queued command oldest first, calls the closure (`ctx` is passed
+    in, like `ev` in the core's `drain`, so the closure borrows the module and the `Ctx` separately), and sends
+    each outcome ("succeeded", "failed: reason", "pending") itself, from the MODULE'S OWN SOURCE at the call's time,
+    NOT THROTTLED (`EvHandle` got no public method for this; `drain_cmds` reaches its private fields from inside
+    `ctx.rs`, so a module cannot send arbitrary outcomes). New: `Module::Cmd: 'static` (`()` for no commands; the
+    bound is needed because the inbox holds a borrow), `cmd::Inbox<'a, C>` (`new(&mut Queue<(C, CmdMeta), N>)`,
+    `empty()`, `pub(crate) pop`; it holds an `Option<&mut dyn Pop<C>>` so a `Ctx` takes any queue depth), a new last
+    argument `cmds: cmd::Inbox<'a, M::Cmd>` on `Ctx::new`, `Slot::init` and `Slot::step`. `cmd::send_outcome` now
+    takes the source and is shared by the core's `drain` (source 0) and `drain_cmds`. The router's received/rejected
+    acks still come from the core. Modules without commands pass `cmd::Inbox::empty()`.
+    Tests: 8 in `core-api/tests/ctx.rs` (order, results, source and time, severity, NOT throttled when more commands
+    than `EV_MAX_PER_TICK` run in one step, an empty queue, `()` commands); `core/tests/cmd_loop.rs` is now 34
+    tests (the `Worker` uses `drain_cmds`; success, failure, pending, outcome time and source, a slow module, a
+    rejected command gets no outcome). Mutation check (7 more breakages) all caught. Workspace: 538 tests.
+    Design doc updated (Command Routing, Module Requirements, throttling note). **TO REVISIT (TECH DEBT, DO NOT FORGET):**
+    clippy's `too_many_arguments` (8 of 7) fires on `Ctx::new` and `Slot::step`. The user chose to ALLOW it for
+    now (`#[allow(.., reason)]` with a `TODO(revisit)` comment on both). The fix is to bundle the per call handles
+    `inputs`, `out`, `cmds` into one struct, and then remove both `allow`s. Do it before the next thing is added to
+    `Ctx` (tables, devices), which would make it 9. Find them with `grep -rn "TODO(revisit)" core-api core`.
+
+96. **The sample sends the core a `Noop` through a sink; `CmdSet::opcode()`; a coverage assessment** (`core-types/src/core_cmd.rs`,
+    `core/src/commands.rs`, `core-derive/src/cmd_set.rs`, `sample-deployment/src/{main,pinger}.rs`,
+    `sample-deployment/tests/sample_runs.rs`, `docs/design.md`). New core command `Noop(NoopArgs {}) = 2`: does nothing
+    and returns `Success`, so a sender can check the path end to end (the router's "accepted", then the core's
+    "succeeded"). The `CmdSet` derive now also writes `opcode(&self) -> u16` (from the same discriminant
+    expressions `decode` matches), so a SENDER fills in `RawCmd::opcode` without writing the number again.
+    The sample has a third module, `pinger` (`sample-deployment/src/pinger.rs`; source 3, steps once a second), a
+    stand-in for the link module: `Out` is a `cmd::SinkHandle`, it submits `CoreCmd::Noop` with `opcode()` and
+    `NoopArgs::encode()` and reports a failure as a `NotSent` event. `Exec` owns one `cmd::Sink` (id 1, `PINGER_SINK`)
+    and `tick` is now: suppressed reports, `core.route_commands(from_mut(&mut sink), &mut [], now)`,
+    `core.tick`, then the three steps. Checked in the real binary (`the_pinger_sends_the_core_a_noop_and_both_acks_come_back`)
+    and under `--features alloc-guard` (routing and the core's drain allocate nothing). Design doc: the Command
+    Router row of the core services table and the per tick loop (now four steps) are up to date.
+    Workspace: 542 tests, clippy and fmt clean (the `too_many_arguments` allows of item 95 remain).
+    COVERAGE, MEASURED (2026-11-24; `llvm-tools-preview` and `cargo-llvm-cov` 0.9.2 were installed with the user's
+    OK). Run: `cargo llvm-cov --workspace --summary-only --ignore-filename-regex '(/tests/|/target/)'`; add
+    `--show-missing-lines` to `cargo llvm-cov report` for the missed line numbers (the run is reused). Result: 95.8%
+    of regions, 94.9% of lines, 94.9% of functions; no branch coverage on this toolchain. CAVEAT: each file's
+    number includes its own `#[cfg(test)]` code, which is nearly 100% covered, so production code is somewhat lower
+    than shown (the files with no in-file tests are exact: `log_writer.rs` 73.9% of lines, `pinger.rs` 70.8%).
+    What the misses are:
+    (a) NOT REAL: `core-api/src/crc.rs` (the table is built by a `const fn` at compile time, so it never runs);
+    stub `event::Code` impls inside test modules (`from_index`, `index`: `cmd.rs`, `ev.rs`, `throttle.rs`);
+    `Default` impls; `Display` for the start errors; the `FailingFiles` methods in `core/src/lib.rs` tests.
+    (b) THE BIGGEST REAL GAP, about 150 lines: the four derives' error paths (`core-derive/src/{cmd_set,code,
+    command,message,lib}.rs`, 67 to 83%), which are exactly the compile-fail cases that `trybuild` would automate.
+    (c) `core/src/log_writer.rs` (74%): the `flush` give-up on a stuck write (lines 110-112), `busy()` (125-127), the
+    once per streak report staying quiet on a second failure (`Err(_) => {}`, line 161), the refused `request`
+    (148), and an event that does not fit a batch (138-140, "cannot happen").
+    (d) `Core::start_log_writer`'s `Err` arm (`core/src/lib.rs` 208-212): the writer thread failing to spawn.
+    (e) `std_watchdog.rs` (93%): the `StartError` text and a few `from_env` arms; `std_syslog.rs` 57-63.
+    (f) `sample-deployment/src/main.rs` (89%): the `StartError` conversions, the watchdog and system log queue
+    failures, a bad tick limit's other branches; `pinger.rs`'s `NotSent` branch (65-68).
+    (g) `cmd::CmdEvent::from_index` (production, never called: the router's events are never throttled or
+    reported by `new_tick`); `osal/src/files.rs` 41-45.
+    Also known and untested: the router with duplicate target ids (first wins). USER (2026-11-24): wants a BETTER WAY
+    OF ASSIGNING TARGET IDS anyway, to be worked out later; do not patch the duplicate case before that.
+
 ## WHERE WE LEFT OFF (2026-11-24)
 Everything builds, 469 tests pass, clippy and `cargo fmt --check` are clean. Items 87 to 90 (the
 `bus::Message` derive, the APID-to-TID rename, the `core-derive` file split, TIDs and the dyn view step 1)
@@ -1546,6 +1656,7 @@ The blocking event log write is gone (item 74); the two sample overruns on WSL w
 on native Linux.
 
 ## Next
+**FIRST: the `too_many_arguments` debt (item 95, `grep -rn "TODO(revisit)"`): bundle `inputs`, `out`, `cmds`.**
 Open choices, in the order I would do them, all for the user to pick:
 1. The file service (thread, bounded request queues): removes the blocking `append` from `Core::tick` and the
    overruns above. The biggest piece: a new `Platform` associated type. After it, assert `Core::tick`
@@ -1557,7 +1668,7 @@ Older plan, still relevant: STRETCH GOAL, only after everything else works (note
 Executive Requirements): a threaded module type for slow work (image processing, say) that gets its
 own thread or core, talking through bounded queues like the file service.
 Possible follow-ups: `trybuild` for the derive's compile-fail cases (adds a dev dependency).
-Command Router piece 6 (item 92): wire `CoreCommands` into `core/src/lib.rs`.
+`Core::route_commands` called from the sample deployment's executive, `flush_bus`.
 
 ## Decisions to remember
 - Debug and test only features (the allocation guard, fakes, the test hooks) must be invisible to the code they
@@ -1605,6 +1716,6 @@ Command Router piece 6 (item 92): wire `CoreCommands` into `core/src/lib.rs`.
 - How a module waits for a command result without blocking (see item 19). Part of the command design.
 
 ## Not started
-command router piece 6 (item 92: wiring `CoreCommands` into `core/src/lib.rs`), tables,
+the sample deployment calling `route_commands`, the link module, tables,
 `exec!` (the sample deployment is its hand written precursor), more modules, the recorder, telemetry,
 FDIR, the ground tool. (The `module-types` crate was dropped: no mission wide types crate, item 58.)

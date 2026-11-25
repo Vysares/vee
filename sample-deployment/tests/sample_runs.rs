@@ -39,6 +39,7 @@ const EXAMPLE_STARTED: u16 = 0;
 const EXAMPLE_STEPPED: u16 = 1;
 const WATCHER_SOURCE: u8 = 2;
 const WATCHER_SAW: u16 = 0;
+const PINGER_SOURCE: u8 = 3;
 
 /// How long to wait for a started program to show that it has started, and how often to look.
 const START_TIMEOUT: time::Duration = time::Duration::from_secs(10);
@@ -241,4 +242,32 @@ fn a_tick_limit_that_is_not_a_number_fails_loudly() {
     assert!(stderr.contains("InvalidTickLimit"), "{stderr}");
     // It stopped before it started anything: no log files.
     assert!(!dir.file(RESET_LOG).exists());
+}
+
+#[test]
+fn the_pinger_sends_the_core_a_noop_and_both_acks_come_back() {
+    let dir = TempDir::new("the_pinger_sends_a_noop");
+    // 150 ticks of 10 ms: the pinger is due on every 100th and submits then, so its command is
+    // routed at the start of the tick after, which is inside the run.
+    let stderr = run(&dir, 150);
+    let events = events(&dir);
+
+    // The router's ack and the core's outcome, both from the core, in that order. The pinger's
+    // sink is 1 and its first `seq` is 0. The core is target 0, and `Noop` is opcode 2.
+    let acks: Vec<String> = events
+        .iter()
+        .filter(|event| event.source == CORE_SOURCE)
+        .map(|event| String::from_utf8_lossy(event.text.as_bytes()).into_owned())
+        .filter(|text| text.starts_with("cmd "))
+        .collect();
+    assert_eq!(
+        acks,
+        [
+            "cmd 1/0 t0 op0x0002: accepted",
+            "cmd 1/0 t0 op0x0002: succeeded"
+        ],
+        "{stderr}"
+    );
+    // The pinger had nothing to report.
+    assert!(events.iter().all(|event| event.source != PINGER_SOURCE));
 }

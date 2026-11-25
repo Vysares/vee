@@ -10,6 +10,7 @@
 //! `Ctx` is generic over the module `M`: what is inside comes from what `M` declares: its event
 //! enum (`M::Event`) and the bus handles it reads and writes (`M::In` and `M::Out`).
 
+use crate::cmd;
 use crate::ev;
 use crate::event;
 use crate::module;
@@ -29,6 +30,8 @@ pub struct Ctx<'a, M: module::Module> {
     pub inputs: M::In<'a>,
     /// The bus topics the module writes: what it declared as `M::Out`.
     pub out: M::Out<'a>,
+    /// The module's command queue: only `drain_cmds` reads it.
+    cmds: cmd::Inbox<'a, M::Cmd>,
     monotonic_us: u64,
 }
 
@@ -42,6 +45,15 @@ impl<'a, M: module::Module> Ctx<'a, M> {
     /// - `inputs` and `out`: the module's bus handles, made by the executive from the topics it
     ///   owns. They have the same lifetime `'a` as the other borrows, because all of them last
     ///   for this one call.
+    /// - `cmds`: the module's command queue (`Inbox::empty()` for a module with no commands).
+    // TODO(revisit): too many arguments (8 of clippy's 7), allowed for now. Every new thing a
+    // module can reach (tables, devices) adds another one, to this and to every caller. The plan:
+    // group the per call handles `inputs`, `out` and `cmds` into one struct, so the list shrinks and
+    // each is named at the call site. Remove this `allow` when that is done. See progress.md, item 95.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "known and temporary: the per call handles will be grouped into one struct (TODO above)"
+    )]
     pub fn new(
         ev: &'a mut ev::Ev,
         throttle: &'a mut throttle::Throttle,
@@ -50,6 +62,7 @@ impl<'a, M: module::Module> Ctx<'a, M> {
         reset: reset::ResetInfo,
         inputs: M::In<'a>,
         out: M::Out<'a>,
+        cmds: cmd::Inbox<'a, M::Cmd>,
     ) -> Self {
         Ctx {
             ev: EvHandle {
@@ -62,7 +75,32 @@ impl<'a, M: module::Module> Ctx<'a, M> {
             reset,
             inputs,
             out,
+            cmds,
             monotonic_us,
+        }
+    }
+
+    /// Handles every command waiting in the module's queue, oldest first. Call it from `step`.
+    ///
+    /// `handle` is the module's part: it matches on the command (an `M::Cmd`), does the work, and
+    /// returns what came of it (`cmd::CmdResult`). `drain_cmds` does the rest: it sends the
+    /// command's outcome event ("succeeded", "failed: reason" or "pending") from this module's
+    /// source, so a module never writes ack text. The outcome is not throttled: every command
+    /// gets one.
+    ///
+    /// `handle` gets `ctx` as its second argument, so it can send events or write outputs. It
+    /// cannot use the `ctx` it was called on instead, because `drain_cmds` has that borrowed for
+    /// the whole call.
+    pub fn drain_cmds(&mut self, mut handle: impl FnMut(M::Cmd, &mut Self) -> cmd::CmdResult) {
+        while let Some((command, meta)) = self.cmds.pop() {
+            let result = handle(command, self);
+            cmd::send_outcome(
+                &mut *self.ev.ev,
+                self.ev.source,
+                self.monotonic_us,
+                meta,
+                result,
+            );
         }
     }
 

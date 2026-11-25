@@ -24,6 +24,7 @@
 
 use vee_core::slot::Slot;
 use vee_core_api::bus;
+use vee_core_api::cmd;
 use vee_core_api::ctx;
 use vee_core_api::event;
 use vee_core_api::module;
@@ -77,6 +78,7 @@ impl module::Module for Producer {
     type Event = ProducerEv;
     type In<'a> = ();
     type Out<'a> = ProducerOut<'a>;
+    type Cmd = ();
 
     fn init(&mut self, _ctx: &mut ctx::Ctx<'_, Self>) {}
 
@@ -116,6 +118,7 @@ impl module::Module for Reader {
     type Event = ReaderEv;
     type In<'a> = ReaderIn<'a>;
     type Out<'a> = ();
+    type Cmd = ();
 
     fn init(&mut self, _ctx: &mut ctx::Ctx<'_, Self>) {}
 
@@ -179,8 +182,15 @@ impl Exec {
         let out = ProducerOut {
             feed: self.feed.writer(),
         };
-        self.producer
-            .step(self.tick, &mut self.core.ev, now, reset, (), out);
+        self.producer.step(
+            self.tick,
+            &mut self.core.ev,
+            now,
+            reset,
+            (),
+            out,
+            cmd::Inbox::empty(),
+        );
         self.clock.advance(MODULE_COST_US);
     }
 
@@ -191,8 +201,15 @@ impl Exec {
         let inputs = ReaderIn {
             feed: self.feed.reader(0),
         };
-        self.reader_a
-            .step(self.tick, &mut self.core.ev, now, reset, inputs, ());
+        self.reader_a.step(
+            self.tick,
+            &mut self.core.ev,
+            now,
+            reset,
+            inputs,
+            (),
+            cmd::Inbox::empty(),
+        );
         self.clock.advance(MODULE_COST_US);
     }
 
@@ -203,8 +220,15 @@ impl Exec {
         let inputs = ReaderIn {
             feed: self.feed.reader(1),
         };
-        self.reader_b
-            .step(self.tick, &mut self.core.ev, now, reset, inputs, ());
+        self.reader_b.step(
+            self.tick,
+            &mut self.core.ev,
+            now,
+            reset,
+            inputs,
+            (),
+            cmd::Inbox::empty(),
+        );
         self.clock.advance(MODULE_COST_US);
     }
 

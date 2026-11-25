@@ -6,6 +6,7 @@
 //! A module never sees any of this: it sees the `Ctx` that a `Slot` builds for each call.
 
 use crate::suppressed;
+use vee_core_api::cmd;
 use vee_core_api::ctx;
 use vee_core_api::ev;
 use vee_core_api::module;
@@ -38,7 +39,8 @@ impl<M: module::Module> Slot<M> {
     /// `ctx.monotonic()`, and the executive uses the same time for the bus handles it makes
     /// (`StateTopic::writer(time)`), so a sample's `updated_at` and the module's clock agree.
     /// `inputs` and `out` are the module's bus handles, which the executive makes from the topics
-    /// it owns.
+    /// it owns. `cmds` is the module's command queue (`cmd::Inbox::new(&mut queue)`, or
+    /// `cmd::Inbox::empty()` for a module with no commands).
     ///
     /// All the borrows share the one lifetime `'a`, the length of this call. (`M::In<'a>` and
     /// `M::Out<'a>` cannot be shortened by the compiler, because it does not know how a module's
@@ -50,6 +52,7 @@ impl<M: module::Module> Slot<M> {
         reset: reset::ResetInfo,
         inputs: M::In<'a>,
         out: M::Out<'a>,
+        cmds: cmd::Inbox<'a, M::Cmd>,
     ) {
         log::debug!("source {} init at {time} us", self.source);
         let mut ctx = ctx::Ctx::<M>::new(
@@ -60,6 +63,7 @@ impl<M: module::Module> Slot<M> {
             reset,
             inputs,
             out,
+            cmds,
         );
         self.module.init(&mut ctx);
     }
@@ -74,6 +78,14 @@ impl<M: module::Module> Slot<M> {
 
     /// Calls `step` if this tick is one of the module's. `time` is the monotonic time the
     /// executive read just before this call (see `init`).
+    // TODO(revisit): too many arguments (8 of clippy's 7), allowed for now. Every new thing a
+    // module can reach (tables, devices) adds another one, to this, to `Ctx::new` and to every caller. The plan:
+    // group the per call handles `inputs`, `out` and `cmds` into one struct, so the list shrinks and
+    // each is named at the call site. Remove this `allow` when that is done. See progress.md, item 95.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "known and temporary: the per call handles will be grouped into one struct (TODO above)"
+    )]
     pub fn step<'a>(
         &'a mut self,
         tick: u64,
@@ -82,6 +94,7 @@ impl<M: module::Module> Slot<M> {
         reset: reset::ResetInfo,
         inputs: M::In<'a>,
         out: M::Out<'a>,
+        cmds: cmd::Inbox<'a, M::Cmd>,
     ) {
         if tick.checked_rem(self.period) != Some(0) {
             return;
@@ -95,6 +108,7 @@ impl<M: module::Module> Slot<M> {
             reset,
             inputs,
             out,
+            cmds,
         );
         self.module.step(&mut ctx);
     }

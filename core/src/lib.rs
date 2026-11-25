@@ -20,6 +20,8 @@ pub mod reset_log;
 pub mod slot;
 pub mod suppressed;
 
+use vee_core_api::cmd;
+use vee_core_api::cmd::CommandTarget as _;
 use vee_core_api::ev;
 use vee_core_api::reset;
 use vee_core_types::core_event;
@@ -52,6 +54,8 @@ pub struct Core<P: platform::Platform> {
     log_writer: Option<log_writer::LogWriter>,
     /// How the previous run ended. Set by `start`.
     reset: reset::ResetInfo,
+    /// The core's own commands: its queue, drained in `tick`.
+    commands: commands::CoreCommands,
 }
 
 impl<P: platform::Platform> Core<P> {
@@ -72,6 +76,7 @@ impl<P: platform::Platform> Core<P> {
             event_log_path,
             log_writer: None,
             reset: reset::ResetInfo::first_boot(),
+            commands: commands::CoreCommands::new(),
         }
     }
 
@@ -209,19 +214,55 @@ impl<P: platform::Platform> Core<P> {
         }
     }
 
+    /// The router: moves every command waiting in the sinks to its target's queue, and sends the
+    /// received ack, or the rejected nak with the reason, for each. `now` is the time of those
+    /// events. A command for the core (`cmd::CORE_TARGET`) goes to the core's own queue; any
+    /// other goes to the entry in `targets` with that id (the modules', which the executive
+    /// owns and lends), or is rejected as an unknown target. Nothing is run here: a target
+    /// handles its commands in its own step.
+    ///
+    /// The executive calls it once per tick, before `tick` (so the core's own commands are handled
+    /// in the same tick) and before the modules' `step`s.
+    pub fn route_commands(
+        &mut self,
+        sinks: &mut [cmd::Sink],
+        targets: &mut [(u8, &mut dyn cmd::CommandTarget)],
+        now: u64,
+    ) {
+        for sink in sinks {
+            while let Some(raw) = sink.pop() {
+                let result = if raw.target == cmd::CORE_TARGET {
+                    self.commands.accept(&raw)
+                } else {
+                    cmd::route(targets, raw)
+                };
+                cmd::ack(&mut self.ev, &raw, &result, now);
+            }
+        }
+    }
+
     /// The core's step of a tick, at time `now`. The executive calls it after the modules'
     /// suppressed-event reports and before the modules' `step`s.
     ///
-    /// 1. Events: the log writer collects what happened to the write in flight, and, if the file
+    /// 1. Commands: handles the core's own queued commands (`cmd::drain`, like a module in its own
+    ///    step), which sends each one's outcome event. Done first, so those events are written
+    ///    in this tick's batch.
+    /// 2. Events: the log writer collects what happened to the write in flight, and, if the file
     ///    service is free, sends the next batch of queued events (one write for as many as fit).
     ///    It never waits. Then, if the queue refused any events, sends the report
     ///    (`events::report_dropped`).
-    /// 2. The watchdog: feeds it. This comes last, so a tick that hangs part way (a blocked
+    /// 3. The watchdog: feeds it. This comes last, so a tick that hangs part way (a blocked
     ///    write, say) is not fed, and the supervisor notices. The call is made every tick, and
     ///    the watchdog sends on each one. If the supervisor cannot be reached, the
     ///    first failure of a streak sends `WatchdogUnavailable`, and the call is tried again at
     ///    the next tick. The event is written by the next tick, as the dropped report is.
     pub fn tick(&mut self, now: u64) {
+        cmd::drain(
+            &mut self.commands.queue,
+            &mut self.ev,
+            now,
+            commands::handle,
+        );
         if let Some(writer) = self.log_writer.as_mut() {
             writer.step(&mut self.ev, now);
         }
@@ -252,6 +293,8 @@ impl<P: platform::Platform> Core<P> {
 #[cfg(test)]
 mod tests {
     use super as vee_core;
+    use super::commands;
+    use vee_core_api::cmd;
     use vee_core_api::ev;
     use vee_core_api::event;
     use vee_core_api::reset;
@@ -631,5 +674,222 @@ mod tests {
         core.flush_event_log(6);
         assert_eq!(record_count(&core), 2);
         assert_eq!(record(&core, 1).monotonic_us, 5);
+    }
+
+    /// A core with no event log writer, so a test can read the events from `core.ev.log`.
+    fn bare_core() -> vee_core::Core<Fake> {
+        vee_core::Core::new(
+            fake_files::FakeFiles::new(),
+            fake_watchdog::FakeWatchdog::new(),
+            RESET_LOG,
+            PATH,
+        )
+    }
+
+    /// A command target that keeps what it is handed.
+    struct Keeper(Option<cmd::RawCmd>);
+
+    impl cmd::CommandTarget for Keeper {
+        fn accept(&mut self, raw: &cmd::RawCmd) -> Result<(), cmd::CmdErr> {
+            self.0 = Some(*raw);
+            Ok(())
+        }
+    }
+
+    /// The text of the next event in the queue.
+    fn next_text(core: &mut vee_core::Core<Fake>) -> event::Text {
+        core.ev.log.pop().unwrap().text
+    }
+
+    #[test]
+    fn a_command_for_a_module_is_routed_to_it_and_acked() {
+        let mut core = bare_core();
+        let mut sinks = [cmd::Sink::new(1)];
+        sinks[0].submit(5, 3, 0x20, cmd::Args::EMPTY).unwrap();
+        let mut module = Keeper(None);
+        core.route_commands(&mut sinks, &mut [(3, &mut module)], 10);
+
+        let raw = module.0.unwrap();
+        assert_eq!((raw.sink, raw.seq, raw.opcode), (1, 5, 0x20));
+        assert_eq!(
+            next_text(&mut core).as_str(),
+            "cmd 1/5 t3 op0x0020: accepted"
+        );
+        assert!(sinks[0].pop().is_none());
+    }
+
+    #[test]
+    fn a_command_for_no_one_is_rejected() {
+        let mut core = bare_core();
+        let mut sinks = [cmd::Sink::new(1)];
+        sinks[0].submit(5, 9, 0x20, cmd::Args::EMPTY).unwrap();
+        core.route_commands(&mut sinks, &mut [], 10);
+        assert_eq!(
+            next_text(&mut core).as_str(),
+            "cmd 1/5 t9 op0x0020: rejected: unknown command target"
+        );
+    }
+
+    #[test]
+    fn a_core_command_is_acked_when_routed_and_run_by_the_next_tick() {
+        let mut core = bare_core();
+        let mut sinks = [cmd::Sink::new(2)];
+        // SetEventFilter (opcode 1), floor 1.
+        sinks[0]
+            .submit(8, cmd::CORE_TARGET, 1, cmd::Args::new(&[1]).unwrap())
+            .unwrap();
+        core.route_commands(&mut sinks, &mut [], 10);
+        assert_eq!(
+            next_text(&mut core).as_str(),
+            "cmd 2/8 t0 op0x0001: accepted"
+        );
+        assert!(core.ev.log.is_empty());
+
+        core.tick(20);
+        assert_eq!(
+            next_text(&mut core).as_str(),
+            "cmd 2/8 t0 op0x0001: succeeded"
+        );
+    }
+
+    #[test]
+    fn every_sink_is_drained_in_order() {
+        let mut core = bare_core();
+        let mut sinks = [cmd::Sink::new(1), cmd::Sink::new(2)];
+        sinks[0].submit(1, 3, 1, cmd::Args::EMPTY).unwrap();
+        sinks[1].submit(2, 3, 1, cmd::Args::EMPTY).unwrap();
+        let mut module = Keeper(None);
+        core.route_commands(&mut sinks, &mut [(3, &mut module)], 10);
+        assert_eq!(
+            next_text(&mut core).as_str(),
+            "cmd 1/1 t3 op0x0001: accepted"
+        );
+        assert_eq!(
+            next_text(&mut core).as_str(),
+            "cmd 2/2 t3 op0x0001: accepted"
+        );
+    }
+
+    #[test]
+    fn the_core_refuses_a_command_when_its_own_queue_is_full() {
+        let mut core = bare_core();
+        let mut sink = [cmd::Sink::new(1)];
+        // Route one at a time, with no `tick` between: nothing empties the core's queue.
+        for seq in 0..=u16::try_from(commands::CORE_CMD_QUEUE_DEPTH).unwrap() {
+            sink[0]
+                .submit(seq, cmd::CORE_TARGET, 1, cmd::Args::new(&[1]).unwrap())
+                .unwrap();
+            core.route_commands(&mut sink, &mut [], 10);
+        }
+        for _ in 0..commands::CORE_CMD_QUEUE_DEPTH {
+            assert!(next_text(&mut core).as_str().ends_with("accepted"));
+        }
+        assert!(
+            next_text(&mut core)
+                .as_str()
+                .ends_with("rejected: command queue is full")
+        );
+        assert!(core.ev.log.is_empty());
+    }
+
+    #[test]
+    fn a_tick_empties_the_cores_queue_so_it_takes_commands_again() {
+        let mut core = bare_core();
+        let mut sink = [cmd::Sink::new(1)];
+        for round in 0..2 {
+            for seq in 0..commands::CORE_CMD_QUEUE_DEPTH {
+                let seq = u16::try_from(seq).unwrap();
+                sink[0]
+                    .submit(seq, cmd::CORE_TARGET, 1, cmd::Args::new(&[1]).unwrap())
+                    .unwrap();
+                core.route_commands(&mut sink, &mut [], round);
+            }
+            core.tick(round);
+        }
+        let mut rejected = 0;
+        let mut succeeded = 0;
+        while let Some(event) = core.ev.log.pop() {
+            rejected += usize::from(event.text.as_str().contains("rejected"));
+            succeeded += usize::from(event.text.as_str().ends_with("succeeded"));
+        }
+        assert_eq!(rejected, 0);
+        assert_eq!(succeeded, 2 * commands::CORE_CMD_QUEUE_DEPTH);
+    }
+
+    #[test]
+    fn commands_for_the_core_and_a_module_in_one_sink_are_acked_in_order() {
+        let mut core = bare_core();
+        let mut sinks = [cmd::Sink::new(1)];
+        sinks[0]
+            .submit(1, cmd::CORE_TARGET, 1, cmd::Args::new(&[1]).unwrap())
+            .unwrap();
+        sinks[0].submit(2, 3, 0x20, cmd::Args::EMPTY).unwrap();
+        sinks[0]
+            .submit(3, cmd::CORE_TARGET, 1, cmd::Args::new(&[9]).unwrap())
+            .unwrap();
+        let mut module = Keeper(None);
+        core.route_commands(&mut sinks, &mut [(3, &mut module)], 10);
+        assert_eq!(
+            next_text(&mut core).as_str(),
+            "cmd 1/1 t0 op0x0001: accepted"
+        );
+        assert_eq!(
+            next_text(&mut core).as_str(),
+            "cmd 1/2 t3 op0x0020: accepted"
+        );
+        assert_eq!(
+            next_text(&mut core).as_str(),
+            "cmd 1/3 t0 op0x0001: rejected: invalid: floor must be 0..=3"
+        );
+    }
+
+    #[test]
+    fn routing_with_nothing_in_the_sinks_sends_nothing() {
+        let mut core = bare_core();
+        let mut sinks = [cmd::Sink::new(1), cmd::Sink::new(2)];
+        core.route_commands(&mut sinks, &mut [], 10);
+        assert!(core.ev.log.is_empty());
+    }
+
+    #[test]
+    fn a_command_is_routed_once() {
+        let mut core = bare_core();
+        let mut sinks = [cmd::Sink::new(1)];
+        sinks[0].submit(1, 3, 1, cmd::Args::EMPTY).unwrap();
+        let mut module = Keeper(None);
+        core.route_commands(&mut sinks, &mut [(3, &mut module)], 10);
+        core.route_commands(&mut sinks, &mut [(3, &mut module)], 20);
+        assert!(core.ev.log.pop().is_some());
+        assert!(core.ev.log.is_empty());
+    }
+
+    #[test]
+    fn a_received_ack_is_info_and_a_rejection_is_an_error_with_their_own_codes() {
+        use event::Code as _;
+        let mut core = bare_core();
+        let mut sinks = [cmd::Sink::new(1)];
+        sinks[0].submit(1, 3, 1, cmd::Args::EMPTY).unwrap();
+        sinks[0].submit(2, 9, 1, cmd::Args::EMPTY).unwrap();
+        let mut module = Keeper(None);
+        core.route_commands(&mut sinks, &mut [(3, &mut module)], 10);
+
+        let accepted = core.ev.log.pop().unwrap();
+        assert_eq!(accepted.severity, event::Severity::Info);
+        assert_eq!(accepted.code, cmd::CmdEvent::Accepted.code());
+        let rejected = core.ev.log.pop().unwrap();
+        assert_eq!(rejected.severity, event::Severity::Err);
+        assert_eq!(rejected.code, cmd::CmdEvent::Rejected.code());
+    }
+
+    #[test]
+    fn the_cores_ack_is_sent_from_the_core_at_the_given_time_even_when_it_is_a_nak() {
+        let mut core = bare_core();
+        let mut sinks = [cmd::Sink::new(1)];
+        sinks[0].submit(1, 9, 1, cmd::Args::EMPTY).unwrap();
+        core.route_commands(&mut sinks, &mut [], 1234);
+        let event = core.ev.log.pop().unwrap();
+        assert_eq!(event.source, core_event::SOURCE);
+        assert_eq!(event.monotonic_us, 1234);
+        assert_eq!(event.severity, event::Severity::Err);
     }
 }
