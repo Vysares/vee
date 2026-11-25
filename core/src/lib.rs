@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 #![no_std]
 
+pub mod commands;
 pub mod event_log;
 pub mod events;
 pub mod file_device;

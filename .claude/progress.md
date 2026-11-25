@@ -1488,6 +1488,17 @@ Size on 2026-11-17 (cloc, working tree, no target dir): 14 Rust files, 1729 line
     as a `CommandTarget`, its `step` calling `cmd::drain`, matching `Floor` to `Severity`) and `core/src/
     lib.rs` (`Core::submit_command`, wiring `commands.step` into `tick`) — are NOT yet written.
 
+92. **Command Router piece 5: `CoreCommands`** (`core/src/commands.rs`, new; `pub mod commands;` in `core/src/lib.rs`).
+    `CoreCommands { queue: Queue<(CoreCmd, CmdMeta), CORE_CMD_QUEUE_DEPTH> }` (setting `VEE_CORE_CMD_QUEUE_DEPTH`,
+    default 8, `1..=65535`, added to the sample config). `impl cmd::CommandTarget`: `accept` = `CoreCmd::decode`,
+    `validate`, push (full = `QueueFull`); runs nothing. NO `step` (user's call: the core mirrors a module, so
+    `Core::tick` calls `cmd::drain(&mut commands.queue, ev, now, commands::handle)` itself; `queue` is
+    `pub(crate)`). `handle` is a plain function (matches `CoreCmd`, turns `Floor` into `Option<Severity>` with `severity_floor` and calls
+    `Ev::set_filter`; an illegal floor is `Fail`, not a panic). 8 tests (`no_std`: the filter is observed by
+    sending probe events and checking `ev.bus`; the probe empties the bus first because a command's own outcome
+    event can land there). Piece 6 NOT written: `Core::submit_command` (routes with `cmd::route_and_ack`) and
+    the `cmd::drain` call in `Core::tick`; also wiring `flush_bus`.
+
 ## WHERE WE LEFT OFF (2026-11-24)
 Everything builds, 469 tests pass, clippy and `cargo fmt --check` are clean. Items 87 to 90 (the
 `bus::Message` derive, the APID-to-TID rename, the `core-derive` file split, TIDs and the dyn view step 1)
@@ -1526,7 +1537,7 @@ item 88) and `bus::Topic` (item 90, DONE 2026-11-24), the dyn view: `layout()`, 
 out)`, `find(topics, tid)`; implemented for `StateTopic<T>` and `QueuedTopic<T,N,D>`.
 The Command Router (item 91, DONE pieces 1 to 4, 2026-11-24): shared router types, `drain`, and both derives
 are in `core-api/src/cmd.rs` and `core-derive`; the core's one real command, `SetEventFilter`, is in
-`core-types/src/core_cmd.rs`. NOT yet written: `core/src/commands.rs` (`CoreCommands`, piece 5) and wiring
+`core-types/src/core_cmd.rs`. `core/src/commands.rs` (`CoreCommands`, piece 5) is written (item 92). NOT yet written: wiring
 `Core::submit_command` into `core/src/lib.rs` (piece 6) — this is also what will wire `flush_bus` into
 `Core::tick`, since the events-filter command is what switches it on. The recorder, telemetry, FDIR, and
 `exec!` (which will build the real `(tid, &dyn Topic)` array and the table that reads it) are also not
@@ -1546,7 +1557,7 @@ Older plan, still relevant: STRETCH GOAL, only after everything else works (note
 Executive Requirements): a threaded module type for slow work (image processing, say) that gets its
 own thread or core, talking through bounded queues like the file service.
 Possible follow-ups: `trybuild` for the derive's compile-fail cases (adds a dev dependency).
-Command Router pieces 5 and 6 (item 91): `core/src/commands.rs` and wiring `core/src/lib.rs`.
+Command Router piece 6 (item 92): wire `CoreCommands` into `core/src/lib.rs`.
 
 ## Decisions to remember
 - Debug and test only features (the allocation guard, fakes, the test hooks) must be invisible to the code they
@@ -1594,6 +1605,6 @@ Command Router pieces 5 and 6 (item 91): `core/src/commands.rs` and wiring `core
 - How a module waits for a command result without blocking (see item 19). Part of the command design.
 
 ## Not started
-command router pieces 5 and 6 (item 91: `core/src/commands.rs`, wiring into `core/src/lib.rs`), tables,
+command router piece 6 (item 92: wiring `CoreCommands` into `core/src/lib.rs`), tables,
 `exec!` (the sample deployment is its hand written precursor), more modules, the recorder, telemetry,
 FDIR, the ground tool. (The `module-types` crate was dropped: no mission wide types crate, item 58.)

@@ -34,3 +34,6 @@ VEE_FILE_DATA_MAX_BYTES = "4096"
 
 # The most bytes in a file path. A longer path is refused, never cut. Default 128, 1..=1024.
 VEE_FILE_PATH_MAX_BYTES = "128"
+
+# How many commands the core's own command queue holds: what can arrive in one tick. Default 8, 1..=65535.
+VEE_CORE_CMD_QUEUE_DEPTH = "8"
